@@ -1,0 +1,139 @@
+# omavroom
+
+A room full of disposable Omarchy VMs where coding agents can work without
+ever touching my desktop session.
+
+The name: Omarchy + VM + room.
+
+## The problem
+
+I run coding agents (opencode and friends) on this same machine I work on.
+When an agent needs to launch, poke at, restart, or stress-test an
+application — especially anything graphical — its windows grab focus, its
+test keystrokes land in whatever document I'm typing, and my session becomes
+a shared input device with something that doesn't know I exist.
+
+I want agents to get *their own computer*: one they can break, reboot, fill
+with test data, and eventually throw away — while my session stays mine.
+
+Hard requirement: **an agent VM must never open a window on my host session.
+No focus stealing, no keyboard interception, ever.**
+
+## The core idea
+
+The VM runs its own display server, but the host never renders it.
+
+- QEMU runs as a background process with `-display none`; the guest's screen
+  exists only as a framebuffer accessible via VNC/SPICE sockets.
+- On the host's Wayland session, nothing appears, nothing takes focus, and
+  my keyboard never reaches the VM. The VM's inputs are its virtual devices.
+- The guest still runs a *real* Omarchy desktop (Hyprland, waybar, the
+  omarchy bar), so anything graphical is genuinely rendered — it's just
+  rendered into a framebuffer nobody is watching.
+
+### How agents "see" the GUI
+
+- `hyprctl` inside the VM reports true geometry: layer positions, bar size,
+  monitor resolution, workspace state.
+- `grim` takes screenshots inside the VM; the agent reads the PNG itself
+  (agents are multimodal). Same loop a human would use — launch, poke,
+  screenshot, edit, relaunch — with the picture delivered as a file instead
+  of to a monitor.
+- Typing/clicking when needed happens via `wtype`/`ydotool` or VNC input,
+  inside the VM only.
+- When *I* want to look, `omavroom peek <vm>` attaches a viewer on demand.
+  Disconnect, and it goes back to being invisible. Great for reviewing an
+  agent's work or debugging what it did.
+- Worst case, `omavroom destroy <vm>` kills a flaky or runaway VM and my
+  session was never part of the blast radius.
+
+### Discipline rule
+
+The agent never launches GUI apps on the host, only inside the VM via SSH.
+That single invariant is what keeps my session untouched.
+
+## What omavroom is
+
+A small central VM manager with an MCP interface.
+
+- Two seat types:
+  - `desktop` — full Omarchy guest with its own Hyprland session; for
+    graphical work (e.g. building an omarchy plugin, watching where the bar
+    actually renders).
+  - `terminal` — headless; SSH in and do builds/tests/terminal stuff.
+- A capacity pool: this machine declares a budget (starting point: 4 units —
+  a `desktop` costs 4, a `terminal` costs 1; tune after measuring real RAM
+  use. 15 GB total with ~11 GB already in use means roughly one desktop seat
+  today).
+- Agents request a seat, do their work, and release it. Seat claiming is
+  atomic (no "check then claim" races); if no seat is free, requests queue
+  fairly and wait for the next release.
+- Leases + heartbeats: a crashed or abandoned agent's seat is reclaimed
+  automatically.
+- Releasing a seat **destroys** that disposable VM — the next agent gets a
+  fresh machine, never someone's dirty leftovers.
+- Work is preserved by pushing to a repo from inside the VM *before*
+  release. If export fails, the VM is held for recovery instead of deleted.
+
+MCP is the right interface for this: opencode (and other agent hosts) speak
+it natively, so any agent can call tools like:
+
+- `pool_status` — what seats exist, what's busy
+- `request_seat` — take a `desktop` or `terminal` seat (queues if full)
+- `exec` — run commands in the VM over SSH
+- `screenshot` — grab the guest framebuffer as a PNG (desktop seats)
+- `input` — inject keystrokes/clicks inside the guest (desktop seats)
+- `peek_url` / `peek_attach` — let *me* watch when I want to
+- `release_seat` — verify work is exported, then destroy
+
+The manager is the only component that talks to QEMU; agents only ever see
+the MCP tools.
+
+## Machine fit (this box)
+
+- Bare metal, `/dev/kvm` present, 12 cores, ~835 GB free disk — plenty.
+- 15 GB RAM (~11 GB already in use) is the real limit: ~1 desktop seat
+  today. A RAM upgrade raises the seat count more than any software change.
+- Golden qcow2 base image (Arch + Omarchy preinstalled) + per-VM overlay
+  images: boot in seconds, teardown = delete the overlay.
+- virtio-gpu/virgl gives the guest Hyprland real OpenGL acceleration
+  without GPU passthrough — enough for bar/layout work.
+
+## Existing prior art (why we're building our own)
+
+- **microsandbox** — libkrun microVMs, MCP server, secrets stay host-side.
+  Closest general match, but headless-oriented; no real Omarchy desktop.
+- **SmolVM** — Firecracker/QEMU/libkrun VMs for agents with forwarded git
+  credentials; also headless-oriented.
+- **E2B / Beam beta9 / Mitos** — agent sandbox platforms; E2B self-host is
+  experimental, Mitos wants Kubernetes.
+- Avoid Daytona (went closed-source in June 2026).
+
+Nothing off-the-shelf spins up literal Omarchy desktop VMs and keeps them
+off my screen, so omavroom is a thin custom layer over QEMU + cloud-init,
+with a scheduler and an MCP server in front.
+
+## Build order
+
+1. **Prove the invisible desktop.** One Omarchy VM: boots with `-display
+   none`, runs Hyprland, screenshots via `grim` come back readable, SSH
+   provisioning works, `peek` works, nothing ever appears on my session.
+2. **Prove the terminal seat.** Same golden image, headless profile.
+3. **Prove work export.** Clone repo in VM, commit, push with a scoped
+   fine-grained PAT (ideally injected via a host-side proxy so the VM never
+   holds the token), verify, then destroy.
+4. **Scheduler + pool.** Atomic seat claiming, fair queue, leases with
+   heartbeats, auto-reclaim of dead leases, destroy-on-release.
+5. **MCP server.** Expose the tools above; wire it into opencode.
+6. **Golden image automation.** Scripted build of the base image (cloud-init
+   + Omarchy install) so it's reproducible and shareable.
+7. **Polish for sharing.** Install docs, capacity tuning guide, example
+   agent workflows.
+
+Steps 1–3 are the risk-reduction core; everything after is straightforward
+engineering.
+
+## Repository
+
+- Remote: <https://github.com/washburnello/omavroom> (public)
+- License: see LICENSE (TBD)
