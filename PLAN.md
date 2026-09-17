@@ -151,8 +151,10 @@ is a window *I* choose to keep on the side.
 - **Labels on each monitor.** Agent name, repo/project, seat type, elapsed
   time, lease/heartbeat state. Agents self-report a label when requesting
   a seat (required field).
-- **Terminal seats** get a status card (and optionally a text preview)
-  instead of a framebuffer thumbnail.
+- **Terminal seats** get a monitor too: a live text view of the guest's
+  terminal output (polled over SSH — e.g. a tmux/scrollback snapshot or a
+  streaming tail), in the same fixed slot with the same label treatment.
+  No framebuffer needed — the "screen" is the terminal.
 - **Click to peek.** Clicking a live slot opens the full viewer; closing it
   returns the VM to invisible.
 - **Settings.** Capacity budget, seat costs, lease/heartbeat timeouts,
@@ -162,10 +164,11 @@ is a window *I* choose to keep on the side.
 - **Thumbnails, technically:** poll each running VM's framebuffer
   (VNC/SPICE screenshot) every ~1–2 s, downscale, display. Cheap and
   decoupled from the guest.
-- **Build it last, thin.** The Command Center is a view over the manager's
-  API — not the manager itself. Build the headless manager + MCP + CLI
-  first; the dashboard comes after and can be a local web UI, so its
-  language is independent of the daemon's.
+- **Build it last, thin, native.** The Command Center is a real desktop
+  application (explicitly not a web page) and a view over the manager's
+  local API — not the manager itself. Build the headless manager + MCP +
+  CLI first; the dashboard comes after as a native client (likely a Python
+  GUI toolkit, given the daemon choice; Qt6 vs GTK4/libadwaita TBD).
 
 ## Herder integration (proposed)
 
@@ -189,9 +192,12 @@ task, or investigation, owning tabs and panes, with agent states
 
 - Golden image: stored **locally** on this machine (qcow2 base + overlays).
 - Git auth in VMs: plain scoped fine-grained **PAT** for v1; proxy later.
-- Daemon language: **undecided** — Python vs Go vs Rust comparison pending.
-- Command Center: accepted as the post-core UI milestone (thin web UI over
-  the manager API); fixed-slot "monitor wall" metaphor adopted.
+- Daemon language: **Python** (FastMCP server; fastest path to a working
+  proof; clean QEMU/MCP boundary preserved in case of a later rewrite).
+- Command Center: accepted as the post-core UI milestone — a **native
+  desktop application** over the manager's local API; fixed-slot "monitor
+  wall" metaphor adopted; terminal seats get live terminal-output
+  monitors. GUI toolkit TBD (Qt6 vs GTK4/libadwaita).
 
 ## Repository
 
