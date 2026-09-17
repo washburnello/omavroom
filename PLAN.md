@@ -67,9 +67,10 @@ A small central VM manager with an MCP interface.
   today). Admission is dynamic — the manager checks actual free host RAM
   minus a configured headroom floor at claim time and refuses when there is
   no room — with static budgets, seat costs, and overrides settable in
-  config. Static values bound, live measurement admits. (Open: whether a
-  desktop may consume the whole budget or 1 unit stays reserved for
-  terminals.)
+  config. Static values bound, live measurement admits. (Decision: the
+  settings expose a min/max seat count per seat type — graphical and
+  terminal — so the operator decides how resources split between agent
+  lanes instead of the scheduler imposing one policy.)
 - Agents request a seat, do their work, and release it. Seat claiming is
   atomic (no "check then claim" races); if no seat is free, requests queue
   fairly and wait for the next release.
@@ -268,10 +269,11 @@ task, or investigation, owning tabs and panes, with agent states
   (no decision needed — requirement, values tuned from measurement).
 - Golden image v1: hand-build + snapshot (slow layer baked, per-VM fast
   layer injected at provision); scripted builds later.
-- Open: seat reservation policy (may a desktop consume the whole budget,
-  or is 1 unit reserved for terminals?); license (MIT suggested).
+- Seat split: user-configured min/max seat counts per seat type
+  (graphical vs terminal) in settings; no hardcoded scheduler policy.
+- License: **MIT** (see LICENSE).
 
 ## Repository
 
 - Remote: <https://github.com/washburnello/omavroom> (public)
-- License: see LICENSE (TBD)
+- License: MIT (see LICENSE)
