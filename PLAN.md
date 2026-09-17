@@ -155,6 +155,11 @@ is a window *I* choose to keep on the side.
   terminal output (polled over SSH — e.g. a tmux/scrollback snapshot or a
   streaming tail), in the same fixed slot with the same label treatment.
   No framebuffer needed — the "screen" is the terminal.
+- **Queue sidebar.** The scheduler already knows who's waiting (agent
+  label, project, requested seat type, position, wait time) — the sidebar
+  just renders it. Shows who's next and what each waiter wants; when a
+  seat frees, the handoff is visible: the waiter leaves the sidebar and
+  its slot's monitor comes alive.
 - **Click to peek.** Clicking a live slot opens the full viewer; closing it
   returns the VM to invisible.
 - **Settings.** Capacity budget, seat costs, lease/heartbeat timeouts,
@@ -169,6 +174,24 @@ is a window *I* choose to keep on the side.
   local API — not the manager itself. Build the headless manager + MCP +
   CLI first; the dashboard comes after as a native client (likely a Python
   GUI toolkit, given the daemon choice; Qt6 vs GTK4/libadwaita TBD).
+
+## Visual polish (final milestone, after everything works)
+
+Explicitly last: make it beautiful once it's functional.
+
+- Smooth animations with easing throughout: waiters gliding out of the
+  queue sidebar into their slot, monitors flickering on at boot, state
+  changes (booting → ready → busy → tearing down) expressed visually, not
+  just as text.
+- The monitor shows the VM's actual boot/install/init streaming live as it
+  happens — watching a machine come alive in its slot.
+- CRT shader per monitor so each slot reads as a physical screen.
+- Rationale: polish makes the tool feel approachable and intuitive, which
+  is what gets people to actually use it (Grocbot-style precedent).
+- Toolkit implication (noted, not decided): this level of animation and
+  per-monitor shader work favors a toolkit with real animation + shader
+  support — among the Python candidates, that points more toward Qt6/QML
+  than GTK4/libadwaita. Revisit when the Command Center milestone starts.
 
 ## Herder integration (proposed)
 
@@ -197,7 +220,10 @@ task, or investigation, owning tabs and panes, with agent states
 - Command Center: accepted as the post-core UI milestone — a **native
   desktop application** over the manager's local API; fixed-slot "monitor
   wall" metaphor adopted; terminal seats get live terminal-output
-  monitors. GUI toolkit TBD (Qt6 vs GTK4/libadwaita).
+  monitors; queue sidebar rendering scheduler state. GUI toolkit TBD
+  (Qt6 vs GTK4/libadwaita — polish milestone leans Qt6/QML).
+- Visual polish (animations, live boot stream, CRT shader): final
+  milestone, after core + Command Center.
 
 ## Repository
 
