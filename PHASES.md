@@ -34,10 +34,12 @@ config loads with sane defaults.
 ## Phase 1 — Prove the invisible desktop (risk-reduction core)
 
 Spec: libvirt control plane on this box; golden base image v1 (hand-built
-Arch + Omarchy + Hyprland + guest tools, snapshotted read-only); per-VM
-overlay; boot with no local display; Hyprland session up; `grim`
-screenshot readable off-VM; SSH provisioned with key auth; `peek` attaches
-on demand; **nothing ever appears on the host session**.
+Arch + Hyprland + guest tools, snapshotted read-only — full Omarchy
+install deferred to Phase 7, this phase proves the invisible-desktop
+mechanism); per-VM overlay; boot with no local display; Hyprland session
+up; `grim` screenshot readable off-VM; SSH provisioned with key auth;
+`peek` endpoint proven (listening, never opened); **nothing ever appears
+on the host session**.
 
 Accept: a scripted proof run producing the screenshot artifact, the SSH
  transcript, and a signed checklist (no host window, compositor up,
@@ -66,7 +68,10 @@ Spec: capacity pool with per-type min/max from config; atomic seat
 claiming; fair queue with positions; leases + independent heartbeat
 channel with auto-reclaim; dynamic admission (live free-RAM check minus
 headroom floor); mandatory libvirt CPU/RAM caps + overlay disk quotas;
-sqlite state surviving daemon restarts; destroy-on-release.
+sqlite state surviving daemon restarts; destroy-on-release. Autostart
+policy (learned Phase 1): golden bases never autostart — only the manager
+starts seats, so a host reboot never resurrects a 4 GiB guest outside
+manager authority.
 
 Accept: concurrency tests (over-claim refused, queue order fair, dead
 lease reclaimed, daemon restart reattaches, release destroys); resource

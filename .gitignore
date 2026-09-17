@@ -19,3 +19,9 @@ build/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+
+# omavroom local artifacts (Phase 1): VM disk images + installer ISOs live
+# outside the repo (~/.local/share/omavroom, ~/.cache/omavroom); ignore any
+# copies that land in the worktree.
+*.qcow2
+*.iso
