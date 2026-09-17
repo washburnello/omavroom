@@ -64,7 +64,12 @@ A small central VM manager with an MCP interface.
 - A capacity pool: this machine declares a budget (starting point: 4 units —
   a `desktop` costs 4, a `terminal` costs 1; tune after measuring real RAM
   use. 15 GB total with ~11 GB already in use means roughly one desktop seat
-  today).
+  today). Admission is dynamic — the manager checks actual free host RAM
+  minus a configured headroom floor at claim time and refuses when there is
+  no room — with static budgets, seat costs, and overrides settable in
+  config. Static values bound, live measurement admits. (Open: whether a
+  desktop may consume the whole budget or 1 unit stays reserved for
+  terminals.)
 - Agents request a seat, do their work, and release it. Seat claiming is
   atomic (no "check then claim" races); if no seat is free, requests queue
   fairly and wait for the next release.
@@ -78,16 +83,23 @@ A small central VM manager with an MCP interface.
 MCP is the right interface for this: opencode (and other agent hosts) speak
 it natively, so any agent can call tools like:
 
-- `pool_status` — what seats exist, what's busy
-- `request_seat` — take a `desktop` or `terminal` seat (queues if full)
-- `exec` — run commands in the VM over SSH
-- `screenshot` — grab the guest framebuffer as a PNG (desktop seats)
+- `pool_status` — what seats exist, what's busy, who's queued
+- `request_seat` — returns a pending request (queues if full); `seat_status`
+  follows it through queued → provisioning → ready
+- `exec_start` / `exec_poll` / `exec_kill` — long-running commands stream
+  output as a capped ring buffer; nothing agent-facing blocks
+- `heartbeat` — lightweight lease renewal on its own channel, independent
+  of execs, so long commands never look like dead agents
+- `screenshot` — grab the guest framebuffer as a PNG (desktop seats;
+  downscaled to protect agent context budgets)
 - `input` — inject keystrokes/clicks inside the guest (desktop seats)
 - `peek_url` / `peek_attach` — let *me* watch when I want to
-- `release_seat` — verify work is exported, then destroy
+- `release_seat` — kill execs, verify work is exported, then destroy
 
-The manager is the only component that talks to QEMU; agents only ever see
-the MCP tools.
+The manager is the only component that talks to libvirt/QEMU; agents only
+ever see the MCP tools. The agent itself runs on the host (opencode); the
+VM is purely an execution sandbox, so LLM API keys never enter disposable
+guests.
 
 ## Machine fit (this box)
 
@@ -110,8 +122,11 @@ the MCP tools.
 - Avoid Daytona (went closed-source in June 2026).
 
 Nothing off-the-shelf spins up literal Omarchy desktop VMs and keeps them
-off my screen, so omavroom is a thin custom layer over QEMU + cloud-init,
-with a scheduler and an MCP server in front.
+off my screen, so omavroom is a thin custom layer over libvirt/QEMU +
+cloud-init, with a scheduler and an MCP server in front. libvirt (not
+hand-rolled QEMU processes) is the control plane: lifecycle, DHCP leases,
+`virsh screenshot`, cgroup CPU/RAM limits, and reattaching to running VMs
+after a daemon restart.
 
 ## Build order
 
@@ -130,8 +145,12 @@ with a scheduler and an MCP server in front.
 6. **Golden image automation.** Scripted build of the base image (cloud-init
    + Omarchy install), stored locally on this machine, so it's reproducible
    and shareable. (Decision: golden image lives locally — qcow2 base kept
-   read-only, per-VM copy-on-write overlays. Multiple named images come
-   later, managed from the Command Center.)
+   read-only, per-VM copy-on-write overlays. v1 is hand-built and
+   snapshotted: the slow layer — OS, Omarchy, desktop, guest tools
+   (hyprctl/grim/wtype) — is baked in, while per-VM uniqueness (hostname,
+   machine-id, SSH host keys, user key, PAT, repo clone) is injected at
+   provision time in seconds. Fully scripted builds come later. Multiple
+   named images come later, managed from the Command Center.)
 7. **Polish for sharing.** Install docs, capacity tuning guide, example
    agent workflows.
 
@@ -237,6 +256,20 @@ task, or investigation, owning tabs and panes, with agent states
   milestone, after core + Command Center.
 - TUI companion: metadata-only Textual app (layout + labels + queue, no
   framebuffer contents) for SSH monitoring; native GUI stays primary.
+- Agent topology: **host-side** — opencode runs on the host, VM is purely
+  an execution sandbox.
+- Control plane: **libvirt**, not raw QEMU.
+- Capacity: dynamic admission (live free-RAM check minus headroom floor)
+  with static config budgets and manual overrides; static bounds, live
+  measurement admits.
+- MCP API is async-first (`exec_start`/`exec_poll`/`exec_kill`,
+  pending seat requests, independent `heartbeat`); nothing blocks.
+- Per-seat CPU/RAM caps + overlay disk quota are mandatory from day one
+  (no decision needed — requirement, values tuned from measurement).
+- Golden image v1: hand-build + snapshot (slow layer baked, per-VM fast
+  layer injected at provision); scripted builds later.
+- Open: seat reservation policy (may a desktop consume the whole budget,
+  or is 1 unit reserved for terminals?); license (MIT suggested).
 
 ## Repository
 
