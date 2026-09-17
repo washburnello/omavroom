@@ -163,11 +163,15 @@ engineering.
 An opt-in local dashboard window — the VMs never force windows open; this
 is a window *I* choose to keep on the side.
 
-- **Fixed monitor wall.** A fixed number of slots (4 on this box, matching
-  the capacity budget). An active VM connects its framebuffer to a slot and
-  the slot shows a live scaled-down thumbnail; a torn-down VM leaves its
-  slot in place showing "off / no signal". Slots never appear or disappear,
-  so the layout is spatially stable.
+- **Monitor wall.** Slot counts come from settings (e.g. max 3 graphical +
+  max 2 terminal) and every slot is always rendered — slots never appear
+  or disappear on VM lifecycle events; a torn-down VM leaves its slot in
+  place showing "off / no signal". Within that, the layout is a responsive
+  grid that packs all slots to fill the window pleasingly: graphical tiles
+  large (~16:9 live thumbnails), terminal tiles compact (live text views).
+  No rigid lanes with permanent empty holes; no reflow that moves occupied
+  slots when a VM exits. Window resizes may rescale/repack (user-initiated,
+  expected); VM exits only ever turn a screen off in place.
 - **Labels on each monitor.** Agent name, repo/project, seat type, elapsed
   time, lease/heartbeat state. Agents self-report a label when requesting
   a seat (required field).
