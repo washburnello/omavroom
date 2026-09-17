@@ -169,20 +169,17 @@ is a window *I* choose to keep on the side.
 - **Thumbnails, technically:** poll each running VM's framebuffer
   (VNC/SPICE screenshot) every ~1–2 s, downscale, display. Cheap and
   decoupled from the guest.
-- **TUI alternative (considered, not chosen).** A Textual-based terminal
-  Command Center is technically viable: modern terminals render real pixel
-  images (not ASCII art) via the Kitty graphics protocol (Ghostty, Kitty),
-  Sixel (foot, WezTerm), or iTerm2 inline images, with Unicode half-block
-  fallback; Python widgets (textual-kitty, par-textual-image) already wrap
-  this with protocol auto-detection, and Textual itself has easing-based
-  animation. Limits: emulator-dependent (notably, Alacritty supports none
-  of the image protocols), thumbnails would refresh as a low-fps slideshow
-  rather than video, and the CRT look would be CPU-simulated scanlines,
-  not a real GPU shader. Verdict: keep the native app as the plan, but a
-  Textual TUI is the natural mid-fidelity progression — `status --watch`
-  first, then a Textual monitor wall in the same language as the daemon,
-  then the full native GUI. The TUI could live on permanently as the
-  terminal-native view; both read the same manager API.
+- **TUI companion (decided).** Alongside the native GUI, a Textual-based
+  terminal view with exactly one job: monitoring over SSH. By design it
+  shows no framebuffer contents — just the monitor layout in ASCII, which
+  agent/project is attached to each slot, seat state, and the queue
+  sidebar. Metadata-only on purpose: no image-protocol dependency, so it
+  works in any terminal (Alacritty included) and stays light over SSH.
+  (Terminal image protocols — Kitty graphics, Sixel, iTerm2 inline —
+  were evaluated and rejected for this view; they would buy thumbnails at
+  the cost of emulator dependence.) The native GUI remains the primary
+  Command Center and the only place that renders monitor contents. Both
+  read the same manager API.
 - **Build it last, thin, native.** The Command Center is a real desktop
   application (explicitly not a web page) and a view over the manager's
   local API — not the manager itself. Build the headless manager + MCP +
@@ -238,6 +235,8 @@ task, or investigation, owning tabs and panes, with agent states
   (Qt6 vs GTK4/libadwaita — polish milestone leans Qt6/QML).
 - Visual polish (animations, live boot stream, CRT shader): final
   milestone, after core + Command Center.
+- TUI companion: metadata-only Textual app (layout + labels + queue, no
+  framebuffer contents) for SSH monitoring; native GUI stays primary.
 
 ## Repository
 
