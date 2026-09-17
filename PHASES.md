@@ -82,6 +82,35 @@ Accept: concurrency tests (over-claim refused, queue order fair, dead
 lease reclaimed, daemon restart reattaches, release destroys); resource
 limit tests (fork-bomb/memory-hog contained).
 
+Phase 3 audit deltas (binding on the daemon design):
+- **Content gate before push (must-have).** Phase 3 proved export
+  faithfully pushes whatever the guest committed — including a commit
+  that deleted nearly the whole tree. The daemon must enforce diffstat
+  sanity limits, protected paths, and/or approval for destructive
+  exports before anything reaches a remote.
+- **Lock scope + ordering:** per-VM *and* per-repo locks with a defined
+  order across export vs reset vs release vs concurrent exports (the
+  update-ref CAS fix in Phase 3 closed the instance; the daemon needs
+  the general mutex).
+- **Quarantine-before-trust:** fetch to `refs/omavroom/*` staging, then
+  `git fsck`, pack/blob/size caps, and the content gate. Bundle
+  integrity proves self-consistency with a guest-advertised SHA, not
+  benign-ness — the guest chooses the SHA.
+- Base prerequisite (host checkout must contain the bundle base or fall
+  back to fuller bundles); `git stash list` must be empty (porcelain
+  misses stashes); submodule policy decided; guest host keys pinned
+  (no TOFU); branch names validated (`git check-ref-format` + allowlist,
+  fully-qualified refspecs); remote-is-truth retry semantics; export
+  provenance logged (consider host-signed tag on push).
+- Snapshot lineage rule: `term-git` is a disposable Phase 3 convenience;
+  Phase 7 golden automation installs git in the base and collapses the
+  fork. Per-seat identity regeneration (machine-id + SSH host keys)
+  required before multi-seat snapshotting.
+- Disposition: Phase 3 proof commit `2bb6cb1` remains publicly reachable
+  by SHA on GitHub despite branch deletion (GitHub serves unreferenced
+  objects indefinitely) — accepted as a benign public test artifact
+  (4-line text file, no secrets); "GC will clean it" is struck.
+
 ## Phase 5 — MCP server + opencode wiring
 
 Spec: FastMCP server exposing the async toolset (`pool_status`,
