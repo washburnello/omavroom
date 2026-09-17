@@ -78,8 +78,12 @@ A small central VM manager with an MCP interface.
   automatically.
 - Releasing a seat **destroys** that disposable VM — the next agent gets a
   fresh machine, never someone's dirty leftovers.
-- Work is preserved by pushing to a repo from inside the VM *before*
-  release. If export fails, the VM is held for recovery instead of deleted.
+- Work is preserved by host-side export *before* release: the agent
+  commits on a task branch in the guest, the host pulls a `git bundle`
+  over SSH, applies it to its own checkout, and pushes with the host's
+  own credentials. The VM holds zero GitHub credentials — no PAT to
+  create, scope, rotate, or leak. If export fails, the VM is held for
+  recovery instead of deleted.
 
 MCP is the right interface for this: opencode (and other agent hosts) speak
 it natively, so any agent can call tools like:
@@ -135,11 +139,11 @@ after a daemon restart.
    none`, runs Hyprland, screenshots via `grim` come back readable, SSH
    provisioning works, `peek` works, nothing ever appears on my session.
 2. **Prove the terminal seat.** Same golden image, headless profile.
-3. **Prove work export.** Clone repo in VM, commit, push with a scoped
-   fine-grained PAT injected at provision time, verify, then destroy.
-   (Decision: plain PAT for v1. The VM holds the token; acceptable because
-   VMs are disposable and local. A host-side credential proxy that keeps
-   secrets out of the guest is a possible later hardening step.)
+3. **Prove work export.** Commit on a task branch in the VM, pull a `git
+   bundle` to the host over SSH, apply and push with host credentials,
+   verify SHA, then destroy. (Decision: no PAT at all — host-side export.
+   The VM never holds a token, which also moots the planned credential
+   proxy: there is no secret left to proxy.)
 4. **Scheduler + pool.** Atomic seat claiming, fair queue, leases with
    heartbeats, auto-reclaim of dead leases, destroy-on-release.
 5. **MCP server.** Expose the tools above; wire it into opencode.
@@ -249,6 +253,11 @@ task, or investigation, owning tabs and panes, with agent states
 ## Decisions log
 
 - Golden image: stored **locally** on this machine (qcow2 base + overlays).
+- Git auth: **no PAT** — host-side export via `git bundle` over SSH; the
+  guest never holds credentials. (Supersedes the earlier v1-PAT decision:
+  push-from-guest was a leftover from before the host-side-agent topology
+  was locked; host-driven export fits that topology and removes the
+  secret entirely.)
 - Git auth in VMs: plain scoped fine-grained **PAT** for v1; proxy later.
 - Daemon language: **Python** (FastMCP server; fastest path to a working
   proof; clean QEMU/MCP boundary preserved in case of a later rewrite).

@@ -53,14 +53,19 @@ Spec: headless seat profile from the same base (no compositor, lower RAM);
 Accept: terminal seat boots/clones/pushes/destroys; wedged-seat reset
 demonstrated (break it on purpose, reset, show clean).
 
-## Phase 3 — Prove work export
+## Phase 3 — Prove work export (host-side, no PAT)
 
-Spec: clone in VM, commit, push with scoped fine-grained PAT injected at
-provision; verify via clean `git status` + local SHA == `ls-remote` before
-destroy; failed export holds the VM for recovery instead of deleting.
+Spec: no PAT anywhere — the guest never holds credentials. Install `git`
+in the seat image; agent commits on a task branch in the guest (guest
+`git status --porcelain` must be clean before export, forcing everything
+into commits); host pulls a `git bundle` over SSH, verifies it, applies it
+to its own checkout, and pushes with the host's own credentials; verify
+pushed SHA == `ls-remote` before destroy; failed export holds the VM for
+recovery instead of deleting.
 
-Accept: end-to-end run ending in a real commit on GitHub from inside a VM;
-a simulated push failure demonstrably preserves the VM.
+Accept: hermetic proof (bundle → host bare repo, SHA match) plus one live
+push of a `phase3-proof` branch to GitHub and remote deletion afterwards;
+a simulated export failure demonstrably preserves the VM.
 
 ## Phase 4 — Scheduler + manager daemon
 
