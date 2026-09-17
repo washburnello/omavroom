@@ -120,18 +120,78 @@ with a scheduler and an MCP server in front.
    provisioning works, `peek` works, nothing ever appears on my session.
 2. **Prove the terminal seat.** Same golden image, headless profile.
 3. **Prove work export.** Clone repo in VM, commit, push with a scoped
-   fine-grained PAT (ideally injected via a host-side proxy so the VM never
-   holds the token), verify, then destroy.
+   fine-grained PAT injected at provision time, verify, then destroy.
+   (Decision: plain PAT for v1. The VM holds the token; acceptable because
+   VMs are disposable and local. A host-side credential proxy that keeps
+   secrets out of the guest is a possible later hardening step.)
 4. **Scheduler + pool.** Atomic seat claiming, fair queue, leases with
    heartbeats, auto-reclaim of dead leases, destroy-on-release.
 5. **MCP server.** Expose the tools above; wire it into opencode.
 6. **Golden image automation.** Scripted build of the base image (cloud-init
-   + Omarchy install) so it's reproducible and shareable.
+   + Omarchy install), stored locally on this machine, so it's reproducible
+   and shareable. (Decision: golden image lives locally — qcow2 base kept
+   read-only, per-VM copy-on-write overlays. Multiple named images come
+   later, managed from the Command Center.)
 7. **Polish for sharing.** Install docs, capacity tuning guide, example
    agent workflows.
 
 Steps 1–3 are the risk-reduction core; everything after is straightforward
 engineering.
+
+## Command Center (proposed, not yet built)
+
+An opt-in local dashboard window — the VMs never force windows open; this
+is a window *I* choose to keep on the side.
+
+- **Fixed monitor wall.** A fixed number of slots (4 on this box, matching
+  the capacity budget). An active VM connects its framebuffer to a slot and
+  the slot shows a live scaled-down thumbnail; a torn-down VM leaves its
+  slot in place showing "off / no signal". Slots never appear or disappear,
+  so the layout is spatially stable.
+- **Labels on each monitor.** Agent name, repo/project, seat type, elapsed
+  time, lease/heartbeat state. Agents self-report a label when requesting
+  a seat (required field).
+- **Terminal seats** get a status card (and optionally a text preview)
+  instead of a framebuffer thumbnail.
+- **Click to peek.** Clicking a live slot opens the full viewer; closing it
+  returns the VM to invisible.
+- **Settings.** Capacity budget, seat costs, lease/heartbeat timeouts,
+  default images per seat type, PAT storage (system keyring).
+- **Golden image management.** List local images, build new ones from the
+  scripted flow, set defaults. Multiple named images supported here.
+- **Thumbnails, technically:** poll each running VM's framebuffer
+  (VNC/SPICE screenshot) every ~1–2 s, downscale, display. Cheap and
+  decoupled from the guest.
+- **Build it last, thin.** The Command Center is a view over the manager's
+  API — not the manager itself. Build the headless manager + MCP + CLI
+  first; the dashboard comes after and can be a local web UI, so its
+  language is independent of the daemon's.
+
+## Herder integration (proposed)
+
+Note: Herdr (the terminal workspace manager for coding agents) calls its
+project containers **workspaces**, not spaces — one workspace per repo,
+task, or investigation, owning tabs and panes, with agent states
+(working/blocked/done/idle) rolling up per workspace.
+
+- The idea is sound: bind a Herdr workspace to a Command Center image, so
+  seats spun up for that workspace use the right golden image.
+- Keep authority split: omavroom owns VM/seat truth; Herdr owns
+  pane/agent-state truth; join on the workspace name passed as the seat
+  label. v1 is a config map (workspace name or pattern → image) plus
+  showing the workspace name on the monitor card.
+- Deeper integration (querying Herdr's socket API/CLI to show live agent
+  state next to each VM, or driving Herdr panes from omavroom) is possible
+  — Herdr documents a CLI + local socket API — but deferred until the core
+  VM path works.
+
+## Decisions log
+
+- Golden image: stored **locally** on this machine (qcow2 base + overlays).
+- Git auth in VMs: plain scoped fine-grained **PAT** for v1; proxy later.
+- Daemon language: **undecided** — Python vs Go vs Rust comparison pending.
+- Command Center: accepted as the post-core UI milestone (thin web UI over
+  the manager API); fixed-slot "monitor wall" metaphor adopted.
 
 ## Repository
 
