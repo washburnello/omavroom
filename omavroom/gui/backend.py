@@ -75,6 +75,8 @@ class WallBackend(QObject):
     requestAction = Signal(str, int)
     requestAdmission = Signal(str)
     requestPollInterval = Signal(float)
+    #: Ask the worker to change the screenshot capture width (sharp tiles).
+    requestScreenshotWidth = Signal(int)
 
     def __init__(
         self,
@@ -95,6 +97,7 @@ class WallBackend(QObject):
         #: Key of the enlarged/focused slot, or None for the uniform wall.
         self._focused_key: str | None = None
         self._layout_revision = 0
+        self._screenshot_request_width = 0
         self._daemon_ok = False
         self._daemon_message = "connecting to daemon..."
         self._notice = ""
@@ -215,6 +218,7 @@ class WallBackend(QObject):
         if plan_changed:
             self.slotKeysChanged.emit()
             self._bump_layout()
+            self._emit_screenshot_width()
         self.revisionChanged.emit()
         self.queueChanged.emit()
         self.attentionChanged.emit()
@@ -294,6 +298,7 @@ class WallBackend(QObject):
         self._viewport_h = h
         self._columns = grid_columns(w)
         self._bump_layout()
+        self._emit_screenshot_width()
 
     @Slot(int, result="QVariantMap")
     def slotRectAt(self, index: int) -> dict:
@@ -342,6 +347,21 @@ class WallBackend(QObject):
     def _bump_layout(self) -> None:
         self._layout_revision += 1
         self.layoutChanged.emit()
+
+    def _emit_screenshot_width(self) -> None:
+        """Ask the worker for screenshots as wide as the largest tile.
+
+        Capturing at the display size (2x for crispness, hard-capped) keeps
+        the monitor sharp instead of upscaling a small thumbnail.
+        """
+        rects = self._slot_rects()
+        if not rects:
+            return
+        widest = max(rect.width for rect in rects)
+        desired = int(max(640, min(2048, widest * 2)))
+        if desired != self._screenshot_request_width:
+            self._screenshot_request_width = desired
+            self.requestScreenshotWidth.emit(desired)
 
     @Slot(str)
     def openViewer(self, endpoint: str) -> None:
@@ -477,6 +497,11 @@ class PollWorker(QObject):
         self._interval_s = max(0.25, float(seconds))
         if self._timer is not None:
             self._timer.setInterval(int(self._interval_s * 1000))
+
+    @Slot(int)
+    def set_screenshot_width(self, max_width: int) -> None:
+        """Capture width for desktop thumbnails (kept sharp to the tile)."""
+        self._screenshot_max_width = max(160, min(2048, int(max_width)))
 
     @Slot()
     def poll_once(self) -> None:

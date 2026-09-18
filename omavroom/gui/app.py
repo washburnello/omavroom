@@ -22,7 +22,7 @@ from pathlib import Path
 from omavroom.config import Config
 
 DEFAULT_POLL_INTERVAL_S = 2.0
-DEFAULT_SCREENSHOT_WIDTH = 480
+DEFAULT_SCREENSHOT_WIDTH = 1024
 VIEWER_ENV_VAR = "OMAVROOM_VIEWER"
 
 
@@ -110,6 +110,7 @@ def run_gui(
     backend.requestAction.connect(worker.perform_action)
     backend.requestAdmission.connect(worker.set_admission)
     backend.requestPollInterval.connect(worker.set_interval)
+    backend.requestScreenshotWidth.connect(worker.set_screenshot_width)
 
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("backend", backend)

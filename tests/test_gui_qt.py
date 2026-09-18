@@ -358,6 +358,9 @@ def test_wall_fits_all_slots_inside_the_wall_area():
             assert rect["y"] + rect["height"] <= height + 0.5
         # Everything fits AND fills the height: no empty band beneath the wall.
         assert max(r["y"] + r["height"] for r in rects) >= height - 1.0
+        # Screenshots are captured at the tile size (sharp), not a tiny 480px.
+        widest = max(r["width"] for r in rects)
+        assert backend._screenshot_request_width >= widest
     finally:
         engine.deleteLater()
         app.processEvents()

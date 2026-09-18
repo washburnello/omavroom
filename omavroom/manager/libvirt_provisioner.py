@@ -1690,8 +1690,14 @@ class LibvirtProvisioner(Provisioner):
                 commands.append(self._click_command(event.value))
         if not commands:
             return
-        joined = " && ".join(commands)
-        result = self.run(vm_ref, joined, env=self._desktop_env(), timeout_s=60)
+        # The Wayland env must apply to EVERY command, not just the first in an
+        # "&&" chain (``env A=1 cmd1 && cmd2`` leaves cmd2 without it), so
+        # export it once for the whole remote shell.
+        env_exports = " ".join(
+            f"{key}={_quote(value)}" for key, value in self._desktop_env().items()
+        )
+        joined = f"export {env_exports}; " + " && ".join(commands)
+        result = self.run(vm_ref, joined, timeout_s=60)
         if not result.ok:
             raise ProvisionerError(f"input injection failed on {vm_ref}: {result.stderr.strip()}")
 
