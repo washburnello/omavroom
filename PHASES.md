@@ -188,6 +188,17 @@ images, PAT via keyring); image management.
 Accept: side-by-side run with CLI showing identical state; lifecycle events
 never move occupied slots; teardown reads as screen-off.
 
+Status: PHASE 8A COMPLETE (2026-09-18). PySide6/QML `omavroom-gui`
+(+ `omavroom gui`): responsive packed grid of permanent settings-derived
+slots, desktop thumbnails polled on a worker thread, terminal exec-activity
+text, sticky no-reflow teardown, queue sidebar, needs_attention with
+recovery actions, settings + admission override, desktop-only click-to-peek,
+interruptible non-blocking shutdown. 470 tests. Remaining for Phase 8B
+before this phase fully closes: editable settings (min/max/timeouts),
+in-GUI image management, and the Phase 9 add-ons below. PySide6 is
+currently a core dependency (648 MB) — move to an optional `gui` extra in
+Phase 10.
+
 ## Phase 9 — Visual polish (final functional milestone)
 
 Spec: easing animations throughout (queue→slot handoff, power on/off,
