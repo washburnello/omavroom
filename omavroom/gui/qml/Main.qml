@@ -109,10 +109,13 @@ ApplicationWindow {
         }
     }
 
-    RowLayout {
+    // Deterministic split: the sidebar is a fixed-width column pinned right;
+    // the wall takes all the remaining space. (A RowLayout starved the plain
+    // Item to a few pixels, so anchors do the split explicitly.)
+    Item {
+        id: content
         anchors.fill: parent
         anchors.topMargin: daemonBanner.height
-        spacing: 0
 
         // Fit-to-window wall: no scrolling. Each tile is positioned/sized by
         // the pure layout in the backend, and animates to its new geometry
@@ -120,8 +123,14 @@ ApplicationWindow {
         Item {
             id: wallArea
             objectName: "wallArea"
-            Layout.fillWidth: true
-            Layout.fillHeight: true
+            anchors.left: parent.left
+            anchors.right: sidebar.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 10
+            anchors.rightMargin: 10
+            anchors.topMargin: 10
+            anchors.bottomMargin: 10
             clip: true
             onWidthChanged: root.syncWallSize()
             onHeightChanged: root.syncWallSize()
@@ -150,8 +159,14 @@ ApplicationWindow {
         }
 
         ColumnLayout {
-            Layout.preferredWidth: 350
-            Layout.fillHeight: true
+            id: sidebar
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            anchors.rightMargin: 10
+            anchors.topMargin: 10
+            anchors.bottomMargin: 10
+            width: 340
             spacing: 8
             QueuePanel {
                 Layout.fillWidth: true
@@ -163,7 +178,6 @@ ApplicationWindow {
             }
             Label {
                 Layout.fillWidth: true
-                Layout.margins: 8
                 visible: backend.lastMessage !== ""
                 text: backend.lastMessage
                 color: "#7d8590"
