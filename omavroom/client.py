@@ -48,6 +48,7 @@ import time
 from pathlib import Path
 
 from omavroom.daemon import default_socket_path
+from omavroom.manager.execs import DEFAULT_LIST_OUTPUT_BUDGET_BYTES
 from omavroom.manager.provisioner import InputEvent, RepoSpec
 
 DEFAULT_TIMEOUT_S = 30.0
@@ -299,8 +300,23 @@ class DaemonClient:
     def list_events(self, *, limit: int | None = 200) -> list:
         return self.call("list_events", limit=limit)
 
-    def list_execs(self, seat_id: int) -> list:
-        return self.call("list_execs", seat_id=seat_id)
+    def list_execs(
+        self,
+        seat_id: int,
+        *,
+        include_output: bool = True,
+        max_total_output_bytes: int | None = DEFAULT_LIST_OUTPUT_BUDGET_BYTES,
+    ) -> list:
+        """Bounded exec list; ``include_output=False`` for metadata only.
+
+        Pass ``max_total_output_bytes=None`` for the full per-record rings.
+        """
+        return self.call(
+            "list_execs",
+            seat_id=seat_id,
+            include_output=include_output,
+            max_total_output_bytes=max_total_output_bytes,
+        )
 
     def heartbeat(
         self,
@@ -367,10 +383,12 @@ class DaemonClient:
     def exec_kill(self, seat_id: int, exec_id: str, *, signal: int = 9) -> dict:
         return self.call("exec_kill", seat_id=seat_id, exec_id=exec_id, signal=signal)
 
-    def screenshot(self, seat_id: int, *, max_width: int | None = None) -> bytes:
+    def screenshot(
+        self, seat_id: int, *, max_width: int | None = None, max_bytes: int | None = None
+    ) -> bytes:
         import base64
 
-        result = self.call("screenshot", seat_id=seat_id, max_width=max_width)
+        result = self.call("screenshot", seat_id=seat_id, max_width=max_width, max_bytes=max_bytes)
         return base64.b64decode(result["png_base64"])
 
     def input(self, seat_id: int, events: list[InputEvent] | list[dict]) -> dict:

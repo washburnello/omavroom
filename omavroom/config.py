@@ -42,6 +42,7 @@ defaults for anything unset:
     max_output_bytes = 1048576
     max_runtime_s = 3600
     max_concurrent_per_seat = 4
+    max_concurrent_total = 16
     [export]
     max_files_changed = 200
     max_insertions = 5000
@@ -119,6 +120,7 @@ _SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "max_output_bytes": _INT,
         "max_runtime_s": _INT,
         "max_concurrent_per_seat": _INT,
+        "max_concurrent_total": _INT,
     },
     "admission": {"dynamic": _BOOL, "override": _STR},
     "export": {
@@ -313,12 +315,14 @@ class ExecConfig:
     max_output_bytes: int = 1_048_576
     max_runtime_s: int = 3600
     max_concurrent_per_seat: int = 4
+    max_concurrent_total: int = 16
 
     def __post_init__(self) -> None:
         for name in (
             "max_output_bytes",
             "max_runtime_s",
             "max_concurrent_per_seat",
+            "max_concurrent_total",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1")

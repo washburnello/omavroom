@@ -28,6 +28,11 @@ Phase 5 mapping / frozen contract
   ``exec_poll`` returns ``stdout``/``stderr``/``exit_code``/``truncated``
   from bounded (ring) buffers; ``exec_output`` streams into the buffer and
   ``exec_finish`` may carry the final output.
+- A ``command`` exec is executed for real by the manager's
+  :class:`~omavroom.manager.exec_engine.ExecEngine` on a **dedicated per-exec
+  worker thread** (not the daemon job queue), so a long command never delays
+  lifecycle work. Without a ``command`` the exec stays bookkeeping-only and
+  the client drives it with ``exec_output``/``exec_finish`` (v1 compatibility).
 - ``screenshot`` defaults to ``DEFAULT_SCREENSHOT_MAX_WIDTH`` and clamps to
   ``MAX_SCREENSHOT_MAX_WIDTH`` so a response can never be a multi-MB line.
 - ``peek_url`` (MCP name) maps to ``peek_endpoint``; ``peek_attach`` is a
@@ -75,6 +80,7 @@ from pathlib import Path
 
 from omavroom.config import Config
 from omavroom.manager import Manager
+from omavroom.manager.execs import DEFAULT_LIST_OUTPUT_BUDGET_BYTES
 from omavroom.manager.provisioner import (
     FakeProvisioner,
     InputEvent,
@@ -101,6 +107,10 @@ PROVISIONER_CHOICES: tuple[str, ...] = ("libvirt", "real", "fake")
 #: enforces so a screenshot can never produce a multi-MB JSON line.
 DEFAULT_SCREENSHOT_MAX_WIDTH = 1024
 MAX_SCREENSHOT_MAX_WIDTH = 2048
+#: Screenshot byte caps: the encoded PNG is bounded as well as its width, so a
+#: response can never be a multi-MB JSON line even on a busy framebuffer.
+DEFAULT_SCREENSHOT_MAX_BYTES = 2_000_000
+MAX_SCREENSHOT_MAX_BYTES = 8_000_000
 #: Connection guard rails (advisories): max request line, read timeout, cap
 #: on simultaneous client connections.
 MAX_LINE_BYTES = 1024 * 1024
@@ -189,6 +199,10 @@ def _error_payload(exc: BaseException) -> dict[str, str]:
         code = exc.code
     elif isinstance(exc, KeyError):
         code = "not_found"
+    elif isinstance(getattr(exc, "code", None), str):
+        # Domain errors (e.g. ExecNotAllowed -> ``exec_not_allowed``) carry
+        # their own structured code without becoming daemon-layer classes.
+        code = exc.code
     elif isinstance(exc, ValueError):
         code = "invalid"
     elif isinstance(exc, ProvisionerError):
@@ -470,7 +484,19 @@ class Protocol:
         return self.manager.list_events(limit=_optional_int(params, "limit", 200))
 
     def _list_execs(self, params: dict):
-        return self.manager.list_execs(_required_int(params, "seat_id"))
+        # Safe bounded defaults; a client may ask for metadata only
+        # (``include_output=false``) or the full per-record rings
+        # (``max_total_output_bytes=null``).
+        max_bytes = _optional_int(
+            params, "max_total_output_bytes", DEFAULT_LIST_OUTPUT_BUDGET_BYTES
+        )
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("parameter 'max_total_output_bytes' must be >= 0 or null")
+        return self.manager.list_execs(
+            _required_int(params, "seat_id"),
+            include_output=_optional_bool(params, "include_output", True),
+            max_total_output_bytes=max_bytes,
+        )
 
     # -- lease / work ----------------------------------------------------
     def _heartbeat(self, params: dict):
@@ -489,7 +515,7 @@ class Protocol:
     # -- exec ------------------------------------------------------------
     def _exec_start(self, params: dict):
         # Frozen Phase 5 contract: accept the command (and optional timeout);
-        # 4B2 records it, Phase 5 executes it.
+        # the manager's exec engine executes it on a per-exec worker thread.
         return self.manager.exec_start(
             _required_int(params, "seat_id"),
             _required_str(params, "exec_id"),
@@ -537,11 +563,20 @@ class Protocol:
             raise ValueError("parameter 'max_width' must be >= 1")
         else:
             width = min(requested, MAX_SCREENSHOT_MAX_WIDTH)
-        data = self.manager.screenshot(seat_id, max_width=width)
+        requested_bytes = _optional_int(params, "max_bytes", None)
+        if requested_bytes is None:
+            max_bytes = DEFAULT_SCREENSHOT_MAX_BYTES
+        elif requested_bytes < 1:
+            raise ValueError("parameter 'max_bytes' must be >= 1")
+        else:
+            max_bytes = min(requested_bytes, MAX_SCREENSHOT_MAX_BYTES)
+        data = self.manager.screenshot(seat_id, max_width=width, max_bytes=max_bytes)
         return {
             "png_base64": base64.b64encode(data).decode("ascii"),
             "max_width": width,
             "hard_cap": MAX_SCREENSHOT_MAX_WIDTH,
+            "max_bytes": max_bytes,
+            "hard_cap_bytes": MAX_SCREENSHOT_MAX_BYTES,
         }
 
     def _input(self, params: dict):
@@ -981,8 +1016,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI shim
 
     parser = argparse.ArgumentParser(prog="omavroom-daemon")
     parser.add_argument("--provisioner", choices=list(PROVISIONER_CHOICES), default="libvirt")
+    parser.add_argument("--socket", default=None, help="override the daemon socket path")
+    parser.add_argument("--db", default=None, help="override the state database path")
     args = parser.parse_args(argv)
-    return run_daemon(provisioner=args.provisioner)
+    return run_daemon(provisioner=args.provisioner, socket_path=args.socket, db_path=args.db)
 
 
 if __name__ == "__main__":  # pragma: no cover

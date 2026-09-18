@@ -380,10 +380,12 @@ def test_ping_reports_protocol_version(daemon_env):
 
 
 def test_exec_start_poll_finish_fields(daemon_env):
+    # Frozen v1 shapes: with no ``command`` an exec is bookkeeping-only and
+    # the client drives output/finish itself (the 4B2 behaviour).
     client = daemon_env.client
     _, seat_id = _ready_seat(client)
-    started = client.exec_start(seat_id, "e1", label="build", command="make test", timeout_s=120)
-    assert started["command"] == "make test"
+    started = client.exec_start(seat_id, "e1", label="build", timeout_s=120)
+    assert started["command"] is None
     assert started["timeout_s"] == 120
     assert started["stdout"] == "" and started["stderr"] == ""
 
@@ -398,6 +400,49 @@ def test_exec_start_poll_finish_fields(daemon_env):
     assert finished["state"] == "finished"
     assert finished["exit_code"] == 0
     assert finished["stdout"] == "partial\ndone\n"
+
+
+def test_exec_command_runs_and_streams_through_daemon(daemon_env):
+    # Phase 5: a command exec runs on a dedicated worker and its output is
+    # polled from the bounded ring buffer.
+    fake = daemon_env.fake
+    fake.run_chunks = [
+        (0.0, "stdout", "building...\n"),
+        (0.02, "stderr", "warning: x\n"),
+        (0.02, "stdout", "done\n"),
+    ]
+    fake.run_exit_code = 0
+    client = daemon_env.client
+    _, seat_id = _ready_seat(client)
+
+    started = client.exec_start(seat_id, "cmd-1", label="build", command="make test", timeout_s=30)
+    assert started["state"] == "running"
+    assert started["command"] == "make test"
+
+    deadline = time.monotonic() + 5
+    view = client.exec_poll(seat_id, "cmd-1")
+    while view["state"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.02)
+        view = client.exec_poll(seat_id, "cmd-1")
+    assert view["state"] == "finished"
+    assert view["exit_code"] == 0
+    assert "building..." in view["stdout"] and "done" in view["stdout"]
+    assert "warning: x" in view["stderr"]
+    # The worker records the terminal exec state just before it flips the
+    # seat busy -> ready, so wait for the seat transition rather than assume.
+    deadline = time.monotonic() + 5
+    while client.list_seats()[0]["state"] != "ready" and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert client.list_seats()[0]["state"] == "ready"
+
+
+def test_exec_rejected_on_released_seat_over_wire(daemon_env):
+    client = daemon_env.client
+    _, seat_id = _ready_seat(client)
+    client.release_seat(seat_id, export=False).result(timeout=5)
+    with pytest.raises(DaemonRequestError) as excinfo:
+        client.exec_start(seat_id, "e1", command="echo hi")
+    assert excinfo.value.code == "exec_not_allowed"
 
 
 def test_screenshot_default_and_hard_cap(daemon_env):

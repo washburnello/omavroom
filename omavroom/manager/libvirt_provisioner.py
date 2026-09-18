@@ -74,6 +74,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 import uuid as uuid_module
 from collections.abc import Callable
@@ -84,6 +85,7 @@ from xml.etree import ElementTree as ET
 
 from omavroom.config import Config
 from omavroom.manager.provisioner import (
+    CommandResult,
     ExportSpec,
     FetchResult,
     InputEvent,
@@ -118,19 +120,6 @@ _GOLDEN_SOURCES: dict[str, tuple[str, str]] = {
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-@dataclass(frozen=True)
-class CommandResult:
-    """Result of one host command (``virsh``/``ssh``/``git``/...)."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0
-
-
 def _subprocess_runner(argv: list[str], timeout: int, input_text: str | None) -> CommandResult:
     """Default host runner: list argv, no shell, hard timeout."""
     try:
@@ -152,6 +141,117 @@ def _subprocess_runner(argv: list[str], timeout: int, input_text: str | None) ->
     except FileNotFoundError as exc:
         return CommandResult(127, "", str(exc))
     return CommandResult(proc.returncode, proc.stdout, proc.stderr)
+
+
+def _subprocess_stream_runner(
+    argv: list[str],
+    timeout: int,
+    on_output: Callable[[str, str], None] | None,
+    cancel: threading.Event | None,
+) -> CommandResult:
+    """Stream a host command's stdout/stderr while it runs.
+
+    Used by :meth:`LibvirtProvisioner.run` for the Phase 5 exec path: the
+    ``ssh`` process is started directly (not through
+    :func:`_subprocess_runner`) so output can be forwarded as it arrives and
+    so the ``cancel`` event can terminate the transport. Killing the local
+    ``ssh`` process closes the channel and normally terminates the remote
+    command; a command that detaches itself in the guest is out of scope
+    (documented limitation -- see the exec engine docs).
+    """
+    import subprocess  # local import: only needed on the streaming path
+
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        return CommandResult(127, "", str(exc))
+    # In streaming mode the caller owns the output (the exec engine copies a
+    # bounded tail into its ring buffer), so the transport must not retain an
+    # unbounded copy of its own. Only buffer when there is no callback.
+    retain = on_output is None
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+
+    def _pump(pipe, stream: str, buf: list[str]) -> None:
+        try:
+            for line in iter(pipe.readline, ""):
+                if retain:
+                    buf.append(line)
+                if on_output is not None:
+                    try:
+                        on_output(stream, line)
+                    except Exception:  # noqa: BLE001 - never break the pump
+                        pass
+        finally:
+            pipe.close()
+
+    readers = [
+        threading.Thread(target=_pump, args=(proc.stdout, "stdout", out_buf), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, "stderr", err_buf), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    killed = False
+    timed_out = False
+    deadline = time.monotonic() + timeout if timeout else None
+
+    def _terminate() -> None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    while True:
+        if cancel is not None and cancel.is_set():
+            killed = True
+            _terminate()
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            _terminate()
+            break
+        try:
+            proc.wait(timeout=0.1)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    for reader in readers:
+        reader.join(timeout=2)
+
+    returncode = proc.returncode
+    timeout_note = ""
+    if timed_out:
+        returncode = 124
+        timeout_note = f"\n(command timed out after {timeout}s)\n"
+        if retain:
+            err_buf.append(timeout_note)
+    elif killed and returncode == 0:
+        returncode = -9
+    stderr = "".join(err_buf) or timeout_note
+    return CommandResult(
+        returncode if returncode is not None else -1,
+        "".join(out_buf) if retain else "",
+        stderr,
+    )
 
 
 def _template_dir() -> Path:
@@ -363,6 +463,13 @@ class LibvirtProvisioner(Provisioner):
         golden_convert_timeout_s: int = 900,
         fsck_timeout_s: int = 300,
         host_runner: Callable[[list[str], int, str | None], CommandResult] | None = None,
+        stream_runner: (
+            Callable[
+                [list[str], int, Callable[[str, str], None] | None, threading.Event | None],
+                CommandResult,
+            ]
+            | None
+        ) = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -390,6 +497,7 @@ class LibvirtProvisioner(Provisioner):
         self.golden_convert_timeout_s = golden_convert_timeout_s
         self.fsck_timeout_s = fsck_timeout_s
         self._runner = host_runner or _subprocess_runner
+        self._stream_runner = stream_runner or _subprocess_stream_runner
         self._sleep = sleep
         self._monotonic = monotonic
         for directory in (self.seats_dir, self.nvram_dir, self.staging_dir):
@@ -833,14 +941,31 @@ class LibvirtProvisioner(Provisioner):
         timeout_s: int = 60,
         env: dict[str, str] | None = None,
         check: bool = False,
+        on_output: Callable[[str, str], None] | None = None,
+        cancel: threading.Event | None = None,
     ) -> CommandResult:
         """Run a command inside the seat over pinned-key SSH.
 
         This is the real exec primitive; Phase 5's ``exec_start``/``exec_poll``
         tools build streaming on top of it. Real operations always verify the
         guest host key against the per-seat ``known_hosts``.
+
+        Without ``on_output``/``cancel`` it uses the injected blocking host
+        runner (``host``), preserving the lifecycle/export behaviour. With
+        either control it uses the streaming runner, which forwards output as
+        it arrives and can terminate the         ``ssh`` process on cancel. Killing
+        ``ssh`` closes the channel, which normally terminates the remote
+        command; a command that daemonises itself in the guest is a documented
+        limitation (the local handle is gone, the guest process may survive).
+        The engine's ``exec_kill(signal=N)`` does **not** deliver signal ``N``
+        to a guest process -- it only records ``-N`` and terminates the local
+        transport.
         """
-        result = self.host(self._ssh_argv(vm_ref, command, env), timeout=timeout_s)
+        argv = self._ssh_argv(vm_ref, command, env)
+        if on_output is None and cancel is None:
+            result = self.host(argv, timeout=timeout_s)
+        else:
+            result = self._stream_runner(argv, timeout_s, on_output, cancel)
         if check and not result.ok:
             raise ProvisionerError(
                 f"guest command failed ({result.returncode}) on {vm_ref}: {result.stderr.strip()}"
@@ -1453,8 +1578,16 @@ class LibvirtProvisioner(Provisioner):
     # ------------------------------------------------------------------
     # desktop ops
     # ------------------------------------------------------------------
-    def screenshot(self, vm_ref: str, *, max_width: int | None = None) -> bytes:
-        """Grab the guest framebuffer as PNG bytes, optionally downscaled."""
+    def screenshot(
+        self, vm_ref: str, *, max_width: int | None = None, max_bytes: int | None = None
+    ) -> bytes:
+        """Grab the guest framebuffer as PNG bytes, bounded by width and bytes.
+
+        If the image needs conversion/downscaling and ImageMagick is
+        unavailable, or the encoded PNG cannot be brought under ``max_bytes``,
+        this raises :class:`ProvisionerError` rather than returning an
+        oversized/unresized image.
+        """
         if not self._exists(vm_ref):
             raise ProvisionerError(f"unknown seat VM: {vm_ref}")
         seat_dir = self._seat_dir(vm_ref)
@@ -1476,7 +1609,8 @@ class LibvirtProvisioner(Provisioner):
                 needs_resize = width > max_width
             except ValueError:
                 needs_resize = False
-        if not (needs_convert or needs_resize):
+        over_bytes = max_bytes is not None and len(data) > max_bytes
+        if not (needs_convert or needs_resize or over_bytes):
             raw.unlink(missing_ok=True)
             return data
         if not self.magick_bin:
@@ -1485,22 +1619,50 @@ class LibvirtProvisioner(Provisioner):
                 raise ProvisionerError(
                     "framebuffer is not PNG and ImageMagick is unavailable for conversion"
                 )
-            return data
+            if needs_resize:
+                raise ProvisionerError(
+                    "screenshot needs downscaling but ImageMagick is unavailable"
+                )
+            raise ProvisionerError(
+                f"screenshot is {len(data)} bytes > max_bytes {max_bytes} and "
+                "ImageMagick is unavailable"
+            )
         # ImageMagick keys off the suffix; libvirt's screenshot is PPM (P6).
         src = seat_dir / ("screenshot.ppm" if needs_convert else "screenshot.src.png")
         src.write_bytes(data)
         raw.unlink(missing_ok=True)
         png = seat_dir / "screenshot.png"
-        png.unlink(missing_ok=True)
-        argv = [self.magick_bin, str(src)]
-        if max_width is not None:
-            argv += ["-resize", f"{max_width}x"]
-        argv.append(str(png))
-        converted = self.host(argv, timeout=120)
+        width = max_width
+        encoded: bytes | None = None
+        for _ in range(6):
+            png.unlink(missing_ok=True)
+            argv = [self.magick_bin, str(src)]
+            if width is not None:
+                argv += ["-resize", f"{width}x"]
+            argv.append(str(png))
+            converted = self.host(argv, timeout=120)
+            if not converted.ok or not png.exists():
+                src.unlink(missing_ok=True)
+                raise ProvisionerError(f"image conversion failed: {converted.stderr.strip()}")
+            encoded = png.read_bytes()
+            if max_bytes is None or len(encoded) <= max_bytes:
+                break
+            if width is None:
+                # Unknown source width; shrink from the encoded PNG's own size.
+                try:
+                    width, _ = png_dimensions(encoded)
+                except ValueError:
+                    width = 1280
+            if width <= 64:
+                break
+            width = max(64, int(width * 0.75))
         src.unlink(missing_ok=True)
-        if not converted.ok or not png.exists():
-            raise ProvisionerError(f"image conversion failed: {converted.stderr.strip()}")
-        return png.read_bytes()
+        assert encoded is not None
+        if max_bytes is not None and len(encoded) > max_bytes:
+            raise ProvisionerError(
+                f"screenshot is {len(encoded)} bytes > max_bytes {max_bytes} after downscaling"
+            )
+        return encoded
 
     def _desktop_env(self) -> dict[str, str]:
         return {

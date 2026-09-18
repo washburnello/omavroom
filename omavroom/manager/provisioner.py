@@ -23,11 +23,30 @@ from __future__ import annotations
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
 class ProvisionerError(RuntimeError):
     """Raised by a provisioner when a seat operation fails."""
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """Result of one guest command run through a provisioner.
+
+    ``returncode`` follows the shell convention: ``0`` on success, ``124``
+    for a timeout enforced by the transport, ``127`` when the transport
+    executable is missing, and (for a killed exec) ``-<signal>``.
+    """
+
+    returncode: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
 
 
 @dataclass(frozen=True)
@@ -140,6 +159,8 @@ class InputEvent:
     def __post_init__(self) -> None:
         if self.kind not in ("key", "text", "click"):
             raise ValueError(f"unknown input event kind: {self.kind!r}")
+        if not isinstance(self.value, str) or not self.value:
+            raise ValueError("input event value must be a non-empty string")
 
 
 @dataclass(frozen=True)
@@ -238,8 +259,16 @@ class Provisioner(ABC):
 
     # -- desktop ops seam (Phase 5 screenshot / input / peek) ------------
     @abstractmethod
-    def screenshot(self, vm_ref: str, *, max_width: int | None = None) -> bytes:
-        """Grab the guest framebuffer as PNG bytes (desktop seats)."""
+    def screenshot(
+        self, vm_ref: str, *, max_width: int | None = None, max_bytes: int | None = None
+    ) -> bytes:
+        """Grab the guest framebuffer as PNG bytes (desktop seats).
+
+        ``max_width`` bounds the image width; ``max_bytes`` bounds the encoded
+        PNG size. An implementation that cannot satisfy ``max_bytes`` (no
+        resizer available) must raise :class:`ProvisionerError` rather than
+        return an oversized image.
+        """
 
     @abstractmethod
     def input(self, vm_ref: str, events: list[InputEvent]) -> None:
@@ -248,6 +277,39 @@ class Provisioner(ABC):
     @abstractmethod
     def peek_endpoint(self, vm_ref: str) -> str:
         """Return the on-demand viewer endpoint (never auto-opened)."""
+
+    # -- exec seam (Phase 5 ``exec_start``/``exec_poll``/``exec_kill``) --
+    @abstractmethod
+    def run(
+        self,
+        vm_ref: str,
+        command: str,
+        *,
+        timeout_s: int = 60,
+        env: dict[str, str] | None = None,
+        check: bool = False,
+        on_output: Callable[[str, str], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> CommandResult:
+        """Run a command inside the seat and return its result.
+
+        This is the primitive the Phase 5 exec engine drives on a dedicated
+        per-exec worker thread. Implementations must honour two optional
+        cooperative controls:
+
+        - ``on_output(stream, chunk)`` called as output is produced, where
+          ``stream`` is ``"stdout"`` or ``"stderr"``. When provided, callers
+          assume the output was streamed and will not also record the final
+          ``stdout``/``stderr`` (avoiding double-counting).
+        - ``cancel`` set to request termination. The implementation should
+          kill the transport (for SSH, the ``ssh`` process) and return with
+          ``returncode = -<signal>`` as soon as it observes the flag. Purely
+          blocking transports that cannot interrupt themselves may ignore it;
+          the engine still marks the exec killed.
+
+        ``timeout_s`` is a hard transport timeout: on expiry the command is
+        terminated and ``returncode`` is ``124``.
+        """
 
     # -- autostart invariant --------------------------------------------
     def verify_autostart_invariant(self) -> None:
@@ -284,6 +346,9 @@ class FakeProvisioner(Provisioner):
         fail_exports: bool = False,
         sha_mismatch: bool = False,
         raise_on: dict[str, BaseException] | None = None,
+        run_chunks: list[tuple[float, str, str]] | None = None,
+        run_hang_s: float = 0.0,
+        run_exit_code: int = 0,
     ) -> None:
         self.delay_s = delay_s
         self.export_delay_s = export_delay_s
@@ -292,6 +357,14 @@ class FakeProvisioner(Provisioner):
         self.fail_exports = fail_exports
         self.sha_mismatch = sha_mismatch
         self.raise_on: dict[str, BaseException] = dict(raise_on or {})
+        # Exec simulation knobs (Phase 5). ``run_chunks`` is a list of
+        # ``(delay_s, stream, text)`` tuples emitted in order; after them the
+        # fake idles for ``run_hang_s`` (cancellable), then exits with
+        # ``run_exit_code``. Both are interruptible via the ``cancel`` event.
+        self.run_chunks: list[tuple[float, str, str]] = list(run_chunks or ())
+        self.run_hang_s = run_hang_s
+        self.run_exit_code = run_exit_code
+        self.runs: list[tuple[str, str]] = []
         self.calls: list[tuple[str, tuple, dict]] = []
         self.vms: dict[str, dict] = {}
         self.created: list[str] = []
@@ -417,6 +490,92 @@ class FakeProvisioner(Provisioner):
         if vm["name"] in self.fail_seats:
             raise ProvisionerError(f"fake provisioner: seat {vm['name']} never became ready")
 
+    def _sleep_cancellable(
+        self,
+        seconds: float,
+        cancel: threading.Event | None,
+        deadline: float | None,
+    ) -> int:
+        """Sleep in small slices; return 0 done, -9 cancelled, 124 timed out."""
+        end = time.monotonic() + max(0.0, seconds)
+        while True:
+            if cancel is not None and cancel.is_set():
+                return -9
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                return 124
+            remaining = end - now
+            if remaining <= 0:
+                return 0
+            nap = min(0.02, remaining)
+            if deadline is not None:
+                nap = min(nap, deadline - now)
+            if nap > 0:
+                time.sleep(nap)
+
+    def run(
+        self,
+        vm_ref: str,
+        command: str,
+        *,
+        timeout_s: int = 60,
+        env: dict[str, str] | None = None,
+        check: bool = False,
+        on_output: Callable[[str, str], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> CommandResult:
+        """Simulate a guest command, emitting and/or hanging as configured.
+
+        Streaming, cancellation and timeout are all cooperative, mirroring
+        the real transport contract (``on_output``/``cancel``/``timeout_s``)
+        so the exec engine can be exercised without a VM.
+        """
+        self._record("run", vm_ref, command)
+        self._maybe_fail("run")
+        self._vm(vm_ref)
+        with self._lock:
+            self.runs.append((vm_ref, command))
+        deadline = time.monotonic() + timeout_s if timeout_s else None
+        out: list[str] = []
+        err: list[str] = []
+        timeout_note = f"\n(command timed out after {timeout_s}s)\n"
+
+        def emit(stream: str, text: str) -> None:
+            (out if stream == "stdout" else err).append(text)
+            if on_output is not None:
+                try:
+                    on_output(stream, text)
+                except Exception:  # noqa: BLE001 - mirror a best-effort transport
+                    pass
+
+        status = self._sleep_cancellable(self.delay_s, cancel, deadline)
+        if status == -9:
+            return CommandResult(-9, "".join(out), "".join(err))
+        if status == 124:
+            err.append(timeout_note)
+            return CommandResult(124, "".join(out), "".join(err))
+        for delay, stream, text in self.run_chunks:
+            if stream not in ("stdout", "stderr"):
+                raise ValueError(f"fake provisioner: bad run stream {stream!r}")
+            status = self._sleep_cancellable(delay, cancel, deadline)
+            if status == -9:
+                return CommandResult(-9, "".join(out), "".join(err))
+            if status == 124:
+                err.append(timeout_note)
+                return CommandResult(124, "".join(out), "".join(err))
+            emit(stream, text)
+        status = self._sleep_cancellable(self.run_hang_s, cancel, deadline)
+        if status == -9:
+            return CommandResult(-9, "".join(out), "".join(err))
+        if status == 124:
+            err.append(timeout_note)
+            return CommandResult(124, "".join(out), "".join(err))
+        if check and self.run_exit_code != 0:
+            raise ProvisionerError(
+                f"fake provisioner: guest command failed ({self.run_exit_code}): {command}"
+            )
+        return CommandResult(self.run_exit_code, "".join(out), "".join(err))
+
     def reset(self, vm_ref: str) -> None:
         self._record("reset", vm_ref)
         self._maybe_fail("reset")
@@ -528,14 +687,19 @@ class FakeProvisioner(Provisioner):
             state=vm.get("state", "unknown"),
         )
 
-    def screenshot(self, vm_ref: str, *, max_width: int | None = None) -> bytes:
+    def screenshot(
+        self, vm_ref: str, *, max_width: int | None = None, max_bytes: int | None = None
+    ) -> bytes:
         self._record("screenshot", vm_ref, max_width)
         self._maybe_fail("screenshot")
         vm = self._vm(vm_ref)
         with self._lock:
             self.screenshots.append(vm_ref)
         width = max_width or 1280
-        return f"PNG:{vm['name']}:{width}x720".encode()
+        data = f"PNG:{vm['name']}:{width}x720".encode()
+        if max_bytes is not None and len(data) > max_bytes:
+            data = data[:max_bytes]
+        return data
 
     def input(self, vm_ref: str, events: list[InputEvent]) -> None:
         self._record("input", vm_ref, events)

@@ -8,11 +8,13 @@ host) or headless `terminal` — does its work, pushes it to a repo, and
 releases the seat, which destroys the VM. See `PLAN.md` for the full
 design and `PHASES.md` for the build order.
 
-> Phase 4A: scheduler + state core complete and VM-free (atomic claiming,
-> fair queue, leases/heartbeats with auto-reclaim, dynamic admission,
-> destroy-on-release, content-gated export, reattach/reconcile). The
-> libvirt provisioner, MCP server, and CLI/TUI are still to come; the
-> scheduler is exercised against an in-process `FakeProvisioner`.
+> Phase 5: the real exec engine (per-exec worker threads, streaming ring
+> buffers, kill/timeout) and the FastMCP server are in place. Phase 4 added
+> the scheduler + state core (atomic claiming, fair queue, leases/heartbeats
+> with auto-reclaim, dynamic admission, destroy-on-release, content-gated
+> export, reattach/reconcile) and the Phase 4B libvirt provisioner. The CLI/TUI
+> is still to come; tests exercise everything against an in-process
+> `FakeProvisioner`.
 
 ## Quickstart
 
@@ -22,8 +24,18 @@ Prerequisites: Python 3.12 and [uv](https://docs.astral.sh/uv/)
 ```bash
 cd /home/washburnello/Work/omavroom
 uv sync --group dev   # create .venv and install dev tools (pytest, ruff)
-uv run pytest         # run the test suite
+uv run pytest         # run the test suite (no VMs)
 uv run omavroom --help
+```
+
+## MCP server
+
+`omavroom-mcp` serves the seat manager to agents over MCP (stdio), auto-starting
+the daemon when one is not already running. The opencode config snippet, the
+full tool list, and usage guidance live in [`docs/mcp.md`](docs/mcp.md).
+
+```bash
+uv run omavroom-mcp --help
 ```
 
 Configuration is optional: without a config file, sane defaults apply

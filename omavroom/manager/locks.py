@@ -42,6 +42,12 @@ import threading
 from contextlib import contextmanager
 
 
+class LockTimeout(TimeoutError):
+    """A bounded lock acquisition did not succeed in time."""
+
+    code = "lock_timeout"
+
+
 class LockManager:
     """Registry of non-reentrant, in-process locks keyed by seat or repo."""
 
@@ -56,10 +62,19 @@ class LockManager:
             return self._locks.setdefault((kind, str(key)), threading.Lock())
 
     @contextmanager
-    def seat(self, seat_key: str):
-        """Hold the lock for one seat (identified by its stable name)."""
+    def seat(self, seat_key: str, *, timeout: float | None = None):
+        """Hold the lock for one seat (identified by its stable name).
+
+        With ``timeout`` set, acquisition is bounded and raises
+        :class:`LockTimeout` instead of blocking indefinitely; this is what
+        keeps a desktop op (screenshot/input/peek) from hanging behind a long
+        export/release for the whole agent turn.
+        """
         lock = self._get("seat", seat_key)
-        lock.acquire()
+        if timeout is None:
+            lock.acquire()
+        elif not lock.acquire(timeout=max(0.0, timeout)):
+            raise LockTimeout(f"seat {seat_key!r} is busy")
         try:
             yield
         finally:

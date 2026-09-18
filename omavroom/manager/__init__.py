@@ -29,7 +29,9 @@ Reads (fast, synchronous; bounded by default)::
     manager.pool_status() -> PoolStatus
     manager.queue_view(include_history=False) -> list[RequestView]
     manager.seat_status(request_id) -> RequestView
-    manager.list_execs(seat_id) -> list[ExecView]
+    manager.list_execs(seat_id, include_output=True,
+                       max_total_output_bytes=8192) -> list[ExecView]
+        # bounded aggregate output; None for full per-record rings
     manager.list_events(limit=200) -> list[Event]     # limit=None -> all
 
 Seat requests (non-blocking; returns a handle immediately)::
@@ -49,11 +51,18 @@ Lease + work::
     manager.exec_kill(seat_id, exec_id, signal=9) -> ExecView
     manager.exec_finish(seat_id, exec_id, exit_code=None, stdout="", stderr="") -> ExecView
 
+With a ``command``, ``exec_start`` runs it on a dedicated per-exec worker
+thread (see :mod:`omavroom.manager.exec_engine`) and streams output into the
+bounded ring buffer; without one it is bookkeeping-only. ``exec_kill`` signals
+the worker, and release/reset cancel a seat's execs without waiting for them.
+
 Desktop ops (desktop seats; Phase 5 ``screenshot`` / ``input`` / ``peek_*``)::
 
-    manager.screenshot(seat_id, max_width=None) -> bytes
+    manager.screenshot(seat_id, max_width=None, max_bytes=None) -> bytes
     manager.input(seat_id, events: list[InputEvent]) -> None
     manager.peek_endpoint(seat_id) -> str
+        # Desktop ops bound their wait for the seat lock; a long
+        # export/reset/release yields SeatBusy (wire code ``seat_busy``).
 
 Teardown (non-blocking; returns a handle)::
 
@@ -94,8 +103,13 @@ from pathlib import Path
 
 from omavroom import state as st
 from omavroom.config import Config
-from omavroom.manager.execs import ExecTracker, ExecView
-from omavroom.manager.locks import LockManager
+from omavroom.manager.exec_engine import ExecEngine
+from omavroom.manager.execs import (
+    DEFAULT_LIST_OUTPUT_BUDGET_BYTES,
+    ExecTracker,
+    ExecView,
+)
+from omavroom.manager.locks import LockManager, LockTimeout
 from omavroom.manager.provisioner import (
     FakeProvisioner,
     InputEvent,
@@ -115,6 +129,21 @@ from omavroom.manager.scheduler import (
 )
 
 log = logging.getLogger("omavroom.manager")
+
+#: Default seconds a desktop op (screenshot/input/peek) will wait for the
+#: per-seat lock before failing with ``seat_busy``. Bounds how long a long
+#: export/reset/release can stall an agent's desktop op.
+DEFAULT_DESKTOP_OP_LOCK_TIMEOUT_S = 5.0
+
+
+class SeatBusy(RuntimeError):
+    """A seat is exclusively busy (export/reset/release) and did not free.
+
+    Carries the structured wire code ``seat_busy`` so the daemon returns a
+    clear, typed error instead of blocking the connection.
+    """
+
+    code = "seat_busy"
 
 
 class Handle:
@@ -181,12 +210,14 @@ class Manager:
         free_ram_mb=None,
         tick_s: float = 0.02,
         export_approver=None,
+        desktop_lock_timeout_s: float = DEFAULT_DESKTOP_OP_LOCK_TIMEOUT_S,
     ) -> None:
         self.config = config or Config.default()
         self.store = st.StateStore(db_path)
         self.store.init()
         self.provisioner = provisioner if provisioner is not None else FakeProvisioner()
         self.locks = LockManager()
+        self.desktop_lock_timeout_s = desktop_lock_timeout_s
         self.scheduler = Scheduler(
             self.store,
             self.config,
@@ -200,6 +231,15 @@ class Manager:
             clock=clock,
             max_concurrent_per_seat=self.config.exec.max_concurrent_per_seat,
             max_output_bytes=self.config.exec.max_output_bytes,
+            max_concurrent_total=self.config.exec.max_concurrent_total,
+        )
+        self.exec_engine = ExecEngine(
+            self.execs,
+            self.provisioner,
+            read_seat=lambda seat_id: self.store.read(lambda c: st.seat_by_id(c, seat_id)),
+            max_runtime_s=self.config.exec.max_runtime_s,
+            on_busy=self._exec_on_busy,
+            on_idle=self._exec_on_idle,
         )
         self.tick_s = tick_s
         self.last_pump_error: BaseException | None = None
@@ -240,6 +280,7 @@ class Manager:
             self._thread.join(timeout=5)
         self._running = False
         self._thread = None
+        self.exec_engine.shutdown()
 
     def _wake(self) -> None:
         with self._cv:
@@ -430,25 +471,27 @@ class Manager:
         command: str | None = None,
         timeout_s: int | None = None,
     ) -> ExecView:
-        view = self.execs.start(seat_id, exec_id, label=label, command=command, timeout_s=timeout_s)
-        if self.execs.active_count(seat_id) == 1:
-            self.scheduler.begin_work(seat_id)
-        return view
+        """Start an exec; with a ``command`` a dedicated worker runs it.
+
+        Seat/VM validation and worker management live in :class:`ExecEngine`
+        so the daemon handler and this facade stay thin.
+        """
+        return self.exec_engine.start(
+            seat_id, exec_id, label=label, command=command, timeout_s=timeout_s
+        )
 
     def exec_poll(self, seat_id: int, exec_id: str) -> ExecView:
-        return self.execs.poll(seat_id, exec_id)
+        return self.exec_engine.poll(seat_id, exec_id)
 
     def exec_output(
         self, seat_id: int, exec_id: str, *, stdout: str = "", stderr: str = ""
     ) -> ExecView:
         """Append streamed output to a running exec (Phase 5 exec streaming)."""
-        return self.execs.record_output(seat_id, exec_id, stdout=stdout, stderr=stderr)
+        return self.exec_engine.record_output(seat_id, exec_id, stdout=stdout, stderr=stderr)
 
     def exec_kill(self, seat_id: int, exec_id: str, *, signal: int = 9) -> ExecView:
         """Kill a running exec; last live exec returns the seat to ready."""
-        view = self.execs.kill(seat_id, exec_id, signal=signal)
-        self._finish_if_idle(seat_id)
-        return view
+        return self.exec_engine.kill(seat_id, exec_id, signal=signal)
 
     def exec_finish(
         self,
@@ -459,44 +502,74 @@ class Manager:
         stdout: str = "",
         stderr: str = "",
     ) -> ExecView:
-        view = self.execs.finish(
+        return self.exec_engine.finish(
             seat_id, exec_id, exit_code=exit_code, stdout=stdout, stderr=stderr
         )
-        self._finish_if_idle(seat_id)
-        return view
 
-    def _finish_if_idle(self, seat_id: int) -> None:
+    def list_execs(
+        self,
+        seat_id: int,
+        *,
+        include_output: bool = True,
+        max_total_output_bytes: int | None = DEFAULT_LIST_OUTPUT_BUDGET_BYTES,
+    ) -> list[ExecView]:
+        """Bounded exec list (metadata by default; full output on request).
+
+        The aggregate stdout+stderr across the list is capped so a long
+        history of large execs cannot produce a multi-MiB response. Use
+        ``exec_poll`` for one exec's full (ring-bounded) output.
+        """
+        return self.exec_engine.list(
+            seat_id,
+            include_output=include_output,
+            max_total_output_bytes=max_total_output_bytes,
+        )
+
+    def _exec_on_busy(self, seat_id: int) -> None:
+        """First live exec flips the seat ``ready -> busy``."""
+        if self.execs.active_count(seat_id) == 1:
+            self.scheduler.begin_work(seat_id)
+
+    def _exec_on_idle(self, seat_id: int) -> None:
+        """Last live exec flips the seat ``busy -> ready``."""
         if self.execs.active_count(seat_id) == 0:
             self.scheduler.finish_work(seat_id)
-
-    def list_execs(self, seat_id: int) -> list[ExecView]:
-        return self.execs.list(seat_id)
 
     # ------------------------------------------------------------------
     # desktop ops (synchronous; serialized per seat against reset/release)
     # ------------------------------------------------------------------
     @contextmanager
-    def _seat_guard(self, seat_id: int):
-        """Yield the seat's live VM ref while holding its per-seat lock."""
+    def _seat_guard(self, seat_id: int, *, timeout: float | None = None):
+        """Yield the seat's live VM ref while holding its per-seat lock.
+
+        With ``timeout`` the acquisition is bounded and raises
+        :class:`SeatBusy` (wire code ``seat_busy``) if a long export/reset/
+        release holds the seat, instead of blocking the caller indefinitely.
+        """
         seat = self.store.read(lambda c: st.seat_by_id(c, seat_id))
         if seat is None:
             raise KeyError(f"no such seat: {seat_id}")
-        with self.locks.seat(seat.name):
-            fresh = self.store.read(lambda c: st.seat_by_id(c, seat_id))
-            if fresh is None or fresh.vm_name is None:
-                raise RuntimeError(f"seat {seat_id} has no VM")
-            yield fresh.vm_name
+        try:
+            with self.locks.seat(seat.name, timeout=timeout):
+                fresh = self.store.read(lambda c: st.seat_by_id(c, seat_id))
+                if fresh is None or fresh.vm_name is None:
+                    raise RuntimeError(f"seat {seat_id} has no VM")
+                yield fresh.vm_name
+        except LockTimeout as exc:
+            raise SeatBusy(f"seat {seat_id} is busy (export/reset/release in progress)") from exc
 
-    def screenshot(self, seat_id: int, *, max_width: int | None = None) -> bytes:
-        with self._seat_guard(seat_id) as vm_ref:
-            return self.provisioner.screenshot(vm_ref, max_width=max_width)
+    def screenshot(
+        self, seat_id: int, *, max_width: int | None = None, max_bytes: int | None = None
+    ) -> bytes:
+        with self._seat_guard(seat_id, timeout=self.desktop_lock_timeout_s) as vm_ref:
+            return self.provisioner.screenshot(vm_ref, max_width=max_width, max_bytes=max_bytes)
 
     def input(self, seat_id: int, events: list[InputEvent]) -> None:
-        with self._seat_guard(seat_id) as vm_ref:
+        with self._seat_guard(seat_id, timeout=self.desktop_lock_timeout_s) as vm_ref:
             self.provisioner.input(vm_ref, events)
 
     def peek_endpoint(self, seat_id: int) -> str:
-        with self._seat_guard(seat_id) as vm_ref:
+        with self._seat_guard(seat_id, timeout=self.desktop_lock_timeout_s) as vm_ref:
             return self.provisioner.peek_endpoint(vm_ref)
 
     # ------------------------------------------------------------------
@@ -524,6 +597,9 @@ class Manager:
                 seat_id, repo=repo, export=export, branch=branch, ref=ref
             )
 
+        # Cancel execs promptly (non-blocking); the release itself never waits
+        # on a worker, so a long exec can never delay teardown.
+        self.exec_engine.cancel_seat(seat_id)
         return self._submit(job)
 
     def reset_seat(self, seat_id: int) -> Handle:
@@ -532,6 +608,8 @@ class Manager:
         def job() -> SeatView:
             return self.scheduler.reset_seat(seat_id)
 
+        # Reset discards the VM, so any in-flight exec is invalid.
+        self.exec_engine.cancel_seat(seat_id)
         return self._submit(job)
 
     def prepare_repo(self, seat_id: int, spec: RepoSpec) -> Handle:
@@ -569,11 +647,14 @@ class Manager:
 
     def force_discard(self, seat_id: int, *, reason: str = "force_discard") -> Handle:
         """Operator escape hatch: destroy a stuck seat's VM on the worker."""
+        self.exec_engine.cancel_seat(seat_id)
         return self._submit(lambda: self.scheduler.force_discard(seat_id, reason=reason))
 
 
 # Re-exported so callers import everything from the package root.
 __all__ = [
+    "DEFAULT_DESKTOP_OP_LOCK_TIMEOUT_S",
+    "ExecEngine",
     "ExecTracker",
     "ExportGate",
     "Handle",
@@ -589,5 +670,6 @@ __all__ = [
     "RequestHandle",
     "RequestView",
     "Scheduler",
+    "SeatBusy",
     "SeatView",
 ]
