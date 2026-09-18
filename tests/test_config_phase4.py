@@ -25,9 +25,19 @@ def test_resources_defaults_match_real_box() -> None:
 
 def test_seat_default_image_is_set() -> None:
     cfg = Config.default()
-    assert cfg.seats["desktop"].image == DEFAULT_IMAGE
+    assert cfg.seats["desktop"].image == "golden-omarchy"
     assert cfg.seats["terminal"].image == DEFAULT_IMAGE
-    assert cfg.image_for("desktop") == DEFAULT_IMAGE
+    assert cfg.image_for("desktop") == "golden-omarchy"
+
+
+def test_golden_omarchy_registered_with_desktop_fallback() -> None:
+    cfg = Config.default()
+    assert cfg.images["golden-omarchy"].seat_type == "desktop"
+    assert cfg.golden_for("desktop").name == "golden-omarchy.qcow2"
+    # the stock goldens stay registered so switching back is one line
+    assert cfg.images["golden-desktop"].seat_type == "desktop"
+    assert cfg.golden_for("desktop", "golden-desktop").name == "golden-desktop.qcow2"
+    assert cfg.golden_for("desktop", "omavroom-base").name == "golden-desktop.qcow2"
 
 
 def test_admission_defaults() -> None:

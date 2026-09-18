@@ -122,7 +122,9 @@ def test_build_domain_xml_unknown_seat_type(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 def test_golden_for_falls_back_by_seat_type() -> None:
     cfg = Config.default()
-    assert cfg.golden_for("desktop").name == "golden-desktop.qcow2"
+    # Desktop defaults to the Omarchy golden; the stock name stays a fallback.
+    assert cfg.golden_for("desktop").name == "golden-omarchy.qcow2"
+    assert cfg.golden_for("desktop", "omavroom-base").name == "golden-desktop.qcow2"
     assert cfg.golden_for("terminal").name == "golden-term.qcow2"
     # an explicit registered name wins
     assert cfg.golden_for("desktop", "golden-desktop").name == "golden-desktop.qcow2"
@@ -149,7 +151,7 @@ def test_config_parses_custom_images(tmp_path: Path) -> None:
     assert cfg.golden_for("terminal").name == "custom.qcow2"
     assert cfg.golden_for("terminal", "custom-term").name == "custom.qcow2"
     # an unregistered image still falls back to the seat-type default
-    assert cfg.golden_for("desktop").name == "golden-desktop.qcow2"
+    assert cfg.golden_for("desktop", "omavroom-base").name == "golden-desktop.qcow2"
 
 
 def test_config_rejects_bad_image_entries(tmp_path: Path) -> None:
@@ -363,7 +365,7 @@ def test_ensure_golden_images_builds_missing(tmp_path: Path) -> None:
     (images_dir / "base.qcow2").write_bytes(b"base")
     (images_dir / "term.qcow2").write_bytes(b"term")
     built = prov.ensure_golden_images()
-    assert built["desktop"].name == "golden-desktop.qcow2"
+    assert built["desktop"].name == "golden-omarchy.qcow2"
     assert built["terminal"].name == "golden-term.qcow2"
     assert (built["desktop"].stat().st_mode & 0o777) == 0o444
     assert any("convert" in call for call in calls)
@@ -372,7 +374,7 @@ def test_ensure_golden_images_builds_missing(tmp_path: Path) -> None:
     before = len(calls)
     prov.ensure_golden_images()
     assert len(calls) == before
-    assert cfg.golden_for("desktop").name == "golden-desktop.qcow2"
+    assert cfg.golden_for("desktop").name == "golden-omarchy.qcow2"
 
 
 def test_click_command_mapping() -> None:

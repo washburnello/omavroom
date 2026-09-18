@@ -9,12 +9,15 @@ defaults for anything unset:
     cost_units = 4
     min_seats = 0
     max_seats = 1
-    image = "omavroom-base"
+    image = "golden-omarchy"
     [seats.terminal]
     cost_units = 1
     min_seats = 0
     max_seats = 2
     image = "omavroom-base"
+    [images.golden-omarchy]
+    golden = "~/.local/share/omavroom/images/golden-omarchy.qcow2"
+    seat_type = "desktop"
     [images.golden-desktop]
     golden = "~/.local/share/omavroom/images/golden-desktop.qcow2"
     seat_type = "desktop"
@@ -78,7 +81,10 @@ between lanes):
   (``golden``) and the seat type it may serve (``seat_type``). The
   provisioner resolves the name with :meth:`Config.golden_for`; an
   unregistered name (including the stock default ``omavroom-base``) falls
-  back to the seat type's ``golden-<type>`` entry.
+  back to the seat type's ``golden-<type>`` entry. Desktop seats default
+  to ``golden-omarchy`` (the Omarchy 4.0.4 golden); ``golden-desktop``
+  stays registered as the fallback, so switching back is the single
+  ``seats.desktop.image`` line above.
 - ``admission`` controls the dynamic live-RAM check: ``dynamic`` enables
   it, ``override`` is a manual escape hatch (``auto`` = normal,
   ``allow`` = skip the live-RAM gate but still honour static bounds,
@@ -440,8 +446,10 @@ def default_config_path() -> Path:
 
 
 def _default_seats() -> dict[str, SeatTypeConfig]:
+    # Desktop seats boot the Omarchy 4.0.4 golden. To revert, set
+    # ``image="golden-desktop"`` here (or in ``[seats.desktop]`` TOML).
     return {
-        "desktop": SeatTypeConfig(cost_units=4, min_seats=0, max_seats=1),
+        "desktop": SeatTypeConfig(cost_units=4, min_seats=0, max_seats=1, image="golden-omarchy"),
         "terminal": SeatTypeConfig(cost_units=1, min_seats=0, max_seats=2),
     }
 
@@ -455,9 +463,13 @@ def _default_resources() -> dict[str, ResourceConfig]:
 
 def _default_images() -> dict[str, ImageConfig]:
     directory = default_images_dir()
+    # ``golden-omarchy`` is the default desktop image; the stock
+    # ``golden-desktop``/``golden-term`` stay registered as fallbacks.
+    by_name = {name: seat_type for seat_type, name in DEFAULT_GOLDEN_BY_TYPE.items()}
+    by_name["golden-omarchy"] = "desktop"
     return {
         name: ImageConfig(golden=str(directory / f"{name}.qcow2"), seat_type=seat_type)
-        for seat_type, name in DEFAULT_GOLDEN_BY_TYPE.items()
+        for name, seat_type in by_name.items()
     }
 
 
@@ -555,9 +567,10 @@ class Config:
         A registered image (``[images.<name>]``) wins and, when it declares a
         ``seat_type``, must match the requested seat type. An unregistered
         image name (including the historical default ``omavroom-base``) falls
-        back to the seat type's own ``golden-<seat_type>`` entry, so the
-        stock config provisions ``golden-desktop`` for desktop seats and
-        ``golden-term`` for terminal seats without any TOML.
+        back to the seat type's own ``golden-<seat_type>`` entry. Desktop
+        seats default to the registered ``golden-omarchy``; ``golden-desktop``
+        remains the per-type fallback, so the stock config still resolves to a
+        golden for every seat type without any TOML.
         """
         if seat_type not in SEAT_TYPES:
             raise ValueError(f"unknown seat type: {seat_type!r}")
