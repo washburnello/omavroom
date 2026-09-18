@@ -200,6 +200,147 @@ def tile_row_span(seat_type: str) -> int:
     return 2 if seat_type == "desktop" else 1
 
 
+#: Gap between tiles, in pixels.
+WALL_GAP = 10.0
+#: How much of the wall width the focused tile takes in focus mode.
+FOCUS_MASTER_RATIO = 0.68
+#: Tiles are shaped toward this width/height ratio when the fit is ambiguous.
+TARGET_TILE_ASPECT = 1.6
+
+
+@dataclass(frozen=True)
+class SlotRect:
+    """Where one slot sits on the wall, in wall-local pixels."""
+
+    x: float
+    y: float
+    width: float
+    height: float
+    focused: bool = False
+
+
+def _pack_grid(seat_types: list[str], columns: int) -> list[tuple[int, int, int, int]]:
+    """Row-major first-fit placement of spanned tiles into ``columns``.
+
+    Returns ``(row, col, row_span, col_span)`` per tile. Desktop tiles claim a
+    2x2 block (or 1x2 when the wall is too narrow); terminals are 1x1.
+    """
+    cols = max(1, int(columns))
+    occupied: set[tuple[int, int]] = set()
+    placed: list[tuple[int, int, int, int]] = []
+
+    def fits(row: int, col: int, rows: int, span_cols: int) -> bool:
+        return all(
+            (row + dr, col + dc) not in occupied for dr in range(rows) for dc in range(span_cols)
+        )
+
+    for seat_type in seat_types:
+        rows = tile_row_span(seat_type)
+        span_cols = min(tile_column_span(seat_type, cols), cols)
+        row = 0
+        while True:
+            for col in range(0, cols - span_cols + 1):
+                if fits(row, col, rows, span_cols):
+                    for dr in range(rows):
+                        for dc in range(span_cols):
+                            occupied.add((row + dr, col + dc))
+                    placed.append((row, col, rows, span_cols))
+                    break
+            else:
+                row += 1
+                continue
+            break
+    return placed
+
+
+def choose_columns(seat_types: list[str], width: float, height: float) -> int:
+    """Pick the column count that best fills the wall with pleasantly-shaped tiles.
+
+    Every candidate fills the width/height exactly (no scrolling); the score
+    favours using the available cells and tiles close to
+    :data:`TARGET_TILE_ASPECT`, so a wide wall gets a wide grid rather than one
+    very tall column.
+    """
+    count = len(seat_types)
+    if count <= 1:
+        return 1
+    best_score = float("-inf")
+    best_columns = 1
+    for columns in range(1, count + 1):
+        placements = _pack_grid(seat_types, columns)
+        rows = max(row + row_span for row, _, row_span, _ in placements)
+        cell_w = (max(1.0, width) - (columns - 1) * WALL_GAP) / columns
+        cell_h = (max(1.0, height) - (rows - 1) * WALL_GAP) / rows
+        if cell_w <= 1.0 or cell_h <= 1.0:
+            continue
+        used = sum(row_span * col_span for _, _, row_span, col_span in placements)
+        fill = used / (columns * rows)
+        deviations = []
+        for _, _, row_span, col_span in placements:
+            tile_w = col_span * cell_w + (col_span - 1) * WALL_GAP
+            tile_h = row_span * cell_h + (row_span - 1) * WALL_GAP
+            if tile_h > 0:
+                deviations.append(abs(tile_w / tile_h - TARGET_TILE_ASPECT))
+        deviation = sum(deviations) / len(deviations) if deviations else 0.0
+        score = fill - 0.15 * deviation
+        if score > best_score:
+            best_score = score
+            best_columns = columns
+    return best_columns
+
+
+def wall_layout(
+    seat_types: list[str],
+    width: float,
+    height: float,
+    *,
+    focus_index: int | None = None,
+) -> list[SlotRect]:
+    """Lay every slot out so they ALL fit inside ``width`` x ``height``.
+
+    No scrolling: tiles scale down to fit. With ``focus_index`` set, that tile
+    becomes the large master panel and the rest shrink into a side strip.
+    """
+    count = len(seat_types)
+    if count == 0:
+        return []
+    wall_w = max(1.0, float(width))
+    wall_h = max(1.0, float(height))
+
+    if focus_index is not None and 0 <= focus_index < count and count > 1:
+        master_w = max(1.0, (wall_w - WALL_GAP) * FOCUS_MASTER_RATIO)
+        strip_w = max(1.0, wall_w - WALL_GAP - master_w)
+        rects: list[SlotRect | None] = [None] * count
+        rects[focus_index] = SlotRect(0.0, 0.0, master_w, wall_h, True)
+        others = [index for index in range(count) if index != focus_index]
+        tile_h = max(1.0, (wall_h - (len(others) - 1) * WALL_GAP) / len(others))
+        for order, index in enumerate(others):
+            rects[index] = SlotRect(
+                master_w + WALL_GAP,
+                order * (tile_h + WALL_GAP),
+                strip_w,
+                tile_h,
+                False,
+            )
+        return [rect for rect in rects if rect is not None]
+
+    columns = choose_columns(seat_types, wall_w, wall_h)
+    placements = _pack_grid(seat_types, columns)
+    rows = max(row + row_span for row, _, row_span, _ in placements)
+    cell_w = max(1.0, (wall_w - (columns - 1) * WALL_GAP) / columns)
+    cell_h = max(1.0, (wall_h - (rows - 1) * WALL_GAP) / rows)
+    return [
+        SlotRect(
+            col * (cell_w + WALL_GAP),
+            row * (cell_h + WALL_GAP),
+            col_span * cell_w + (col_span - 1) * WALL_GAP,
+            row_span * cell_h + (row_span - 1) * WALL_GAP,
+            False,
+        )
+        for row, col, row_span, col_span in placements
+    ]
+
+
 def heartbeat_text(last_heartbeat: Any, *, now: Any = None, timeout_s: int = 0) -> str:
     """``ok 12s`` / ``stale 6m00s`` / ``-`` for a seat's last heartbeat."""
     age = elapsed_since(last_heartbeat, now)

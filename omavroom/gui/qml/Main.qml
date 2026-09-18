@@ -27,18 +27,14 @@ ApplicationWindow {
     property bool bannerVisible: !backend.daemonOk
     property string bannerText: backend.daemonMessage
 
-    // The wall packing width is the *wall area*, not the whole window: the
-    // sidebar and layout spacing must be subtracted or the grid overpacks at
-    // column boundaries. `wallScroll.availableWidth` is exactly that area, so
-    // it is the single source of truth. `Component.onCompleted` primes it
-    // before the first resize (otherwise the wall would start at one column);
-    // `onWidthChanged`/`onAvailableWidthChanged` keep it current.
-    function syncWallWidth() {
-        var w = wallScroll.availableWidth;
-        if (w > 0)
-            backend.setViewportWidth(Math.round(w));
+    // The wall area is the whole region left of the sidebar. It is the single
+    // source of truth for the layout: `setViewportSize` positions every slot
+    // to FIT this area exactly (tiles scale down; nothing scrolls).
+    function syncWallSize() {
+        if (wallArea.width > 0 && wallArea.height > 0)
+            backend.setViewportSize(Math.round(wallArea.width), Math.round(wallArea.height));
     }
-    Component.onCompleted: syncWallWidth()
+    Component.onCompleted: syncWallSize()
 
     // Non-visual projection of the wall model. Offscreen Qt does not
     // instantiate visual Repeater delegates, so the headless smoke test reads
@@ -118,35 +114,37 @@ ApplicationWindow {
         anchors.topMargin: daemonBanner.height
         spacing: 0
 
-        ScrollView {
-            id: wallScroll
+        // Fit-to-window wall: no scrolling. Each tile is positioned/sized by
+        // the pure layout in the backend, and animates to its new geometry
+        // when the window resizes or a monitor is focused.
+        Item {
+            id: wallArea
+            objectName: "wallArea"
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            contentWidth: availableWidth
-            onAvailableWidthChanged: root.syncWallWidth()
+            onWidthChanged: root.syncWallSize()
+            onHeightChanged: root.syncWallSize()
+            Component.onCompleted: root.syncWallSize()
 
-            GridLayout {
-                id: wallGrid
-                objectName: "wallGrid"
-                width: wallScroll.availableWidth
-                columns: backend.gridColumns
-                columnSpacing: 10
-                rowSpacing: 10
-                Repeater {
-                    id: wallRepeater
-                    model: backend.slotKeys
-                    delegate: SlotTile {
-                        property var d: (backend.revision, backend.slotAt(index)) || ({})
-                        Layout.columnSpan: backend.tileColumnSpan(d.seat_type, wallGrid.columns)
-                        Layout.rowSpan: backend.tileRowSpan(d.seat_type)
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-                        Layout.preferredWidth: d.seat_type === "desktop" ? 470 : 310
-                        Layout.preferredHeight: d.seat_type === "desktop" ? 300 : 190
-                        slotData: d
-                        onPeekRequested: backend.requestPeek(d.seat_id)
-                    }
+            Repeater {
+                id: wallRepeater
+                model: backend.slotKeys
+                delegate: SlotTile {
+                    property var d: (backend.revision, backend.slotAt(index)) || ({})
+                    property var r: (backend.layoutRevision, backend.slotRectAt(index)) || ({})
+                    x: r.x || 0
+                    y: r.y || 0
+                    width: r.width || 0
+                    height: r.height || 0
+                    focused: r.focused === true
+                    slotData: d
+                    onFocusRequested: backend.toggleFocus(d.key)
+                    onPeekRequested: backend.requestPeek(d.seat_id)
+                    Behavior on x { NumberAnimation { duration: 220; easing.type: Easing.InOutQuad } }
+                    Behavior on y { NumberAnimation { duration: 220; easing.type: Easing.InOutQuad } }
+                    Behavior on width { NumberAnimation { duration: 220; easing.type: Easing.InOutQuad } }
+                    Behavior on height { NumberAnimation { duration: 220; easing.type: Easing.InOutQuad } }
                 }
             }
         }

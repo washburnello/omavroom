@@ -322,32 +322,66 @@ def test_visual_queue_and_attention_panels_render():
 
 
 # --------------------------------------------------------------------------
-# FIX 4: initial columns use the real wall width, not one
+# Fit-to-window wall: every slot fits inside the wall area (no scrolling),
+# and clicking a monitor focuses/enlarges it.
 # --------------------------------------------------------------------------
-def test_initial_columns_use_real_wall_width_not_one():
+def _empty_payload():
+    return {
+        "ok": True,
+        "status": _status(
+            seats=[], per_type={"desktop": {"max_seats": 1}, "terminal": {"max_seats": 2}}
+        ),
+        "execs": {},
+        "screenshots": {},
+    }
+
+
+def test_wall_fits_all_slots_inside_the_wall_area():
     app = _qapp()
     backend = WallBackend(_config(desktop=1, terminal=2))
-    backend.apply_payload(
-        {
-            "ok": True,
-            "status": _status(
-                seats=[], per_type={"desktop": {"max_seats": 1}, "terminal": {"max_seats": 2}}
-            ),
-            "execs": {},
-            "screenshots": {},
-        }
-    )
+    backend.apply_payload(_empty_payload())
     engine = _build_engine(backend)
     try:
         root = engine.rootObjects()[0]
         _render(app, root)
-        grid = root.findChild(QObject, "wallGrid")
-        assert grid is not None
-        # Window is 1280 wide, the sidebar 350 + spacing are subtracted, so
-        # the wall area packs 3 columns (930 // 260), never 1 and never the
-        # overpacked 4 a whole-window calculation would give.
-        assert grid.property("columns") == 3
-        assert backend.gridColumns == 3
+        wall = root.findChild(QObject, "wallArea")
+        assert wall is not None
+        width = float(wall.property("width"))
+        height = float(wall.property("height"))
+        assert width > 0 and height > 0
+        rects = [backend.slotRectAt(i) for i in range(len(backend.slotKeys))]
+        assert len(rects) == 3
+        for rect in rects:
+            assert rect["x"] >= -0.5
+            assert rect["y"] >= -0.5
+            assert rect["x"] + rect["width"] <= width + 0.5
+            assert rect["y"] + rect["height"] <= height + 0.5
+        # Everything fits AND fills the height: no empty band beneath the wall.
+        assert max(r["y"] + r["height"] for r in rects) >= height - 1.0
+    finally:
+        engine.deleteLater()
+        app.processEvents()
+
+
+def test_toggle_focus_enlarges_the_selected_slot():
+    app = _qapp()
+    backend = WallBackend(_config(desktop=1, terminal=2))
+    backend.apply_payload(_empty_payload())
+    engine = _build_engine(backend)
+    try:
+        root = engine.rootObjects()[0]
+        _render(app, root)
+        keys = backend.slotKeys
+        backend.toggleFocus(keys[0])
+        assert backend.focusedSlotKey == keys[0]
+        focused = backend.slotRectAt(0)
+        other = backend.slotRectAt(1)
+        assert focused["focused"] is True
+        assert other["focused"] is False
+        assert focused["width"] * focused["height"] > other["width"] * other["height"]
+        # Clicking the same monitor again restores the uniform wall.
+        backend.toggleFocus(keys[0])
+        assert backend.focusedSlotKey == ""
     finally:
         engine.deleteLater()
         app.processEvents()

@@ -9,7 +9,10 @@ Rectangle {
     id: tile
     objectName: "slotTile-" + (slotData.key || "")
     property var slotData: ({})
+    //: True while this monitor is the enlarged/focused one.
+    property bool focused: false
     signal peekRequested()
+    signal focusRequested()
 
     readonly property bool occupied: slotData.occupied === true
     readonly property bool desktop: slotData.seat_type === "desktop"
@@ -22,8 +25,8 @@ Rectangle {
 
     radius: 8
     color: occupied ? "#151a21" : "#0f1216"
-    border.width: 1
-    border.color: slotData.needsAttention ? "#f85149" : "#262d36"
+    border.width: focused ? 2 : 1
+    border.color: focused ? "#388bfd" : (slotData.needsAttention ? "#f85149" : "#262d36")
     clip: true
 
     ColumnLayout {
@@ -134,13 +137,29 @@ Rectangle {
     }
 
     HoverHandler { id: hover }
-    ToolTip.visible: hover.hovered && tile.occupied && tile.peekable
-    ToolTip.text: "Click to peek (shows the endpoint; nothing opens automatically)"
+    ToolTip.visible: hover.hovered
+    ToolTip.text: focused
+        ? "Focused — click to restore the wall"
+        : "Click to focus this monitor"
 
+    // A plain click focuses/enlarges this monitor (click again to restore).
     MouseArea {
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton
-        cursorShape: (tile.occupied && tile.peekable) ? Qt.PointingHandCursor : Qt.ArrowCursor
-        onClicked: if (tile.occupied && tile.peekable) tile.peekRequested()
+        cursorShape: Qt.PointingHandCursor
+        onClicked: tile.focusRequested()
+    }
+
+    // Peek is an explicit secondary action (desktop seats only), so a plain
+    // click can mean "focus". It appears on hover; nothing opens by itself.
+    Button {
+        anchors.top: parent.top
+        anchors.right: parent.right
+        anchors.margins: 6
+        visible: hover.hovered && tile.occupied && tile.peekable
+        text: "Peek"
+        font.pixelSize: 11
+        padding: 4
+        onClicked: tile.peekRequested()
     }
 }

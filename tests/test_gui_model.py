@@ -9,17 +9,21 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from omavroom.config import Config
 from omavroom.gui.viewmodel import (
     ATTENTION_ACTIONS,
     TERMINAL_IDLE,
     MonitorWall,
+    choose_columns,
     grid_columns,
     heartbeat_text,
     plan_from_config,
     render_terminal_text,
     tile_column_span,
     tile_row_span,
+    wall_layout,
 )
 from omavroom.poolview import NO_SIGNAL
 
@@ -413,3 +417,79 @@ def test_tile_spans():
     assert tile_column_span("terminal", 4) == 1
     assert tile_row_span("desktop") == 2
     assert tile_row_span("terminal") == 1
+
+
+def _assert_inside(rects, width, height):
+    for rect in rects:
+        assert rect.x >= -0.001
+        assert rect.y >= -0.001
+        assert rect.x + rect.width <= width + 0.001
+        assert rect.y + rect.height <= height + 0.001
+
+
+def _assert_no_overlap(rects):
+    for i, first in enumerate(rects):
+        for second in rects[i + 1 :]:
+            overlap_x = min(first.x + first.width, second.x + second.width) - max(first.x, second.x)
+            overlap_y = min(first.y + first.height, second.y + second.height) - max(
+                first.y, second.y
+            )
+            assert not (overlap_x > 0.5 and overlap_y > 0.5), (first, second)
+
+
+@pytest.mark.parametrize(
+    "seat_types",
+    [
+        ["desktop", "terminal", "terminal"],
+        ["terminal", "terminal"],
+        ["desktop"],
+        ["desktop", "desktop", "terminal", "terminal"],
+        ["terminal", "terminal", "terminal", "terminal", "terminal"],
+    ],
+)
+@pytest.mark.parametrize("size", [(930.0, 700.0), (600.0, 900.0), (1600.0, 500.0), (400.0, 300.0)])
+def test_wall_layout_always_fits_inside_the_area(seat_types, size):
+    """The wall must never scroll: every slot fits, with no overlaps."""
+    width, height = size
+    rects = wall_layout(seat_types, width, height)
+    assert len(rects) == len(seat_types)
+    _assert_inside(rects, width, height)
+    _assert_no_overlap(rects)
+
+
+def test_wall_layout_fills_the_available_space():
+    rects = wall_layout(["desktop", "terminal", "terminal"], 930.0, 700.0)
+    # No empty band below or beside the tiles.
+    assert min(r.y for r in rects) <= 0.001
+    assert min(r.x for r in rects) <= 0.001
+    assert max(r.y + r.height for r in rects) >= 699.0
+    assert max(r.x + r.width for r in rects) >= 929.0
+
+
+def test_focus_makes_the_selected_tile_largest_and_keeps_the_rest_visible():
+    seat_types = ["desktop", "terminal", "terminal"]
+    rects = wall_layout(seat_types, 930.0, 700.0, focus_index=1)
+    assert rects[1].focused is True
+    assert all(not rect.focused for index, rect in enumerate(rects) if index != 1)
+    focused_area = rects[1].width * rects[1].height
+    for index, rect in enumerate(rects):
+        if index != 1:
+            assert focused_area > rect.width * rect.height
+            # The others are still on the wall (not collapsed to nothing).
+            assert rect.width > 1.0 and rect.height > 1.0
+    _assert_inside(rects, 930.0, 700.0)
+    _assert_no_overlap(rects)
+
+
+def test_single_slot_focus_is_a_no_op():
+    rects = wall_layout(["terminal"], 800.0, 600.0, focus_index=0)
+    assert len(rects) == 1
+    assert rects[0].width == 800.0 and rects[0].height == 600.0
+
+
+def test_choose_columns_is_a_valid_candidate():
+    seat_types = ["desktop", "terminal", "terminal"]
+    columns = choose_columns(seat_types, 930.0, 700.0)
+    assert 1 <= columns <= len(seat_types)
+    # A wide wall should not fall back to a single tall column.
+    assert choose_columns(["terminal", "terminal"], 1600.0, 500.0) >= 2

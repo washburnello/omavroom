@@ -41,7 +41,11 @@ from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 
 from omavroom.client import DaemonClient, DaemonClientError, DaemonRequestError, DaemonTimeout
 from omavroom.config import Config
-from omavroom.gui.viewmodel import MonitorWall, grid_columns, tile_column_span, tile_row_span
+from omavroom.gui.viewmodel import (
+    MonitorWall,
+    grid_columns,
+    wall_layout,
+)
 from omavroom.poolview import now_utc
 
 #: Per-request socket timeout for polling calls (keeps a hung daemon from
@@ -85,6 +89,12 @@ class WallBackend(QObject):
         self._wall = MonitorWall(config)
         self._revision = 0
         self._columns = grid_columns(0)
+        #: Wall area (already excludes the sidebar) for fit-to-window layout.
+        self._viewport_w = 0
+        self._viewport_h = 0
+        #: Key of the enlarged/focused slot, or None for the uniform wall.
+        self._focused_key: str | None = None
+        self._layout_revision = 0
         self._daemon_ok = False
         self._daemon_message = "connecting to daemon..."
         self._notice = ""
@@ -146,6 +156,20 @@ class WallBackend(QObject):
     def gridColumns(self) -> int:
         return self._columns
 
+    @Property(str, notify=layoutChanged)
+    def focusedSlotKey(self) -> str:
+        """Key of the focused (enlarged) slot, or "" for the uniform wall."""
+        return self._focused_key or ""
+
+    @Property(int, notify=layoutChanged)
+    def layoutRevision(self) -> int:
+        """Bumped whenever viewport size, focus, or the slot plan changes.
+
+        QML uses it as a dependency so ``slotRectAt`` re-evaluates without the
+        delegate being recreated.
+        """
+        return self._layout_revision
+
     @Property("QVariantList", notify=queueChanged)
     def queue(self) -> list[dict]:
         return self._wall.state.waiter_dicts()
@@ -162,14 +186,6 @@ class WallBackend(QObject):
     def attentionCount(self) -> int:
         return len(self._wall.state.attention)
 
-    @Slot(str, int, result=int)
-    def tileColumnSpan(self, seat_type: str, columns: int) -> int:
-        return tile_column_span(seat_type, columns)
-
-    @Slot(str, result=int)
-    def tileRowSpan(self, seat_type: str) -> int:
-        return tile_row_span(seat_type)
-
     # -- update path (called on the GUI thread) --------------------------
     @Slot(object)
     def apply_payload(self, payload: object) -> None:
@@ -183,6 +199,10 @@ class WallBackend(QObject):
             return
         status = payload.get("status") or {}
         plan_changed = self._wall.sync_plan(status.get("per_type") or {})
+        # A focus on a slot that no longer exists would be a stale rectangle.
+        if self._focused_key and self._focused_key not in self._wall.state.slot_keys:
+            self._focused_key = None
+            plan_changed = True
         self._wall.update(
             status,
             execs_by_seat=payload.get("execs") or {},
@@ -194,6 +214,7 @@ class WallBackend(QObject):
         self._revision += 1
         if plan_changed:
             self.slotKeysChanged.emit()
+            self._bump_layout()
         self.revisionChanged.emit()
         self.queueChanged.emit()
         self.attentionChanged.emit()
@@ -249,16 +270,78 @@ class WallBackend(QObject):
 
     @Slot(int)
     def setViewportWidth(self, width: int) -> None:
-        """Set the wall's available width (already excludes the sidebar).
+        """Set the wall's available width (kept for callers/tests).
 
-        The column count is derived from this width; QML passes the
-        ``ScrollView.availableWidth`` (or the window width minus the sidebar
-        and margins) so column packing never overflows at a boundary.
+        Prefer :meth:`setViewportSize`, which also drives the vertical fit.
         """
         columns = grid_columns(width)
         if columns != self._columns:
             self._columns = columns
             self.layoutChanged.emit()
+
+    @Slot(int, int)
+    def setViewportSize(self, width: int, height: int) -> None:
+        """Set the wall area (sidebar/header already excluded).
+
+        The whole slot set is laid out to fit this area exactly: tiles scale
+        down rather than scrolling.
+        """
+        w = max(0, int(width))
+        h = max(0, int(height))
+        if (w, h) == (self._viewport_w, self._viewport_h):
+            return
+        self._viewport_w = w
+        self._viewport_h = h
+        self._columns = grid_columns(w)
+        self._bump_layout()
+
+    @Slot(int, result="QVariantMap")
+    def slotRectAt(self, index: int) -> dict:
+        """Geometry for slot ``index`` in the current fit-to-window layout."""
+        rects = self._slot_rects()
+        if 0 <= index < len(rects):
+            rect = rects[index]
+            return {
+                "x": rect.x,
+                "y": rect.y,
+                "width": rect.width,
+                "height": rect.height,
+                "focused": rect.focused,
+            }
+        return {}
+
+    @Slot(str)
+    def toggleFocus(self, key: str) -> None:
+        """Enlarge ``key`` and shrink the rest; clicking it again restores."""
+        key = str(key)
+        self._focused_key = None if key == self._focused_key else key
+        self._bump_layout()
+
+    @Slot()
+    def clearFocus(self) -> None:
+        if self._focused_key is not None:
+            self._focused_key = None
+            self._bump_layout()
+
+    def _slot_rects(self):
+        slots = self._wall.state.slots
+        seat_types = [slot.seat_type for slot in slots]
+        focus_index = None
+        if self._focused_key:
+            for index, slot in enumerate(slots):
+                if slot.key == self._focused_key:
+                    focus_index = index
+                    break
+        return wall_layout(
+            seat_types,
+            self._viewport_w,
+            self._viewport_h,
+            focus_index=focus_index,
+        )
+
+    def _bump_layout(self) -> None:
+        self._layout_revision += 1
+        self.layoutChanged.emit()
 
     @Slot(str)
     def openViewer(self, endpoint: str) -> None:
