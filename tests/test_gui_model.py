@@ -488,6 +488,26 @@ def test_focus_makes_the_selected_tile_largest_and_keeps_the_rest_visible():
     _assert_no_overlap(rects)
 
 
+def test_missing_screenshot_keeps_the_previous_frame():
+    """A poll without a fresh screenshot must not blank the monitor (the
+    'flash of black' seen every few seconds)."""
+    wall = MonitorWall(_config(desktop=1, terminal=2))
+    wall.sync_plan({"desktop": {"max_seats": 1}, "terminal": {"max_seats": 2}})
+    status = {
+        "seats": [_seat(1, "desktop-1", seat_type="desktop", state="ready")],
+        "queue": [],
+        "per_type": {"desktop": {"max_seats": 1}, "terminal": {"max_seats": 2}},
+    }
+    first = wall.update(status, screenshots={1: "AAAA"})
+    assert "AAAA" in first.slots[0].thumbnail_source
+    # No screenshot this poll -> the previous frame is retained, not cleared.
+    second = wall.update(status, screenshots={})
+    assert "AAAA" in second.slots[0].thumbnail_source
+    # A fresh frame replaces it.
+    third = wall.update(status, screenshots={1: "BBBB"})
+    assert "BBBB" in third.slots[0].thumbnail_source
+
+
 def test_single_slot_focus_is_a_no_op():
     rects = wall_layout(["terminal"], 800.0, 600.0, focus_index=0)
     assert len(rects) == 1

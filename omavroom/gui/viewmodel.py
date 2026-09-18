@@ -450,6 +450,10 @@ class MonitorWall:
         self.config = config
         self.plan: list[Slot] = plan_from_config(config)
         self._previous: dict[str, int | None] = {}
+        #: Last thumbnail per seat id. A poll that does not return a fresh
+        #: screenshot keeps the previous frame instead of blanking the tile
+        #: (that blank was the "flash of black" every few seconds).
+        self._thumbnails: dict[int, str] = {}
         self.state: WallState = self.initial_state()
 
     def sync_plan(self, per_type: dict) -> bool:
@@ -503,6 +507,13 @@ class MonitorWall:
             execs_by_seat = {}
         if not isinstance(screenshots, dict):
             screenshots = {}
+        # Carry the last good frame forward: a missing screenshot this poll
+        # (slow capture, timeout) must not blank the monitor.
+        for seat_id, frame in screenshots.items():
+            if isinstance(frame, str) and frame:
+                self._thumbnails[int(seat_id)] = frame
+        for seat_id in list(self._thumbnails):
+            screenshots.setdefault(seat_id, self._thumbnails[seat_id])
         timeout_s = self.config.leases.heartbeat_timeout_s
         slots = tuple(
             self._slot_state(
@@ -515,6 +526,11 @@ class MonitorWall:
             )
             for slot in self.plan
         )
+        # Don't accumulate frames for seats that are gone.
+        live_ids = {row.seat_id for row in rows}
+        self._thumbnails = {
+            seat_id: frame for seat_id, frame in self._thumbnails.items() if seat_id in live_ids
+        }
         waiter_rows = build_waiter_rows(status, now=moment)
         next_ids = next_up_ids(waiter_rows)
         waiters = tuple(
