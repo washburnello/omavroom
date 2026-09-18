@@ -144,6 +144,14 @@ Accept: an agent completes a hello-world-grade task end-to-end through MCP
 tools only (request → exec → screenshot → release), with a long-running
 exec polled (not blocked) mid-phase.
 
+Status: COMPLETE (2026-09-18). Exec engine (per-exec workers, bounded
+output, race-free kill), FastMCP server (27 tools, protocol v1), daemon
+autostart, docs/mcp.md, and opencode wiring. Proven end-to-end over MCP
+stdio on a real terminal seat: request → ready (14s) → exec_run returned
+the guest's real output → terminal-seat screenshot correctly refused →
+release destroyed the VM. Human must restart opencode to load the MCP
+server.
+
 ## Phase 6 — CLI + TUI companion
 
 Spec: `omavroom status [--watch]`, `screenshot`, `peek`, `destroy`,
