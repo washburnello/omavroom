@@ -22,6 +22,8 @@ build/
 
 # omavroom local artifacts (Phase 1): VM disk images + installer ISOs live
 # outside the repo (~/.local/share/omavroom, ~/.cache/omavroom); ignore any
-# copies that land in the worktree.
+# copies that land in the worktree. Screenshots default to
+# ~/.local/share/omavroom/screenshots, but ignore stray ones defensively.
 *.qcow2
 *.iso
+omavroom-*.png

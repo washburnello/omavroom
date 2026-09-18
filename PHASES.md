@@ -161,6 +161,13 @@ attachments, seat state, queue — no framebuffer contents), usable over SSH.
 Accept: full VM lifecycle drivable from CLI alone; TUI renders correct
 state against a live manager, including queued waiters.
 
+Status: COMPLETE (2026-09-18). `omavroom` CLI (status/seats/queue/request/
+screenshot/peek/release/reset/retry-release/force-discard/destroy/events/
+admission/settings/tui/daemon) over protocol v1, plus a metadata-only
+Textual TUI (settings-derived fixed slot grid, sticky no-reflow teardown,
+queue sidebar, needs_attention, daemon-down recovery, SSH/Alacritty-safe).
+425 tests.
+
 ## Phase 7 — Golden image automation + multi-image
 
 Spec: scripted base-image build (as automated as the Omarchy installer

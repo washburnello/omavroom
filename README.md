@@ -8,13 +8,13 @@ host) or headless `terminal` — does its work, pushes it to a repo, and
 releases the seat, which destroys the VM. See `PLAN.md` for the full
 design and `PHASES.md` for the build order.
 
-> Phase 5: the real exec engine (per-exec worker threads, streaming ring
-> buffers, kill/timeout) and the FastMCP server are in place. Phase 4 added
-> the scheduler + state core (atomic claiming, fair queue, leases/heartbeats
-> with auto-reclaim, dynamic admission, destroy-on-release, content-gated
-> export, reattach/reconcile) and the Phase 4B libvirt provisioner. The CLI/TUI
-> is still to come; tests exercise everything against an in-process
-> `FakeProvisioner`.
+> Phase 6 adds the operator CLI and the metadata-only Textual TUI companion.
+> Phase 5 landed the real exec engine (per-exec worker threads, streaming ring
+> buffers, kill/timeout) and the FastMCP server. Phase 4 added the scheduler +
+> state core (atomic claiming, fair queue, leases/heartbeats with auto-reclaim,
+> dynamic admission, destroy-on-release, content-gated export,
+> reattach/reconcile) and the Phase 4B libvirt provisioner. Tests exercise
+> everything against an in-process `FakeProvisioner` (no VMs, no sudo).
 
 ## Quickstart
 
@@ -26,6 +26,30 @@ cd /home/washburnello/Work/omavroom
 uv sync --group dev   # create .venv and install dev tools (pytest, ruff)
 uv run pytest         # run the test suite (no VMs)
 uv run omavroom --help
+```
+
+## Daemon, CLI, and TUI
+
+The long-running `omavroom` manager daemon owns all libvirt/QEMU work and
+serves it over a local Unix socket (protocol v1). Every other surface is a
+client of that socket:
+
+- **CLI** — `omavroom status [--watch]`, `seats`, `queue`, `request`,
+  `screenshot`, `peek`, `release`, `reset`, `retry-release`, `force-discard`,
+  `destroy`, `events`, `admission`, `settings` (`config show`), `image list`,
+  and `tui`. Most commands support `--json`.
+- **TUI** — `omavroom tui` (or `omavroom-tui`): a metadata-only Textual
+  monitor wall (fixed slots, queue sidebar, needs-attention panel) that is
+  SSH-friendly and renders no framebuffer contents.
+- **MCP** — `omavroom-mcp` exposes the agent toolset (see below).
+
+Start the daemon, then drive it from another terminal:
+
+```bash
+uv run omavroom daemon --provisioner fake   # foreground; fake = no VMs
+uv run omavroom status --watch
+uv run omavroom settings --json
+uv run omavroom tui
 ```
 
 ## MCP server

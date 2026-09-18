@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -81,3 +85,56 @@ def make_manager(tmp_path, clock, free_ram):
 @pytest.fixture
 def manager(make_manager, config, fake):
     return make_manager(config, provisioner=fake)
+
+
+@pytest.fixture
+def fake_daemon(tmp_path):
+    """Factory starting an in-process daemon (FakeProvisioner) for CLI/TUI tests.
+
+    Usage::
+
+        with fake_daemon() as pool:
+            cli.main(["--socket", str(pool.socket_path), "status"])
+
+    Each call gets a unique socket, database and manager, so a test can start
+    more than one. Yielding a namespace keeps the manager (for state setup)
+    and the socket path (for clients) in one place.
+    """
+    from omavroom.daemon import DaemonServer
+    from omavroom.manager import Manager
+
+    started: list[str] = []
+
+    @contextmanager
+    def _start(*, config=None, provisioner=None, free_ram_mb: int = 10**9):
+        csv = config or Config.default()
+        if config is None:
+            csv.host.headroom_floor_mb = 512
+        index = len(started)
+        started.append(str(index))
+        mgr = Manager(
+            csv,
+            db_path=tmp_path / f"state-{index}.db",
+            provisioner=provisioner or FakeProvisioner(),
+            free_ram_mb=lambda: free_ram_mb,
+        )
+        server = DaemonServer(mgr, socket_path=tmp_path / f"daemon-{index}.sock")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while not server.socket_path.exists():
+            if time.monotonic() >= deadline:  # pragma: no cover - startup guard
+                raise RuntimeError("fake daemon did not start")
+            time.sleep(0.01)
+        try:
+            yield SimpleNamespace(
+                server=server,
+                manager=mgr,
+                config=csv,
+                socket_path=server.socket_path,
+            )
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+    return _start

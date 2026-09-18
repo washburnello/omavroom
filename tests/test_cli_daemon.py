@@ -44,7 +44,8 @@ def test_cli_status_against_running_daemon(tmp_path, monkeypatch, capsys):
     try:
         assert cli.main(["status"]) == 0
         out = capsys.readouterr().out
-        assert "per_type" in out
+        assert "SEATS" in out
+        assert "desktop" in out and "terminal" in out
     finally:
         server.shutdown()
         thread.join(timeout=5)
@@ -58,7 +59,7 @@ def test_cli_status_without_daemon(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_stub_commands_keep_nonzero_exit(capsys):
-    assert cli.main(["request"]) == 2
+    assert cli.main(["exec"]) == 2
     assert "not yet implemented" in capsys.readouterr().err
 
 
