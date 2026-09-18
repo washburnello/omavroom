@@ -178,6 +178,30 @@ class DaemonClient:
         with self._lock:
             self._close_locked()
 
+    def shutdown(self) -> None:
+        """Force-close the socket *without* waiting for the request lock.
+
+        :meth:`close` acquires ``self._lock``, which :meth:`call` holds for the
+        whole (possibly blocking) request/response cycle. A caller on another
+        thread that needs to unblock an in-flight request -- the GUI's
+        background poll worker on application shutdown -- must not wait on
+        that lock. This closes the underlying socket directly, which makes a
+        blocked ``readline`` return promptly; the request then fails with the
+        usual connection error and the connection is discarded on the next
+        call. Thread-safe: the lock-free read of the socket reference is
+        idempotent and tolerant of a concurrent :meth:`call` teardown.
+        """
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def _close_locked(self) -> None:
         stream = self._stream
         self._stream = None

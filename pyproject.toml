@@ -7,6 +7,7 @@ license = { text = "MIT" }
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=4.0.5",
+    "pyside6>=6.11.2",
     "textual>=8.2.8",
 ]
 
@@ -14,6 +15,7 @@ dependencies = [
 omavroom = "omavroom.cli:main"
 omavroom-mcp = "omavroom.mcp.server:main"
 omavroom-tui = "omavroom.tui:main"
+omavroom-gui = "omavroom.gui.app:main"
 
 [dependency-groups]
 dev = [

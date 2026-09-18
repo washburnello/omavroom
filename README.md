@@ -41,6 +41,11 @@ client of that socket:
 - **TUI** — `omavroom tui` (or `omavroom-tui`): a metadata-only Textual
   monitor wall (fixed slots, queue sidebar, needs-attention panel) that is
   SSH-friendly and renders no framebuffer contents.
+- **GUI** — `omavroom gui` (or `omavroom-gui`): the native Qt6/QML Command
+  Center. A responsive packed grid of permanent slots with live desktop
+  thumbnails, live terminal views, a queue sidebar, a needs-attention panel,
+  click-to-peek, and a settings view. It polls the daemon on a background
+  thread and never opens a window on its own.
 - **MCP** — `omavroom-mcp` exposes the agent toolset (see below).
 
 Start the daemon, then drive it from another terminal:
@@ -50,7 +55,13 @@ uv run omavroom daemon --provisioner fake   # foreground; fake = no VMs
 uv run omavroom status --watch
 uv run omavroom settings --json
 uv run omavroom tui
+uv run omavroom gui          # native Command Center (needs a graphical session)
 ```
+
+`omavroom-gui` accepts `--socket`, `--interval` (poll seconds), `--screenshot-width`,
+and `--viewer CMD` (used only when you explicitly click "Open viewer"; set
+`$OMAVROOM_VIEWER` to make it the default). It never launches a viewer without
+an explicit click.
 
 ## MCP server
 

@@ -165,23 +165,59 @@ def _seat_type_sort_key(seat_type: str) -> tuple[int, str]:
         return (len(SEAT_TYPE_ORDER), seat_type)
 
 
+def _int_or(value: Any, default: int) -> int:
+    """Coerce ``value`` to int, or return ``default`` for anything unusable.
+
+    Defensive companion to :func:`build_seat_rows`: a malformed payload (a
+    string id, ``None``, a nested object) must not raise on a monitoring path.
+    Bools are rejected (``True`` is not seat id 1).
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def build_seat_rows(status: dict, *, now: datetime | None = None) -> list[SeatRow]:
-    """Join ``pool_status.seats`` with claimed requests for project/elapsed."""
+    """Join ``pool_status.seats`` with claimed requests for project/elapsed.
+
+    Tolerant by construction: a non-dict ``status`` or a seat record with a
+    missing/non-int ``id`` is skipped rather than raising, so a malformed
+    daemon payload can only degrade the view, never crash a monitor.
+    """
+    if not isinstance(status, dict):
+        return []
     seats = status.get("seats") or []
     queue = status.get("queue") or []
+    if not isinstance(seats, list):
+        seats = []
+    if not isinstance(queue, list):
+        queue = []
     claimed = {
-        request.get("seat_id"): request
+        _int_or(request.get("seat_id"), -1): request
         for request in queue
-        if request.get("seat_id") is not None and request.get("status") == "claimed"
+        if isinstance(request, dict)
+        and request.get("seat_id") is not None
+        and request.get("status") == "claimed"
     }
     rows: list[SeatRow] = []
     for seat in seats:
-        seat_id = seat.get("id")
+        if not isinstance(seat, dict):
+            continue
+        raw_id = seat.get("id")
+        if isinstance(raw_id, bool) or raw_id is None:
+            continue
+        try:
+            seat_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
         request = claimed.get(seat_id) or {}
         lease = request.get("lease") or {}
         rows.append(
             SeatRow(
-                seat_id=int(seat_id),
+                seat_id=seat_id,
                 name=str(seat.get("name") or seat_id),
                 seat_type=str(seat.get("seat_type") or "?"),
                 state=str(seat.get("state") or "?"),
@@ -201,20 +237,29 @@ def build_seat_rows(status: dict, *, now: datetime | None = None) -> list[SeatRo
 
 
 def build_waiter_rows(status: dict, *, now: datetime | None = None) -> list[WaiterRow]:
-    """Queued requests, sorted by seat type then scheduler position."""
+    """Queued requests, sorted by seat type then scheduler position.
+
+    Like :func:`build_seat_rows`, this tolerates a non-dict ``status`` and
+    skips malformed request records instead of raising.
+    """
+    if not isinstance(status, dict):
+        return []
+    queue = status.get("queue") or []
+    if not isinstance(queue, list):
+        return []
     rows = [
         WaiterRow(
-            request_id=int(request.get("id")),
-            position=int(request.get("position") or 0),
+            request_id=_int_or(request.get("id"), 0),
+            position=_int_or(request.get("position"), 0),
             seat_type=str(request.get("seat_type") or "?"),
             agent=str(request.get("agent_label") or "-"),
             project=request.get("project"),
             image=str(request.get("image") or "-"),
             waited_s=elapsed_since(request.get("created_at"), now),
-            queue_ahead=int(request.get("queue_ahead") or 0),
+            queue_ahead=_int_or(request.get("queue_ahead"), 0),
         )
-        for request in (status.get("queue") or [])
-        if request.get("status") == "waiting"
+        for request in queue
+        if isinstance(request, dict) and request.get("status") == "waiting"
     ]
     rows.sort(key=lambda row: (_seat_type_sort_key(row.seat_type), row.position, row.request_id))
     return rows

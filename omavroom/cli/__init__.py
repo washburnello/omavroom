@@ -82,6 +82,7 @@ _COMMAND_HELP: dict[str, str] = {
     "settings": "show the effective (merged) configuration; no daemon needed",
     "config": "configuration helpers (alias of 'settings')",
     "tui": "open the metadata-only Textual monitor wall (over SSH friendly)",
+    "gui": "open the native Qt6/QML Command Center (monitor wall + queue)",
     "exec": "run a command inside a seat (stub; later phase)",
 }
 
@@ -238,6 +239,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_REFRESH_INTERVAL_S,
         help="auto-refresh seconds (default: %(default)s)",
+    )
+
+    gui = subparsers.add_parser("gui", help=_COMMAND_HELP["gui"])
+    gui.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_REFRESH_INTERVAL_S,
+        help="screenshot/status polling seconds (default: %(default)s)",
+    )
+    gui.add_argument(
+        "--screenshot-width",
+        type=int,
+        default=480,
+        help="downscale cap for desktop thumbnails (default: %(default)s)",
+    )
+    gui.add_argument(
+        "--viewer",
+        default=os.environ.get("OMAVROOM_VIEWER"),
+        help="viewer command for click-to-peek ({}=endpoint); never auto-launched",
     )
 
     for name in STUB_COMMANDS:
@@ -671,6 +691,30 @@ def _tui(args: argparse.Namespace) -> int:
     return run_tui(socket_path=getattr(args, "socket", None), refresh_interval=args.interval)
 
 
+def _gui(args: argparse.Namespace) -> int:
+    """Launch the native Command Center; PySide6 is imported lazily."""
+    from omavroom.config import Config
+
+    try:
+        from omavroom.gui.app import run_gui
+    except ImportError as exc:  # pragma: no cover - pyside6 is a hard dependency
+        return _fail("gui", CliError(f"PySide6 is not installed: {exc}"))
+    try:
+        config = Config.load()
+    except (OSError, ValueError) as exc:
+        return _fail("gui", exc)
+    try:
+        return run_gui(
+            socket_path=getattr(args, "socket", None),
+            interval=args.interval,
+            screenshot_width=args.screenshot_width,
+            viewer=args.viewer,
+            config=config,
+        )
+    except SystemExit as exc:  # PySide6 missing: run_gui raises SystemExit
+        return _fail("gui", CliError(str(exc)))
+
+
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
@@ -711,6 +755,7 @@ def main(argv: list[str] | None = None) -> int:
         "admission": _admission,
         "settings": _settings,
         "tui": _tui,
+        "gui": _gui,
     }
     if args.command == "image":
         if getattr(args, "image_command", None) == "list":
