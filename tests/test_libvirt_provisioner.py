@@ -9,6 +9,7 @@ runner. The real libvirt path lives in ``test_libvirt_integration.py``.
 from __future__ import annotations
 
 import base64
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from omavroom.manager.libvirt_provisioner import (
     CommandResult,
     LibvirtProvisioner,
     build_domain_xml,
+    is_safe_ref_token,
+    is_safe_sha,
     png_dimensions,
     repo_name_from,
     safe_branch_name,
@@ -414,3 +417,364 @@ def test_screenshot_on_terminal_reports_no_graphics(tmp_path: Path) -> None:
     _meta(prov, "terminal-1", overlay)
     with pytest.raises(Exception, match="screenshot failed"):
         prov.screenshot("omavroom-seat-terminal-1")
+
+
+# --------------------------------------------------------------------------
+# FIX 2 (4B2) - git ref option-injection hardening
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "-x",
+        "--upload-pack=/bin/echo",
+        "--upload-pack=/bin/echo:refs/heads/x",
+        "origin:--upload-pack=/bin/echo",
+        "origin:",
+    ],
+)
+def test_push_destination_rejects_option_injection(tmp_path: Path, ref: str) -> None:
+    prov = _prov(tmp_path)
+    with pytest.raises(Exception, match="unsafe|invalid|empty"):
+        prov._push_destination(ExportSpec(repo="r", branch="task", ref=ref))
+
+
+def test_push_destination_rejects_option_like_branch(tmp_path: Path) -> None:
+    prov = _prov(tmp_path)
+    with pytest.raises(Exception, match="invalid branch"):
+        prov._push_destination(ExportSpec(repo="r", branch="--upload-pack=/bin/echo"))
+
+
+def test_push_rejects_option_injection_without_calling_git(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv, timeout, input_text):
+        calls.append(list(argv))
+        if argv[1:3] == ["-C", "/repo"] and argv[3] == "rev-parse":
+            return CommandResult(0, ".git\n", "")
+        return CommandResult(0, "", "")
+
+    prov = _prov(tmp_path, host_runner=runner)
+    fetched = FetchResult(ok=True, sha="a" * 40, spec=ExportSpec(repo="/repo", branch="task"))
+    result = prov.push(
+        ExportSpec(repo="/repo", branch="task", ref="--upload-pack=/bin/echo:refs/heads/x"),
+        fetched,
+    )
+    assert result.ok is False
+    assert "unsafe" in result.message or "option" in result.message
+    assert not any("--upload-pack" in arg for call in calls for arg in call)
+
+
+def test_push_rejects_unknown_bare_remote(tmp_path: Path) -> None:
+    sha = "a" * 40
+
+    def runner(argv, timeout, input_text):
+        if argv[1:3] == ["-C", "/repo"] and argv[3] == "rev-parse":
+            return CommandResult(0, ".git\n", "")
+        if "remote" in argv:
+            return CommandResult(0, "origin\n", "")
+        return CommandResult(0, "", "")
+
+    prov = _prov(tmp_path, host_runner=runner)
+    fetched = FetchResult(ok=True, sha=sha, spec=ExportSpec(repo="/repo", branch="task"))
+    result = prov.push(ExportSpec(repo="/repo", branch="task", ref="evil:refs/heads/x"), fetched)
+    assert result.ok is False
+    assert "not 'origin'" in result.message
+
+
+def test_push_accepts_known_remote_and_explicit_path(tmp_path: Path) -> None:
+    sha = "a" * 40
+
+    def runner(argv, timeout, input_text):
+        if argv[1:3] == ["-C", "/repo"] and argv[3] == "rev-parse":
+            return CommandResult(0, ".git\n", "")
+        if "remote" in argv:
+            return CommandResult(0, "upstream\n", "")
+        if "ls-remote" in argv:
+            return CommandResult(0, f"{sha}\trefs/heads/x\n", "")
+        return CommandResult(0, "", "")
+
+    prov = _prov(tmp_path, host_runner=runner)
+    fetched = FetchResult(ok=True, sha=sha, spec=ExportSpec(repo="/repo", branch="task"))
+    known = prov.push(ExportSpec(repo="/repo", branch="task", ref="upstream:refs/heads/x"), fetched)
+    assert known.ok is True
+    path = prov.push(
+        ExportSpec(repo="/repo", branch="task", ref="/tmp/remote.git:refs/heads/x"), fetched
+    )
+    assert path.ok is True
+
+
+def test_push_enforces_configured_remote_allowlist(tmp_path: Path) -> None:
+    sha = "a" * 40
+
+    def runner(argv, timeout, input_text):
+        if argv[1:3] == ["-C", "/repo"] and argv[3] == "rev-parse":
+            return CommandResult(0, ".git\n", "")
+        if "ls-remote" in argv:
+            return CommandResult(0, f"{sha}\trefs/heads/x\n", "")
+        return CommandResult(0, "", "")
+
+    cfg = Config.default()
+    cfg.export.allowed_remotes = ("upstream",)
+    prov = _prov(tmp_path, config=cfg, host_runner=runner)
+    fetched = FetchResult(ok=True, sha=sha, spec=ExportSpec(repo="/repo", branch="task"))
+    # ``origin`` is git's default push remote and stays allowed even with an
+    # allowlist configured (the allowlist only *adds* remotes).
+    origin_ok = prov.push(
+        ExportSpec(repo="/repo", branch="task", ref="origin:refs/heads/x"), fetched
+    )
+    assert origin_ok.ok is True
+    allowed = prov.push(
+        ExportSpec(repo="/repo", branch="task", ref="upstream:refs/heads/x"), fetched
+    )
+    assert allowed.ok is True
+    denied = prov.push(ExportSpec(repo="/repo", branch="task", ref="evil:refs/heads/x"), fetched)
+    assert denied.ok is False
+    assert "allowed_remotes" in denied.message
+
+
+def test_push_rejects_non_sha_fetch(tmp_path: Path) -> None:
+    prov = _prov(tmp_path)
+    fetched = FetchResult(ok=True, sha="not-a-sha", spec=ExportSpec(repo="/repo", branch="task"))
+    result = prov.push(ExportSpec(repo="/repo", branch="task"), fetched)
+    assert result.ok is False
+    assert "SHA" in result.message
+
+
+def test_config_parses_allowed_remotes(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "omavroom.toml"
+    cfg_file.write_text('[export]\nallowed_remotes = ["upstream", "backup"]\n', encoding="utf-8")
+    cfg = Config.from_toml(cfg_file)
+    assert cfg.export.allowed_remotes == ("upstream", "backup")
+
+
+# --------------------------------------------------------------------------
+# FIX A (round 3) - guest-controlled git tokens never reach host git argv
+# --------------------------------------------------------------------------
+class _GuestScriptedFetch(LibvirtProvisioner):
+    """fetch_bundle with a fully scripted guest (returns attacker-set tokens)."""
+
+    def __init__(self, *args, base: str, guest_sha: str, merge_base: str, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._base = base
+        self._guest_sha = guest_sha
+        self._merge_base = merge_base
+
+    def ip_for(self, vm_ref: str) -> str:  # avoid DHCP in fetch_bundle
+        return "10.0.0.5"
+
+    def run(self, vm_ref, command, **kwargs) -> CommandResult:  # type: ignore[override]
+        if "git status --porcelain" in command:
+            return CommandResult(0, "", "")
+        if "git stash list" in command:
+            return CommandResult(0, "0\n", "")
+        if "refs/heads/main" in command:  # base detection
+            return CommandResult(0, f"{self._base}\n", "")
+        if "git merge-base" in command:
+            return CommandResult(0, f"{self._merge_base}\n", "")
+        if "git rev-parse" in command:
+            return CommandResult(0, f"{self._guest_sha}\n", "")
+        if "git bundle create" in command:
+            return CommandResult(0, "", "")
+        if command.startswith("test -s "):
+            return CommandResult(0, "", "")
+        return CommandResult(1, "", f"unexpected guest command: {command}")
+
+
+def _scripted_fetch_host(record: list[list[str]], sha: str):
+    def host(argv, timeout, input_text) -> CommandResult:
+        record.append(list(argv))
+        if argv and argv[0] == "scp":
+            Path(argv[-1]).write_bytes(b"bundle")
+            return CommandResult(0, "", "")
+        if argv and argv[0] == "git":
+            if "rev-parse" in argv and "--verify" in argv:
+                return CommandResult(0, f"{sha}\n", "")
+            if "rev-list" in argv:
+                return CommandResult(0, "1\n", "")
+            if "diff" in argv and "--numstat" in argv:
+                return CommandResult(0, "1\t0\tsrc/app.py\n", "")
+            return CommandResult(0, "", "")
+        return CommandResult(1, "", f"unexpected host command: {argv}")
+
+    return host
+
+
+def _prepare_fetch(
+    tmp_path: Path,
+    *,
+    base: str = "main",
+    guest_sha: str = "a" * 40,
+    merge_base: str = "b" * 40,
+    host_runner=None,
+):
+    kwargs = dict(base=base, guest_sha=guest_sha, merge_base=merge_base)
+    prov = _GuestScriptedFetch(
+        Config.default(), base_dir=tmp_path, host_runner=host_runner, **kwargs
+    )
+    seat_dir = prov.seats_dir / "terminal-1"
+    seat_dir.mkdir(parents=True)
+    (seat_dir / "overlay.qcow2").write_bytes(b"x")
+    _meta(prov, "terminal-1", seat_dir / "overlay.qcow2")
+    return prov, str(tmp_path / "host.git")
+
+
+def test_fetch_bundle_valid_shas_succeed(tmp_path: Path) -> None:
+    record: list[list[str]] = []
+    sha = "a" * 40
+    prov, host_repo = _prepare_fetch(
+        tmp_path, guest_sha=sha, host_runner=_scripted_fetch_host(record, sha)
+    )
+    fetched = prov.fetch_bundle(
+        "omavroom-seat-terminal-1", ExportSpec(repo=host_repo, branch="task")
+    )
+    assert fetched.ok is True, fetched.message
+    assert fetched.sha == sha
+    # The removed/revision guards are present on the host git invocations.
+    flat = [arg for call in record for arg in call]
+    assert "--end-of-options" in flat
+    assert "--" in flat
+
+
+def test_fetch_bundle_rejects_malicious_merge_base(tmp_path: Path) -> None:
+    record: list[list[str]] = []
+    pwned = tmp_path / "pwned_merge_base"
+    prov, host_repo = _prepare_fetch(
+        tmp_path,
+        merge_base=f"--output={pwned}",
+        host_runner=_scripted_fetch_host(record, "a" * 40),
+    )
+    fetched = prov.fetch_bundle(
+        "omavroom-seat-terminal-1", ExportSpec(repo=host_repo, branch="task")
+    )
+    assert fetched.ok is False
+    assert "merge-base" in fetched.message
+    # The option-like token never reached a host argv (so git can't act on it).
+    assert not any("--output" in arg for call in record for arg in call)
+
+
+def test_fetch_bundle_rejects_malicious_guest_sha(tmp_path: Path) -> None:
+    record: list[list[str]] = []
+    prov, host_repo = _prepare_fetch(
+        tmp_path,
+        guest_sha=f"--output={tmp_path / 'pwned_sha'}",
+        host_runner=_scripted_fetch_host(record, "a" * 40),
+    )
+    fetched = prov.fetch_bundle(
+        "omavroom-seat-terminal-1", ExportSpec(repo=host_repo, branch="task")
+    )
+    assert fetched.ok is False
+    assert "guest SHA" in fetched.message
+    assert not any("--output" in arg for call in record for arg in call)
+
+
+def test_fetch_bundle_rejects_malicious_base(tmp_path: Path) -> None:
+    record: list[list[str]] = []
+    prov, host_repo = _prepare_fetch(
+        tmp_path,
+        base=f"--output={tmp_path / 'pwned_base'}",
+        host_runner=_scripted_fetch_host(record, "a" * 40),
+    )
+    fetched = prov.fetch_bundle(
+        "omavroom-seat-terminal-1", ExportSpec(repo=host_repo, branch="task")
+    )
+    assert fetched.ok is False
+    assert "base ref" in fetched.message
+
+
+def test_sha_and_ref_token_validators() -> None:
+    assert is_safe_sha("a" * 40) is True
+    assert is_safe_sha("a" * 64) is True
+    assert is_safe_sha("A" * 40) is False  # uppercase is not a git object id
+    assert is_safe_sha(f"--output={Path('/tmp/x')}") is False
+    assert is_safe_sha("main") is False
+    assert is_safe_ref_token("main") is True
+    assert is_safe_ref_token("origin/HEAD") is True
+    assert is_safe_ref_token("-x") is False
+    assert is_safe_ref_token("--output=/tmp/x") is False
+    assert is_safe_ref_token("a b") is False
+
+
+def test_git_output_option_demonstration(tmp_path: Path) -> None:
+    """Prove the underlying git behavior the validator defends against."""
+    import shutil
+
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    repo = tmp_path / "demo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+        check=True,
+    )
+    pwned = tmp_path / "created_by_git"
+    # Without --end-of-options, git accepts the injected option and writes a file.
+    subprocess.run(["git", "-C", str(repo), "diff", "--numstat", f"--output={pwned}", "HEAD"])
+    assert pwned.exists()
+    pwned.unlink()
+    # With --end-of-options, git rejects it and writes nothing.
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "diff",
+            "--numstat",
+            "--end-of-options",
+            f"--output={pwned}",
+            "HEAD",
+        ],
+        capture_output=True,
+    )
+    assert not pwned.exists()
+
+
+# --------------------------------------------------------------------------
+# FIX C (round 3) - click button may not inject guest shell
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "value",
+    [
+        "1,2,3; touch /tmp/omavroom_pwned",
+        "1,2,$(touch /tmp/omavroom_pwned)",
+        "1,2,272; rm -rf /",
+        "1,2,0",
+        "1,2,4",
+    ],
+)
+def test_click_command_rejects_injected_button(value: str) -> None:
+    with pytest.raises(Exception, match="button|click value"):
+        LibvirtProvisioner._click_command(value)
+
+
+def test_click_command_valid_buttons() -> None:
+    assert "ydotool click 272" in LibvirtProvisioner._click_command("10,20")
+    assert "ydotool click 274" in LibvirtProvisioner._click_command("10,20,2")
+    assert "ydotool click 273" in LibvirtProvisioner._click_command("10,20,3")
+
+
+def test_prepare_repo_rejects_option_like_url_and_branch(tmp_path: Path) -> None:
+    prov = _prov(tmp_path)
+    seat_dir = tmp_path / "seats" / "terminal-1"
+    seat_dir.mkdir(parents=True)
+    (seat_dir / "overlay.qcow2").write_bytes(b"x")
+    _meta(prov, "terminal-1", seat_dir / "overlay.qcow2")
+    with pytest.raises(Exception, match="unsafe repo URL"):
+        prov.prepare_repo("omavroom-seat-terminal-1", RepoSpec(url="--upload-pack=/bin/echo"))
+    with pytest.raises(Exception, match="unsafe repo branch"):
+        prov.prepare_repo(
+            "omavroom-seat-terminal-1",
+            RepoSpec(url="https://example.com/x.git", branch="--upload-pack=/bin/echo"),
+        )

@@ -43,10 +43,11 @@ Lease + work::
 
     manager.heartbeat(seat_id=...) -> LeaseView      # independent channel
     manager.begin_work(seat_id) / finish_work(seat_id) -> SeatView
-    manager.exec_start(seat_id, exec_id, label=None) -> ExecView
-    manager.exec_poll(seat_id, exec_id) -> ExecView
+    manager.exec_start(seat_id, exec_id, label=None, command=None, timeout_s=None) -> ExecView
+    manager.exec_poll(seat_id, exec_id) -> ExecView   # stdout/stderr/exit_code/truncated
+    manager.exec_output(seat_id, exec_id, stdout="", stderr="") -> ExecView
     manager.exec_kill(seat_id, exec_id, signal=9) -> ExecView
-    manager.exec_finish(seat_id, exec_id, exit_code=None) -> ExecView
+    manager.exec_finish(seat_id, exec_id, exit_code=None, stdout="", stderr="") -> ExecView
 
 Desktop ops (desktop seats; Phase 5 ``screenshot`` / ``input`` / ``peek_*``)::
 
@@ -61,6 +62,11 @@ Teardown (non-blocking; returns a handle)::
         # fetch/gate/push failure -> held, never destroyed
     manager.reset_seat(seat_id) -> Handle      # revert to clean, keep seat
     manager.cancel_request(request_id) -> Handle  # atomic; claims take release path
+
+Operator recovery (interrupted release/reset; returns a handle)::
+
+    manager.retry_release(seat_id) -> Handle   # re-run the persisted export
+    manager.force_discard(seat_id) -> Handle   # destroy, no export (escape hatch)
 
 Admission / prewarm::
 
@@ -193,9 +199,11 @@ class Manager:
         self.execs = ExecTracker(
             clock=clock,
             max_concurrent_per_seat=self.config.exec.max_concurrent_per_seat,
+            max_output_bytes=self.config.exec.max_output_bytes,
         )
         self.tick_s = tick_s
         self.last_pump_error: BaseException | None = None
+        self.last_reconcile_report: ReconcileReport | None = None
         self._pending: deque[tuple[Handle, object]] = deque()
         self._tick_lock = threading.Lock()
         self._running = False
@@ -214,7 +222,7 @@ class Manager:
             self._running = True
             self._stop = False
         try:
-            self.reconcile()
+            self.last_reconcile_report = self.reconcile()
         except Exception:  # noqa: BLE001 - start must not die on a bad provisioner
             log.exception("reconcile failed on start; continuing")
         with self._cv:
@@ -413,8 +421,16 @@ class Manager:
     # ------------------------------------------------------------------
     # exec tracking hooks
     # ------------------------------------------------------------------
-    def exec_start(self, seat_id: int, exec_id: str, *, label: str | None = None) -> ExecView:
-        view = self.execs.start(seat_id, exec_id, label=label)
+    def exec_start(
+        self,
+        seat_id: int,
+        exec_id: str,
+        *,
+        label: str | None = None,
+        command: str | None = None,
+        timeout_s: int | None = None,
+    ) -> ExecView:
+        view = self.execs.start(seat_id, exec_id, label=label, command=command, timeout_s=timeout_s)
         if self.execs.active_count(seat_id) == 1:
             self.scheduler.begin_work(seat_id)
         return view
@@ -422,14 +438,30 @@ class Manager:
     def exec_poll(self, seat_id: int, exec_id: str) -> ExecView:
         return self.execs.poll(seat_id, exec_id)
 
+    def exec_output(
+        self, seat_id: int, exec_id: str, *, stdout: str = "", stderr: str = ""
+    ) -> ExecView:
+        """Append streamed output to a running exec (Phase 5 exec streaming)."""
+        return self.execs.record_output(seat_id, exec_id, stdout=stdout, stderr=stderr)
+
     def exec_kill(self, seat_id: int, exec_id: str, *, signal: int = 9) -> ExecView:
         """Kill a running exec; last live exec returns the seat to ready."""
         view = self.execs.kill(seat_id, exec_id, signal=signal)
         self._finish_if_idle(seat_id)
         return view
 
-    def exec_finish(self, seat_id: int, exec_id: str, *, exit_code: int | None = None) -> ExecView:
-        view = self.execs.finish(seat_id, exec_id, exit_code=exit_code)
+    def exec_finish(
+        self,
+        seat_id: int,
+        exec_id: str,
+        *,
+        exit_code: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> ExecView:
+        view = self.execs.finish(
+            seat_id, exec_id, exit_code=exit_code, stdout=stdout, stderr=stderr
+        )
         self._finish_if_idle(seat_id)
         return view
 
@@ -470,11 +502,27 @@ class Manager:
     # ------------------------------------------------------------------
     # teardown (background)
     # ------------------------------------------------------------------
-    def release_seat(self, seat_id: int, *, repo: str | None = None, export: bool = True) -> Handle:
-        """Fetch -> gate -> push -> destroy the seat VM on the worker."""
+    def release_seat(
+        self,
+        seat_id: int,
+        *,
+        repo: str | None = None,
+        export: bool = True,
+        branch: str | None = None,
+        ref: str | None = None,
+    ) -> Handle:
+        """Fetch -> gate -> push -> destroy the seat VM on the worker.
+
+        ``branch``/``ref`` are forwarded to the export so a manager-mediated
+        release-with-export reaches the provisioner's explicit push target
+        (Phase 4B1 delta: without them the ExportSpec had no branch and the
+        export failed as "invalid export branch").
+        """
 
         def job() -> ReleaseOutcome:
-            return self.scheduler.release_seat(seat_id, repo=repo, export=export)
+            return self.scheduler.release_seat(
+                seat_id, repo=repo, export=export, branch=branch, ref=ref
+            )
 
         return self._submit(job)
 
@@ -495,9 +543,33 @@ class Manager:
 
         return self._submit(job)
 
-    def export_seat(self, seat_id: int, *, repo: str) -> Handle:
-        """Export work from a seat without releasing it, on the worker."""
-        return self._submit(lambda: self.scheduler.export_seat(seat_id, repo=repo))
+    def export_seat(
+        self,
+        seat_id: int,
+        *,
+        repo: str,
+        branch: str | None = None,
+        ref: str | None = None,
+    ) -> Handle:
+        """Export work from a seat without releasing it, on the worker.
+
+        ``branch``/``ref`` are forwarded to the export spec (Phase 4B1 delta).
+        """
+        return self._submit(
+            lambda: self.scheduler.export_seat(seat_id, repo=repo, branch=branch, ref=ref)
+        )
+
+    def retry_release(self, seat_id: int) -> Handle:
+        """Operator action: retry a persisted release intent on the worker.
+
+        Unblocks a seat left ``releasing``/``held`` by an interrupted or
+        failed export. Raises ``ProvisionerError`` when no intent exists.
+        """
+        return self._submit(lambda: self.scheduler.retry_release(seat_id))
+
+    def force_discard(self, seat_id: int, *, reason: str = "force_discard") -> Handle:
+        """Operator escape hatch: destroy a stuck seat's VM on the worker."""
+        return self._submit(lambda: self.scheduler.force_discard(seat_id, reason=reason))
 
 
 # Re-exported so callers import everything from the package root.

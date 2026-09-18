@@ -127,6 +127,7 @@ _SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "max_deletions": _INT,
         "protected_paths": _STR_LIST,
         "approval_required": _BOOL,
+        "allowed_remotes": _STR_LIST,
     },
     "prewarm": {"max_retries": _INT, "backoff_s": _INT},
 }
@@ -338,6 +339,12 @@ class ExportConfig:
     max_deletions: int = 5000
     protected_paths: tuple[str, ...] = (".git/", ".github/")
     approval_required: bool = False
+    #: Optional allowlist of *additional* push remotes. When empty, ``origin``
+    #: plus known remotes (from ``git remote``) plus explicit paths/URLs are
+    #: accepted. When set, ``origin`` remains allowed (git's default push
+    #: remote) and these names are added to what is accepted, so configuring
+    #: an allowlist never breaks a default push.
+    allowed_remotes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("max_files_changed", "max_insertions", "max_deletions"):
@@ -349,6 +356,10 @@ class ExportConfig:
         for path in self.protected_paths:
             if not isinstance(path, str) or not path:
                 raise ValueError("protected_paths entries must be non-empty strings")
+        self.allowed_remotes = tuple(self.allowed_remotes)
+        for remote in self.allowed_remotes:
+            if not isinstance(remote, str) or not remote.strip():
+                raise ValueError("allowed_remotes entries must be non-empty strings")
 
     def matches_protected(self, path: str) -> str | None:
         """Return the matching protected prefix for ``path``, if any."""

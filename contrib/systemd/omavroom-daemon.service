@@ -1,0 +1,33 @@
+# omavroom seat-manager daemon (systemd --user unit)
+#
+# NOT installed or enabled by the project. To run it yourself:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/omavroom-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user start omavroom-daemon.service
+#
+# It is a *user* service on purpose: the manager talks to libvirt/QEMU and
+# the state lives under the operator's home. Adjust ExecStart if `omavroom`
+# is not on PATH (e.g. %h/Work/omavroom/.venv/bin/omavroom).
+
+[Unit]
+Description=omavroom disposable-VM seat manager daemon
+Documentation=https://github.com/washburnello/omavroom
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=OMAVROOM_PROVISIONER=libvirt
+Environment=OMAVROOM_LOG_LEVEL=INFO
+ExecStart=%h/.local/bin/omavroom daemon --provisioner libvirt
+Restart=on-failure
+RestartSec=3
+# Durable state is sqlite under ~/.local/state/omavroom; seats left running
+# are reattached on the next start via reconcile. The daemon is stopped with
+# SIGTERM, which it handles gracefully.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

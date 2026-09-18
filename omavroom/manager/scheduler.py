@@ -125,6 +125,8 @@ class SeatView:
     attempts: int
     lease_expires_at: str | None
     last_heartbeat: str | None
+    pending_action: str | None = None
+    needs_attention: bool = False
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,10 @@ class PoolStatus:
     seats: list[SeatView]
     queue: list[RequestView]
     per_type: dict[str, TypeStatus]
+    #: Seat ids an operator may need to act on (``held``, or ``releasing`` /
+    #: ``resetting`` whose intent could not be recovered). ``retry_release``
+    #: or ``force_discard`` always unblocks them.
+    needs_attention: list[int]
 
 
 @dataclass
@@ -178,6 +184,7 @@ class PumpReport:
     prewarmed: int = 0
     provisioned: int = 0
     failed: int = 0
+    resumed: int = 0
 
     @property
     def total(self) -> int:
@@ -190,6 +197,7 @@ class PumpReport:
             + self.prewarmed
             + self.provisioned
             + self.failed
+            + self.resumed
         )
 
 
@@ -210,6 +218,8 @@ class ReconcileReport:
     seats_errored: int = 0
     seats_recovered: int = 0
     seats_off: int = 0
+    #: Interrupted releases/resets resumed to a terminal state.
+    seats_resumed: int = 0
 
 
 class ExportGate:
@@ -440,9 +450,12 @@ class Scheduler:
     # pump
     # ------------------------------------------------------------------
     def pump(self) -> PumpReport:
-        """One scheduler pass: reap, reclaim, evict, assign, admit, provision."""
+        """One scheduler pass: resume, reap, reclaim, evict, assign, admit, provision."""
         now = self._now()
         report = PumpReport()
+        # Interrupted releases/resets first: they hold capacity until they
+        # reach a terminal state, so freeing them before admission matters.
+        report.resumed = self.resume_interrupted(now)
         report.reaped = self._reap_errors(now)
         report.reclaimed = self.reclaim_expired(now)
         report.evicted = self._evict_idle_for_head(now)
@@ -978,9 +991,11 @@ class Scheduler:
         ``create_from_image`` and ``start``) is *destroyed during reconcile*
         and the seat is recorded ``error`` with ``vm_name`` persisted, so the
         overlay is never leaked; the reaper then closes the row out.
-        ``list_vms`` returns *all* domains; a VM that exists but is not yet
-        persisted on a seat row (created during ``wait_ready``) is matched by
-        seat-name identity and is not treated as an orphan.
+        ``list_vms`` returns only **managed (seat)** domains — the
+        ``omavroom-base``/``omavroom-term`` templates are excluded, so they
+        can never be classified as orphans. A managed VM that exists but is
+        not yet persisted on a seat row (created during ``wait_ready``) is
+        matched by seat-name identity and is not treated as an orphan.
         """
         if vms is None:
             vms = self.provisioner.list_vms()
@@ -1005,6 +1020,23 @@ class Scheduler:
         off = 0
         for seat in seats:
             now_text = st.fmt_time(self._now())
+            info = known.get(seat.vm_name) if seat.vm_name is not None else None
+            resumable_release = (
+                seat.state == st.SeatState.RELEASING.value
+                and seat.pending_action == "release"
+                and info is not None
+                and info.state == "running"
+            )
+            resumable_reset = seat.state == st.SeatState.RESETTING.value and info is not None
+            if resumable_release or resumable_reset:
+                # Interrupted release/reset with a **present, running** VM:
+                # resumed after the scan by ``resume_interrupted`` (idempotent
+                # export/destroy or overlay rebuild) so it reaches a terminal
+                # state instead of wedging the seat in an occupying state.
+                # Absent/stopped VMs are NOT skipped: a gone or stopped VM
+                # proves the export already finished (export precedes
+                # stop/destroy), so the row is finalized to ``off`` below.
+                continue
             if seat.vm_name is None:
                 if seat.state == st.SeatState.PROVISIONING.value:
                     info = by_name.get(seat.name)
@@ -1056,6 +1088,36 @@ class Scheduler:
                                 else None,
                             )
                         errored += 1
+                elif seat.state in (
+                    st.SeatState.RELEASING.value,
+                    st.SeatState.HELD.value,
+                    st.SeatState.RESETTING.value,
+                ):
+                    # No VM to tear down or reset: close the row out so a
+                    # half-committed release/reset can never occupy capacity.
+                    with self.store.transaction() as conn:
+                        st.update_seat(
+                            conn,
+                            seat.id,
+                            state=st.SeatState.OFF.value,
+                            vm_name=None,
+                            agent_label=None,
+                            pending_action=None,
+                            pending_export=None,
+                            pending_repo=None,
+                            pending_branch=None,
+                            pending_ref=None,
+                            pending_request_status=None,
+                            now=now_text,
+                        )
+                        self._close_lease(conn, seat.id, st.RequestStatus.FAILED.value, now_text)
+                        st.log_event(
+                            conn,
+                            event_type="seat_reconcile_off",
+                            now=now_text,
+                            seat_id=seat.id,
+                        )
+                    off += 1
                 continue
             info = known.get(seat.vm_name)
             if info is None:
@@ -1093,6 +1155,12 @@ class Scheduler:
                             state=st.SeatState.OFF.value,
                             vm_name=None,
                             agent_label=None,
+                            pending_action=None,
+                            pending_export=None,
+                            pending_repo=None,
+                            pending_branch=None,
+                            pending_ref=None,
+                            pending_request_status=None,
                             now=now_text,
                         )
                         self._close_lease(conn, seat.id, st.RequestStatus.FAILED.value, now_text)
@@ -1148,11 +1216,15 @@ class Scheduler:
                         detail=f"vm={seat.vm_name} state={info.state}",
                     )
                 errored += 1
+        # Now that VM-absent and dead cases are resolved, resume any
+        # interrupted release/reset that still has a live VM.
+        resumed = self.resume_interrupted(now=self._now(), vms=known)
         return ReconcileReport(
             orphans_destroyed=orphans_destroyed,
             seats_errored=errored,
             seats_recovered=recovered,
             seats_off=off,
+            seats_resumed=resumed,
         )
 
     # ------------------------------------------------------------------
@@ -1233,7 +1305,13 @@ class Scheduler:
                 fresh = st.seat_by_id(conn, seat_id)
                 if fresh is None or fresh.vm_name is None:
                     raise ProvisionerError("cannot reset a seat with no VM")
-                st.update_seat(conn, seat_id, state=st.SeatState.RESETTING.value, now=now)
+                st.update_seat(
+                    conn,
+                    seat_id,
+                    state=st.SeatState.RESETTING.value,
+                    pending_action="reset",
+                    now=now,
+                )
                 st.log_event(conn, event_type="seat_resetting", now=now, seat_id=seat_id)
             vm_ref = fresh.vm_name
             try:
@@ -1246,6 +1324,7 @@ class Scheduler:
                         seat_id,
                         state=st.SeatState.ERROR.value,
                         last_error=str(exc),
+                        pending_action=None,
                         now=now,
                     )
                     self._close_lease(conn, seat_id, st.RequestStatus.FAILED.value, now)
@@ -1272,6 +1351,7 @@ class Scheduler:
                         seat_id,
                         state=st.SeatState.READY.value,
                         last_error=None,
+                        pending_action=None,
                         now=now,
                     )
                     st.log_event(conn, event_type="seat_reset", now=now, seat_id=seat_id)
@@ -1282,6 +1362,7 @@ class Scheduler:
                         state=st.SeatState.OFF.value,
                         vm_name=None,
                         agent_label=None,
+                        pending_action=None,
                         now=now,
                     )
                     self._close_lease(conn, seat_id, None, now)
@@ -1342,11 +1423,21 @@ class Scheduler:
                 )
         return ExportOutcome(fetched=fetched, gate=decision, pushed=pushed)
 
-    def export_seat(self, seat_id: int, *, repo: str) -> ExportOutcome:
+    def export_seat(
+        self,
+        seat_id: int,
+        *,
+        repo: str,
+        branch: str | None = None,
+        ref: str | None = None,
+    ) -> ExportOutcome:
         """Export work under the seat-then-repo lock order (no teardown).
 
-        Failure never mutates the seat: it stays ``ready`` (no push, no
-        destroy) so the caller can retry or release later.
+        ``branch``/``ref`` are plumbed into the :class:`ExportSpec` so the
+        host-side push knows the task branch and explicit destination; without
+        them a manager-mediated export cannot resolve a push target. Failure
+        never mutates the seat: it stays ``ready`` (no push, no destroy) so
+        the caller can retry or release later.
         """
         seat = self._get_seat(seat_id)
         if seat.vm_name is None:
@@ -1357,7 +1448,7 @@ class Scheduler:
                 return ExportOutcome(
                     fetched=FetchResult(ok=False, message="seat has no VM to export")
                 )
-            return self._export_locked(fresh, ExportSpec(repo=repo))
+            return self._export_locked(fresh, ExportSpec(repo=repo, branch=branch, ref=ref))
 
     def release_seat(
         self,
@@ -1365,9 +1456,16 @@ class Scheduler:
         *,
         repo: str | None = None,
         export: bool = True,
+        branch: str | None = None,
+        ref: str | None = None,
         request_status: str = st.RequestStatus.DONE.value,
     ) -> ReleaseOutcome:
-        """Export (optional) then destroy the seat's VM. Never hands it on dirty."""
+        """Export (optional) then destroy the seat's VM. Never hands it on dirty.
+
+        ``branch``/``ref`` are plumbed straight into the export spec so a
+        manager-mediated release-with-export reaches the same verified
+        destination as a direct provisioner call.
+        """
         seat = self._get_seat(seat_id)
         repo_key = repo if (export and repo is not None) else None
         with self.locks.seat_then_repo(seat.name, repo_key):
@@ -1376,6 +1474,8 @@ class Scheduler:
                 now=self._now(),
                 export=export,
                 repo=repo,
+                branch=branch,
+                ref=ref,
                 request_status=request_status,
             )
 
@@ -1387,6 +1487,8 @@ class Scheduler:
         export: bool,
         repo: str | None,
         request_status: str | None,
+        branch: str | None = None,
+        ref: str | None = None,
         reason: str = "released",
         require_dead_lease: bool = False,
         require_no_lease: bool = False,
@@ -1418,12 +1520,25 @@ class Scheduler:
                 return ReleaseOutcome(
                     seat_id, destroyed=False, held=False, message="seat_now_leased"
                 )
-            st.update_seat(conn, seat_id, state=st.SeatState.RELEASING.value, now=now_text)
+            st.update_seat(
+                conn,
+                seat_id,
+                state=st.SeatState.RELEASING.value,
+                pending_action="release",
+                pending_export=1 if export else 0,
+                pending_repo=repo,
+                pending_branch=branch,
+                pending_ref=ref,
+                pending_request_status=request_status,
+                now=now_text,
+            )
             st.log_event(conn, event_type="seat_releasing", now=now_text, seat_id=seat_id)
 
         export_outcome: ExportOutcome | None = None
         if export and repo is not None and seat.vm_name is not None:
-            export_outcome = self._export_locked(seat, ExportSpec(repo=repo))
+            export_outcome = self._export_locked(
+                seat, ExportSpec(repo=repo, branch=branch, ref=ref)
+            )
             if not export_outcome.ok:
                 with self.store.transaction() as conn:
                     st.update_seat(
@@ -1463,6 +1578,12 @@ class Scheduler:
                 vm_name=None,
                 agent_label=None,
                 last_error=None,
+                pending_action=None,
+                pending_export=None,
+                pending_repo=None,
+                pending_branch=None,
+                pending_ref=None,
+                pending_request_status=None,
                 now=now_text,
             )
             self._close_lease(conn, seat_id, request_status, now_text)
@@ -1491,6 +1612,226 @@ class Scheduler:
             )
 
     # ------------------------------------------------------------------
+    # interrupted-operation recovery / operator escape hatches
+    # ------------------------------------------------------------------
+    def resume_interrupted(
+        self, now: datetime | None = None, vms: dict[str, VmInfo] | None = None
+    ) -> int:
+        """Resume releases/resets interrupted by a daemon restart.
+
+        A release persists its export spec (repo/branch/ref/export) before the
+        slow ``fetch -> gate -> push`` work begins; re-running the export is
+        only safe while the VM is **present and running**, because a gone or
+        stopped VM proves the export already finished (export always precedes
+        stop/destroy) and re-exporting would falsely land the seat ``held``.
+        Such a seat is finalized to ``off`` instead. Reset is spec-free and is
+        resumed whenever the VM is present; a failed resume falls back to
+        discard. Not idempotent in general: a release whose VM vanished between
+        the attach probe and the export is held, never destroyed.
+
+        Called under the tick lock from :meth:`reconcile` and :meth:`pump`, so
+        it can never overlap an in-flight release. Returns the number of seats
+        returned to a terminal state.
+        """
+        moment = now or self._now()
+        seats = self.store.read(st.list_seats)
+        resumed = 0
+        for seat in seats:
+            if seat.state == st.SeatState.RELEASING.value and seat.pending_action == "release":
+                vm_state = self._vm_state_for(seat, vms)
+                if vm_state is None or vm_state not in ("running", "unknown"):
+                    # Absent or a known non-running state: export already
+                    # completed. ``"unknown"`` (attach failed) is treated as
+                    # present so a transient error cannot discard work.
+                    if self._finalize_gone_release(seat, moment, reason="reconcile_resume"):
+                        resumed += 1
+                    continue
+                repo = seat.pending_repo
+                repo_key = repo if (seat.pending_export and repo) else None
+                with self.locks.seat_then_repo(seat.name, repo_key):
+                    outcome = self._release_seat_locked(
+                        seat.id,
+                        now=moment,
+                        export=bool(seat.pending_export),
+                        repo=repo,
+                        branch=seat.pending_branch,
+                        ref=seat.pending_ref,
+                        request_status=seat.pending_request_status,
+                        reason="reconcile_resume",
+                    )
+                if outcome.destroyed or outcome.held:
+                    resumed += 1
+            elif seat.state == st.SeatState.RESETTING.value and seat.vm_name is not None:
+                if self._resume_reset(seat):
+                    resumed += 1
+        return resumed
+
+    def _vm_state_for(self, seat: st.Seat, vms: dict[str, VmInfo] | None) -> str | None:
+        """Return a seat VM's state, ``None`` if it is gone, or ``"unknown"``.
+
+        ``"unknown"`` (attach failed) is treated as *present* by callers so a
+        transient control-plane error can never silently discard work.
+        """
+        if seat.vm_name is None:
+            return None
+        if vms is not None:
+            info = vms.get(seat.vm_name)
+            return info.state if info is not None else None
+        try:
+            info = self.provisioner.attach(seat.vm_name)
+        except Exception:  # noqa: BLE001 - unknown, not absent
+            log.warning("could not attach %s during resume", seat.vm_name, exc_info=True)
+            return "unknown"
+        return info.state if info is not None else None
+
+    def _finalize_gone_release(self, seat: st.Seat, now: datetime, *, reason: str) -> bool:
+        """Close a pending release whose VM is already gone/stopped to ``off``.
+
+        Export always precedes stop/destroy, so a vanished/stopped VM is proof
+        the export finished. Re-running it would only fail and wrongly hold the
+        seat. The persisted request status is used so a cancel/expire is not
+        rewritten as success. A stopped-but-defined VM is best-effort destroyed
+        so it cannot leak; an absent VM is a no-op.
+        """
+        now_text = st.fmt_time(now)
+        with self.locks.seat(seat.name):
+            with self.store.transaction() as conn:
+                fresh = st.seat_by_id(conn, seat.id)
+                if fresh is None or fresh.state != st.SeatState.RELEASING.value:
+                    return False
+                vm_ref = fresh.vm_name
+                st.update_seat(
+                    conn,
+                    seat.id,
+                    state=st.SeatState.OFF.value,
+                    vm_name=None,
+                    agent_label=None,
+                    last_error=None,
+                    pending_action=None,
+                    pending_export=None,
+                    pending_repo=None,
+                    pending_branch=None,
+                    pending_ref=None,
+                    pending_request_status=None,
+                    now=now_text,
+                )
+                self._close_lease(conn, seat.id, fresh.pending_request_status, now_text)
+                st.log_event(
+                    conn,
+                    event_type="seat_reconcile_off",
+                    now=now_text,
+                    seat_id=seat.id,
+                    detail=reason,
+                )
+            # A stopped-but-defined VM is not leaked; an absent one is a no-op.
+            if vm_ref is not None:
+                self._safe_stop_destroy(vm_ref)
+        return True
+
+    def _resume_reset(self, seat: st.Seat) -> bool:
+        """Complete an interrupted reset, falling back to discard on failure.
+
+        Reset has no parameters to lose, so a ``resetting`` seat with a live
+        VM is always recoverable: re-running :meth:`reset_seat` rebuilds the
+        overlay. If that fails we destroy the seat rather than leave it
+        wedged in ``resetting`` (which occupies capacity).
+        """
+        try:
+            self.reset_seat(seat.id)
+            return True
+        except Exception:  # noqa: BLE001 - fall back to discard, never wedge
+            log.warning("reset resume failed for seat %s; force-discarding", seat.id, exc_info=True)
+        try:
+            self.force_discard(seat.id, reason="reset_resume_failed")
+            return True
+        except Exception:  # noqa: BLE001 - last resort; keep the seat surfaced
+            log.warning("force discard after failed reset resume also failed", exc_info=True)
+            return False
+
+    def retry_release(self, seat_id: int) -> ReleaseOutcome:
+        """Operator action: re-run the persisted release intent for a seat.
+
+        Works for a seat left ``releasing``/``held`` by an interrupted or
+        failed export. Raises :class:`ProvisionerError` when no release intent
+        is recorded, so callers must use :meth:`force_discard` instead.
+        """
+        seat = self._get_seat(seat_id)
+        if seat.pending_action != "release":
+            raise ProvisionerError(f"seat {seat_id} has no persisted release intent to retry")
+        repo = seat.pending_repo
+        repo_key = repo if (seat.pending_export and repo) else None
+        with self.locks.seat_then_repo(seat.name, repo_key):
+            return self._release_seat_locked(
+                seat_id,
+                now=self._now(),
+                export=bool(seat.pending_export),
+                repo=repo,
+                branch=seat.pending_branch,
+                ref=seat.pending_ref,
+                request_status=seat.pending_request_status,
+                reason="retry_release",
+            )
+
+    def force_discard(self, seat_id: int, *, reason: str = "force_discard") -> SeatView:
+        """Operator escape hatch: destroy the VM and release the seat row.
+
+        This is the guaranteed way to unblock the pool for a seat stuck in
+        ``releasing``/``held``/``resetting`` (e.g. when release intent could
+        not be recovered). It never exports, it only destroys.
+        """
+        seat = self._get_seat(seat_id)
+        with self.locks.seat(seat.name):
+            now_text = st.fmt_time(self._now())
+            with self.store.transaction() as conn:
+                fresh = st.seat_by_id(conn, seat_id)
+                if fresh is None:
+                    raise KeyError(f"no such seat: {seat_id}")
+                vm_ref = fresh.vm_name
+                st.update_seat(conn, seat_id, state=st.SeatState.RELEASING.value, now=now_text)
+            if vm_ref is not None:
+                self._safe_stop_destroy(vm_ref)
+            with self.store.transaction() as conn:
+                st.update_seat(
+                    conn,
+                    seat_id,
+                    state=st.SeatState.OFF.value,
+                    vm_name=None,
+                    agent_label=None,
+                    last_error=None,
+                    pending_action=None,
+                    pending_export=None,
+                    pending_repo=None,
+                    pending_branch=None,
+                    pending_ref=None,
+                    pending_request_status=None,
+                    now=now_text,
+                )
+                self._close_lease(conn, seat_id, st.RequestStatus.FAILED.value, now_text)
+                st.log_event(
+                    conn,
+                    event_type="seat_force_discarded",
+                    now=now_text,
+                    seat_id=seat_id,
+                    detail=reason,
+                )
+                fresh = st.seat_by_id(conn, seat_id)
+        return self._seat_view(fresh)
+
+    def attention_seat_ids(self, seats: list[st.Seat] | None = None) -> list[int]:
+        """Seat ids an operator may need to act on (see :class:`PoolStatus`)."""
+        rows = seats if seats is not None else self.store.read(st.list_seats)
+        return sorted(
+            seat.id
+            for seat in rows
+            if seat.state == st.SeatState.HELD.value
+            or (
+                seat.state in (st.SeatState.RELEASING.value, st.SeatState.RESETTING.value)
+                and seat.pending_action is None
+                and seat.vm_name is not None
+            )
+        )
+
+    # ------------------------------------------------------------------
     # views
     # ------------------------------------------------------------------
     def _lease_view(self, lease: st.Lease) -> LeaseView:
@@ -1502,6 +1843,14 @@ class Scheduler:
             acquired_at=lease.acquired_at,
             expires_at=lease.expires_at,
             last_heartbeat=lease.last_heartbeat,
+        )
+
+    @staticmethod
+    def _needs_attention(seat: st.Seat) -> bool:
+        return seat.state == st.SeatState.HELD.value or (
+            seat.state in (st.SeatState.RELEASING.value, st.SeatState.RESETTING.value)
+            and seat.pending_action is None
+            and seat.vm_name is not None
         )
 
     def _seat_view(self, seat: st.Seat) -> SeatView:
@@ -1518,6 +1867,8 @@ class Scheduler:
             attempts=seat.attempts,
             lease_expires_at=lease.expires_at if lease else None,
             last_heartbeat=lease.last_heartbeat if lease else None,
+            pending_action=seat.pending_action,
+            needs_attention=self._needs_attention(seat),
         )
 
     def _request_view(self, conn, request_id: int) -> RequestView:
@@ -1549,6 +1900,8 @@ class Scheduler:
                 attempts=seat.attempts,
                 lease_expires_at=lease.expires_at if lease else None,
                 last_heartbeat=lease.last_heartbeat if lease else None,
+                pending_action=seat.pending_action,
+                needs_attention=self._needs_attention(seat),
             )
         return RequestView(
             id=request.id,
@@ -1634,6 +1987,7 @@ class Scheduler:
             seats=seats,
             queue=queue,
             per_type=per_type,
+            needs_attention=self.attention_seat_ids(all_seats),
         )
 
 

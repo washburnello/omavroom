@@ -102,6 +102,18 @@ def env(tmp_path: Path):
     reason = _prereq_skip_reason()
     if reason:
         pytest.skip(reason)
+    # Isolation: never touch the production base_dir and never destroy seat
+    # domains that existed before this run. Seat state (overlays, NVRAM,
+    # staging) lives under a per-run base_dir; goldens still resolve through
+    # the shared read-only production images directory. If any seat domain
+    # already exists we refuse rather than reap someone else's VM.
+    preexisting = [
+        name
+        for name in _virsh("list", "--all", "--name").stdout.split()
+        if name.startswith(SEAT_DOMAIN_PREFIX)
+    ]
+    if preexisting:
+        pytest.skip(f"pre-existing seat domains present; refusing to disturb them: {preexisting}")
     cfg = Config.default()
     cfg.host.headroom_floor_mb = 512
     cfg.leases.lease_timeout_s = 180
@@ -111,9 +123,10 @@ def env(tmp_path: Path):
     cfg.seats["terminal"].max_seats = 1
     cfg.seats["desktop"].image = "golden-desktop"
     cfg.seats["terminal"].image = "golden-term"
-    prov = LibvirtProvisioner(cfg, base_dir=BASE)
+    run_base = tmp_path / "omavroom-run"
+    prov = LibvirtProvisioner(cfg, base_dir=run_base)
     try:
-        yield SimpleNamespace(prov=prov, cfg=cfg, base=BASE)
+        yield SimpleNamespace(prov=prov, cfg=cfg, base=run_base)
     finally:
         for vm in prov.list_vms():
             try:
@@ -279,12 +292,12 @@ def test_terminal_seat_full_cycle(env, tmp_path: Path) -> None:
         assert ls_remote == guest_sha
         print(f"[terminal] push verified: remote={ls_remote}")
 
-        overlay = BASE / "seats" / view.seat.name / "overlay.qcow2"
+        overlay = env.base / "seats" / view.seat.name / "overlay.qcow2"
         assert overlay.exists()
         outcome = mgr.release_seat(seat_id, export=False).result(timeout=180)
         assert outcome.destroyed is True
         assert not overlay.exists()
-        assert not (BASE / "seats" / view.seat.name).exists()
+        assert not (env.base / "seats" / view.seat.name).exists()
         print("[terminal] destroyed; overlay removed")
     finally:
         daemon.terminate()

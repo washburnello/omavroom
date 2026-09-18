@@ -35,7 +35,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS seats (
     agent_label TEXT,
     last_error TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
+    pending_action TEXT CHECK (pending_action IN ('release', 'reset')),
+    pending_export INTEGER,
+    pending_repo TEXT,
+    pending_branch TEXT,
+    pending_ref TEXT,
+    pending_request_status TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -144,6 +150,21 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_at ON events (at);
 """
 
+#: ``seats`` columns added by the v3 migration, in dependency-free order.
+#: SQLite cannot add a CHECK constraint with ``ALTER TABLE ADD COLUMN``, so a
+#: v2 DB migrated in place has no ``pending_action`` CHECK while a fresh v3
+#: schema does. The value is written only by the scheduler
+#: (``release``/``reset``), so this asymmetry is intentional and documented
+#: rather than papered over with a table rebuild.
+_SEAT_PENDING_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("pending_action", "TEXT"),
+    ("pending_export", "INTEGER"),
+    ("pending_repo", "TEXT"),
+    ("pending_branch", "TEXT"),
+    ("pending_ref", "TEXT"),
+    ("pending_request_status", "TEXT"),
+)
+
 
 def utcnow() -> datetime:
     """Return the current time as a timezone-aware UTC datetime."""
@@ -176,6 +197,12 @@ class Seat:
     agent_label: str | None
     last_error: str | None
     attempts: int
+    pending_action: str | None
+    pending_export: int | None
+    pending_repo: str | None
+    pending_branch: str | None
+    pending_ref: str | None
+    pending_request_status: str | None
     created_at: str
     updated_at: str
 
@@ -240,8 +267,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     Phase 0 shipped a stub schema with no enum constraints and no
     events/audit table. That skeleton was never deployed, so a database
     still at ``user_version = 0`` that already has a ``seats`` table is
-    dropped and recreated. Version 1 databases are migrated in place
-    (``seats.attempts`` was added for bounded prewarm retries).
+    dropped and recreated. Later versions are migrated in place: v1 added
+    ``seats.attempts`` (bounded prewarm retries) and v3 added the
+    ``pending_*`` release/reset intent columns (interrupted-operation
+    recovery).
     """
     version = conn.execute("PRAGMA user_version;").fetchone()[0]
     existing = set(list_tables(conn))
@@ -258,6 +287,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seats);").fetchall()}
         if "attempts" not in columns:
             conn.execute("ALTER TABLE seats ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;")
+    if "seats" in existing and version < 3:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(seats);").fetchall()}
+        for name, ddl in _SEAT_PENDING_COLUMNS:
+            if name not in columns:
+                conn.execute(f"ALTER TABLE seats ADD COLUMN {name} {ddl};")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
 
 
@@ -283,6 +317,12 @@ def _seat(row: sqlite3.Row) -> Seat:
         agent_label=row["agent_label"],
         last_error=row["last_error"],
         attempts=row["attempts"],
+        pending_action=row["pending_action"],
+        pending_export=row["pending_export"],
+        pending_repo=row["pending_repo"],
+        pending_branch=row["pending_branch"],
+        pending_ref=row["pending_ref"],
+        pending_request_status=row["pending_request_status"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -360,6 +400,12 @@ def update_seat(
     agent_label: object = _UNSET,
     last_error: object = _UNSET,
     attempts: object = _UNSET,
+    pending_action: object = _UNSET,
+    pending_export: object = _UNSET,
+    pending_repo: object = _UNSET,
+    pending_branch: object = _UNSET,
+    pending_ref: object = _UNSET,
+    pending_request_status: object = _UNSET,
     now: str,
 ) -> None:
     sets = ["updated_at = ?"]
@@ -370,6 +416,12 @@ def update_seat(
         ("agent_label", agent_label),
         ("last_error", last_error),
         ("attempts", attempts),
+        ("pending_action", pending_action),
+        ("pending_export", pending_export),
+        ("pending_repo", pending_repo),
+        ("pending_branch", pending_branch),
+        ("pending_ref", pending_ref),
+        ("pending_request_status", pending_request_status),
     ):
         if value is not _UNSET:
             sets.append(f"{column} = ?")

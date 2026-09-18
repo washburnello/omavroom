@@ -75,3 +75,53 @@ def test_running_execs_are_not_evicted_by_history_bound() -> None:
     tracker.start(1, "run1")
     tracker.start(1, "run2")
     assert tracker.active_count(1) == 2
+
+
+# --------------------------------------------------------------------------
+# Frozen Phase 5 exec contract: command/timeout in, stdout/stderr/exit_code/
+# truncated out (ring buffer).
+# --------------------------------------------------------------------------
+def test_start_records_command_and_timeout() -> None:
+    tracker = ExecTracker()
+    view = tracker.start(1, "e1", label="build", command="make test", timeout_s=120)
+    assert view.command == "make test"
+    assert view.timeout_s == 120
+    assert view.stdout == ""
+    assert view.stderr == ""
+    assert view.truncated is False
+
+
+def test_poll_returns_output_fields() -> None:
+    tracker = ExecTracker()
+    tracker.start(1, "e1", command="echo hi")
+    tracker.record_output(1, "e1", stdout="hi\n", stderr="warn\n")
+    view = tracker.poll(1, "e1")
+    assert view.stdout == "hi\n"
+    assert view.stderr == "warn\n"
+    assert view.exit_code is None
+    assert view.truncated is False
+
+
+def test_output_buffer_is_bounded_ring() -> None:
+    tracker = ExecTracker(max_output_bytes=10)
+    tracker.start(1, "e1")
+    tracker.record_output(1, "e1", stdout="0123456789")
+    tracker.record_output(1, "e1", stdout="abc")
+    view = tracker.poll(1, "e1")
+    assert view.stdout == "3456789abc"  # keeps the most recent 10 chars
+    assert view.truncated is True
+
+
+def test_finish_carries_final_output_and_exit_code() -> None:
+    tracker = ExecTracker()
+    tracker.start(1, "e1", command="true")
+    view = tracker.finish(1, "e1", exit_code=0, stdout="done\n")
+    assert view.state == "finished"
+    assert view.exit_code == 0
+    assert view.stdout == "done\n"
+
+
+def test_record_output_unknown_exec_raises() -> None:
+    tracker = ExecTracker()
+    with pytest.raises(KeyError):
+        tracker.record_output(1, "nope", stdout="x")

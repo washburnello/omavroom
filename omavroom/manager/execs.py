@@ -40,6 +40,15 @@ class ExecView:
     started_at: str
     finished_at: str | None = None
     exit_code: int | None = None
+    # Frozen Phase 5 contract: exec_start accepts a command (+ timeout) and
+    # exec_poll returns bounded stdout/stderr with a truncation flag. Phase
+    # 4B2 only keeps the bookkeeping; Phase 5 fills the output via
+    # :meth:`ExecTracker.record_output`/``finish``.
+    command: str | None = None
+    timeout_s: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    truncated: bool = False
 
 
 @dataclass
@@ -51,6 +60,11 @@ class _ExecRecord:
     started_at: str
     finished_at: str | None = None
     exit_code: int | None = None
+    command: str | None = None
+    timeout_s: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    truncated: bool = False
 
     def view(self) -> ExecView:
         return ExecView(
@@ -61,6 +75,11 @@ class _ExecRecord:
             started_at=self.started_at,
             finished_at=self.finished_at,
             exit_code=self.exit_code,
+            command=self.command,
+            timeout_s=self.timeout_s,
+            stdout=self.stdout,
+            stderr=self.stderr,
+            truncated=self.truncated,
         )
 
 
@@ -73,14 +92,18 @@ class ExecTracker:
         *,
         max_concurrent_per_seat: int = 4,
         max_history_per_seat: int = 100,
+        max_output_bytes: int = 1_048_576,
     ) -> None:
         if max_concurrent_per_seat < 1:
             raise ValueError("max_concurrent_per_seat must be >= 1")
         if max_history_per_seat < 1:
             raise ValueError("max_history_per_seat must be >= 1")
+        if max_output_bytes < 1:
+            raise ValueError("max_output_bytes must be >= 1")
         self._clock = clock
         self.max_concurrent_per_seat = max_concurrent_per_seat
         self.max_history_per_seat = max_history_per_seat
+        self.max_output_bytes = max_output_bytes
         self._execs: dict[int, dict[str, _ExecRecord]] = {}
         self._lock = threading.Lock()
 
@@ -97,7 +120,15 @@ class ExecTracker:
                 break
             del seat_execs[oldest_finished]
 
-    def start(self, seat_id: int, exec_id: str, *, label: str | None = None) -> ExecView:
+    def start(
+        self,
+        seat_id: int,
+        exec_id: str,
+        *,
+        label: str | None = None,
+        command: str | None = None,
+        timeout_s: int | None = None,
+    ) -> ExecView:
         if not exec_id:
             raise ValueError("exec_id must be non-empty")
         with self._lock:
@@ -114,6 +145,8 @@ class ExecTracker:
                 label=label,
                 state=RUNNING,
                 started_at=st.fmt_time(self._clock()),
+                command=command,
+                timeout_s=timeout_s,
             )
             seat_execs[exec_id] = record
             self._enforce_history_unlocked(seat_id)
@@ -126,19 +159,63 @@ class ExecTracker:
                 raise KeyError(f"no exec {exec_id!r} for seat {seat_id}")
             return record.view()
 
-    def _terminate(self, seat_id: int, exec_id: str, state: str, exit_code: int | None) -> ExecView:
+    def _append_locked(self, record: _ExecRecord, stdout: str, stderr: str) -> None:
+        """Append output to a record, keeping the most recent ``max_output_bytes``.
+
+        Output is treated as a per-stream ring buffer (character-counted, which
+        is a conservative proxy for JSON size); dropped bytes set ``truncated``.
+        """
+        for attribute, chunk in (("stdout", stdout), ("stderr", stderr)):
+            if not chunk:
+                continue
+            combined = getattr(record, attribute) + chunk
+            if len(combined) > self.max_output_bytes:
+                setattr(record, attribute, combined[-self.max_output_bytes :])
+                record.truncated = True
+            else:
+                setattr(record, attribute, combined)
+
+    def record_output(
+        self, seat_id: int, exec_id: str, *, stdout: str = "", stderr: str = ""
+    ) -> ExecView:
+        """Append streamed output to a running exec's bounded buffers."""
         with self._lock:
             record = self._execs.get(seat_id, {}).get(exec_id)
             if record is None:
                 raise KeyError(f"no exec {exec_id!r} for seat {seat_id}")
+            self._append_locked(record, stdout, stderr)
+            return record.view()
+
+    def _terminate(
+        self,
+        seat_id: int,
+        exec_id: str,
+        state: str,
+        exit_code: int | None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> ExecView:
+        with self._lock:
+            record = self._execs.get(seat_id, {}).get(exec_id)
+            if record is None:
+                raise KeyError(f"no exec {exec_id!r} for seat {seat_id}")
+            self._append_locked(record, stdout, stderr)
             if record.state == RUNNING:
                 record.state = state
                 record.finished_at = st.fmt_time(self._clock())
                 record.exit_code = exit_code
             return record.view()
 
-    def finish(self, seat_id: int, exec_id: str, *, exit_code: int | None = None) -> ExecView:
-        return self._terminate(seat_id, exec_id, FINISHED, exit_code)
+    def finish(
+        self,
+        seat_id: int,
+        exec_id: str,
+        *,
+        exit_code: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> ExecView:
+        return self._terminate(seat_id, exec_id, FINISHED, exit_code, stdout, stderr)
 
     def kill(self, seat_id: int, exec_id: str, *, signal: int = 9) -> ExecView:
         return self._terminate(seat_id, exec_id, KILLED, -abs(signal))

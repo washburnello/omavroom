@@ -273,4 +273,61 @@ def test_schema_migrates_v1_to_v2_without_data_loss(tmp_path) -> None:
     assert version == st.SCHEMA_VERSION
     seat = st.list_seats(conn)[0]
     assert seat.name == "terminal-1" and seat.state == "ready" and seat.attempts == 0
+
+
+def test_schema_migrates_v2_to_v3_adds_pending_intent(tmp_path) -> None:
+    """v2 -> v3 adds the interrupted-operation intent columns in place."""
+    path = tmp_path / "v2.db"
+    conn = st.connect(path)
+    conn.executescript(
+        "CREATE TABLE seats ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " name TEXT NOT NULL UNIQUE,"
+        " seat_type TEXT NOT NULL,"
+        " state TEXT NOT NULL DEFAULT 'off',"
+        " vm_name TEXT,"
+        " image TEXT NOT NULL,"
+        " agent_label TEXT,"
+        " last_error TEXT,"
+        " attempts INTEGER NOT NULL DEFAULT 0,"
+        " created_at TEXT NOT NULL,"
+        " updated_at TEXT NOT NULL);"
+        "PRAGMA user_version = 2;"
+    )
+    conn.execute(
+        "INSERT INTO seats (name, seat_type, state, image, attempts, created_at, updated_at)"
+        " VALUES ('terminal-1', 'terminal', 'ready', 'img', 2, ?, ?)",
+        (st.fmt_time(_t()), st.fmt_time(_t())),
+    )
+    conn.commit()
+
+    st.init_schema(conn)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(seats);")}
+    assert {
+        "pending_action",
+        "pending_export",
+        "pending_repo",
+        "pending_branch",
+        "pending_ref",
+        "pending_request_status",
+    } <= columns
+    assert conn.execute("PRAGMA user_version;").fetchone()[0] == st.SCHEMA_VERSION
+    seat = st.list_seats(conn)[0]
+    assert seat.attempts == 2 and seat.pending_action is None
+
+    # The persisted intent round-trips (used by reconcile resume).
+    with st.StateStore(path).transaction() as tx:
+        st.update_seat(
+            tx,
+            seat.id,
+            pending_action="release",
+            pending_export=1,
+            pending_repo="demo",
+            pending_branch="task",
+            now=st.fmt_time(_t(1)),
+        )
+    reloaded = st.StateStore(path).read(lambda c: st.seat_by_id(c, seat.id))
+    assert reloaded.pending_action == "release"
+    assert reloaded.pending_repo == "demo"
+    assert reloaded.pending_branch == "task"
     conn.close()

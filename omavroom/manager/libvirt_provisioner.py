@@ -79,6 +79,7 @@ import uuid as uuid_module
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 from omavroom.config import Config
@@ -184,12 +185,19 @@ def build_domain_xml(
 
     Unique per seat: name, uuid, MAC, NVRAM path, overlay disk path. Per
     type: memory, vcpus and optional ``cputune`` quota / ``memtune`` limits.
-    The template's empty ``<backingStore/>`` is **removed** so libvirt probes
-    and passes the overlay's backing chain to QEMU (keeping it makes QEMU
-    see a blank disk).
+
+    The proven templates declare **no** ``<backingStore/>`` element, because
+    libvirt probes the overlay qcow2 header and passes the backing chain to
+    QEMU itself. Any ``<backingStore>`` element (empty or populated) is
+    defensively stripped here so the image header, not the domain XML, is
+    always authoritative for the backing chain.
     """
     text = template if template is not None else load_template(seat_type)
     root = ET.fromstring(text)
+    for disk in root.findall("devices/disk"):
+        backing = disk.find("backingStore")
+        if backing is not None:
+            disk.remove(backing)
 
     root.find("name").text = name
     root.find("uuid").text = uuid
@@ -240,6 +248,56 @@ def repo_name_from(value: str) -> str:
 def safe_branch_name(branch: str) -> str:
     """Filesystem-safe branch token for bundle/ref names."""
     return branch.replace("/", "_").replace("\\", "_")
+
+
+_SCP_LIKE_RE = re.compile(r"^[^/@:\s]+@[^/:\s]+:")
+_CTRL_OR_SPACE_RE = re.compile(r"[\s\x00-\x1f\x7f]")
+_REMOTE_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+_REFSPEC_RE = re.compile(r"^refs/[^\s\x00-\x1f\x7f]+$")
+_SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+#: A short (unqualified) ref/branch token safe to pass to git as an argument.
+_SAFE_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
+
+
+def is_safe_sha(value: str) -> bool:
+    """True when ``value`` is exactly a hex object id (no option/revision syntax)."""
+    return bool(_SAFE_SHA_RE.fullmatch((value or "").strip()))
+
+
+def is_safe_ref_token(value: str) -> bool:
+    """True when ``value`` is a plain branch/ref token safe as a bare git arg.
+
+    Rejects empty, leading ``-`` (option injection), control/whitespace, and
+    the sequences git forbids in ref names. Used for guest-derived short refs
+    such as the base branch, which are interpolated into guest git commands.
+    """
+    token = (value or "").strip()
+    if not token or token.startswith("-") or len(token) > 255:
+        return False
+    if not _SAFE_REF_TOKEN_RE.fullmatch(token):
+        return False
+    return not (".." in token or "@{" in token or "//" in token or token.endswith(("/", ".")))
+
+
+def url_has_userinfo(url: str) -> bool:
+    """Return ``True`` when ``url`` carries userinfo that could be credentials.
+
+    Flagged forms are ``scheme://user[:secret]@host/...`` and scp-like
+    ``user@host:path``. A credential-free URL (``https://host/repo``,
+    ``git://host/repo``), an absolute path, or a bare ``host/repo`` is not
+    flagged. Callers reject flagged URLs because the guest must never
+    receive credentials.
+    """
+    candidate = (url or "").strip()
+    if not candidate:
+        return False
+    if "://" in candidate:
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            return False
+        return "@" in parsed.netloc
+    return bool(_SCP_LIKE_RE.match(candidate))
 
 
 def png_dimensions(data: bytes) -> tuple[int, int]:
@@ -552,6 +610,17 @@ class LibvirtProvisioner(Provisioner):
                 return
         raise ProvisionerError(f"could not verify autostart state for {ref}")
 
+    def verify_autostart_invariant(self) -> None:
+        """Assert autostart is disabled on the template domains.
+
+        The ABC requires the invariant on base **and** seat domains. Seat
+        domains are asserted at create/start/limit time; this verifies the
+        read-only ``omavroom-base`` / ``omavroom-term`` templates, which must
+        never come back after a host reboot outside manager authority.
+        """
+        for template in (DESKTOP_TEMPLATE, TERMINAL_TEMPLATE):
+            self._assert_no_autostart(template)
+
     # ------------------------------------------------------------------
     # resource caps / overlay quota
     # ------------------------------------------------------------------
@@ -729,6 +798,8 @@ class LibvirtProvisioner(Provisioner):
             "GlobalKnownHostsFile=/dev/null",
             "-o",
             "IdentitiesOnly=yes",
+            "-o",
+            "HostKeyAlgorithms=ssh-ed25519",
             "-o",
             "LogLevel=ERROR",
             "-i",
@@ -942,6 +1013,16 @@ class LibvirtProvisioner(Provisioner):
         url = (repo.url or "").strip()
         if not url:
             raise ProvisionerError("prepare_repo requires a URL (guest holds no credentials)")
+        if url_has_userinfo(url):
+            raise ProvisionerError(
+                "credential-bearing repo URL rejected: the guest must never "
+                "receive credentials (URL userinfo present)"
+            )
+        if url.startswith("-"):
+            # Client-supplied; without this it reaches guest git as an option.
+            raise ProvisionerError(f"unsafe repo URL rejected (looks like an option): {url!r}")
+        if repo.branch and repo.branch.startswith("-"):
+            raise ProvisionerError(f"unsafe repo branch rejected: {repo.branch!r}")
         name = repo_name_from(url)
         guest_path = f"{self.workspace_dir}/{name}"
         exists = self.run(vm_ref, f"test -d {_quote(guest_path)}/.git", timeout_s=30)
@@ -950,7 +1031,8 @@ class LibvirtProvisioner(Provisioner):
             clone = ["git", "clone", "--no-single-branch"]
             if repo.branch:
                 clone += ["-b", repo.branch]
-            clone += [url, guest_path]
+            # ``--`` ends options so a path/URL can never be parsed as one.
+            clone += ["--", url, guest_path]
             result = self.run(vm_ref, " ".join(_quote(a) for a in clone), timeout_s=600)
             if not result.ok:
                 raise ProvisionerError(f"guest clone failed for {url!r}: {result.stderr.strip()}")
@@ -1011,6 +1093,11 @@ class LibvirtProvisioner(Provisioner):
             timeout_s=60,
         )
         base = base_result.stdout.strip()
+        if base and not is_safe_ref_token(base):
+            # Guest-controlled; it is interpolated into a guest git command.
+            return self._fetch_failure(
+                export, f"invalid base ref from guest: {base!r}", stash_count=stash_count
+            )
         rev = self.run(
             vm_ref, f"cd {_quote(guest_path)} && git rev-parse {_quote(branch)}", timeout_s=60
         )
@@ -1021,6 +1108,11 @@ class LibvirtProvisioner(Provisioner):
         guest_sha = rev.stdout.strip()
         if not guest_sha:
             return self._fetch_failure(export, "empty guest SHA", stash_count=stash_count)
+        if not is_safe_sha(guest_sha):
+            # Never let a guest-supplied "SHA" reach a host git argv.
+            return self._fetch_failure(
+                export, f"invalid guest SHA from seat: {guest_sha!r}", stash_count=stash_count
+            )
 
         merge_base = None
         if base and base != branch:
@@ -1034,6 +1126,10 @@ class LibvirtProvisioner(Provisioner):
                     export, f"no merge-base with {base!r}", stash_count=stash_count
                 )
             merge_base = mb.stdout.strip()
+            if not is_safe_sha(merge_base):
+                return self._fetch_failure(
+                    export, f"invalid merge-base from seat: {merge_base!r}", stash_count=stash_count
+                )
             if merge_base == guest_sha:
                 return self._fetch_failure(
                     export,
@@ -1071,19 +1167,25 @@ class LibvirtProvisioner(Provisioner):
                 stash_count,
             )
 
-        verify = self._git(host_repo, "bundle", "verify", str(host_bundle), timeout=120)
+        verify = self._git(host_repo, "bundle", "verify", "--", str(host_bundle), timeout=120)
         if not verify.ok:
             return self._fetch_failure(
                 export, f"git bundle verify failed: {verify.stderr.strip()}", stash_count
             )
         omref = f"refs/omavroom/{branch}"
-        fetch = self._git(host_repo, "fetch", str(host_bundle), f"{branch}:{omref}", timeout=300)
+        fetch = self._git(
+            host_repo, "fetch", "--", str(host_bundle), f"{branch}:{omref}", timeout=300
+        )
         if not fetch.ok:
             return self._fetch_failure(
                 export, f"quarantine fetch failed: {fetch.stderr.strip()}", stash_count
             )
         fetched_sha = self._git(host_repo, "rev-parse", "--verify", omref, timeout=30)
         sha = fetched_sha.stdout.strip()
+        if not is_safe_sha(sha):
+            return self._fetch_failure(
+                export, f"invalid fetched SHA: {sha or '<none>'}", stash_count
+            )
         if sha != guest_sha:
             return self._fetch_failure(
                 export, f"fetched SHA {sha or '<none>'} != guest SHA {guest_sha}", stash_count
@@ -1098,7 +1200,17 @@ class LibvirtProvisioner(Provisioner):
                 stash_count,
             )
         if merge_base:
-            count = self._git(host_repo, "rev-list", "--count", f"{merge_base}..{sha}", timeout=60)
+            # ``--end-of-options`` (not ``--``, which would make git treat the
+            # revisions as paths) guards the revision operands; the SHAs are
+            # already validated as hex.
+            count = self._git(
+                host_repo,
+                "rev-list",
+                "--count",
+                "--end-of-options",
+                f"{merge_base}..{sha}",
+                timeout=60,
+            )
             try:
                 commits = int(count.stdout.strip() or "0")
             except ValueError:
@@ -1110,21 +1222,34 @@ class LibvirtProvisioner(Provisioner):
                     stash_count,
                 )
         diffstat = self._git(
-            host_repo, "diff", "--numstat", merge_base or f"{sha}^", sha, timeout=60
+            host_repo,
+            "diff",
+            "--numstat",
+            "--end-of-options",
+            merge_base or f"{sha}^",
+            sha,
+            timeout=60,
         )
+        if not diffstat.ok:
+            return self._fetch_failure(
+                export,
+                "diffstat computation failed: "
+                f"{diffstat.stderr.strip() or diffstat.stdout.strip() or 'git diff failed'} "
+                f"(base={merge_base or f'{sha}^'})",
+                stash_count=stash_count,
+            )
         files_changed = insertions = deletions = 0
         changed_paths: list[str] = []
-        if diffstat.ok:
-            for line in diffstat.stdout.splitlines():
-                parts = line.split("\t")
-                if len(parts) < 3:
-                    continue
-                files_changed += 1
-                changed_paths.append(parts[2])
-                if parts[0].isdigit():
-                    insertions += int(parts[0])
-                if parts[1].isdigit():
-                    deletions += int(parts[1])
+        for line in diffstat.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            files_changed += 1
+            changed_paths.append(parts[2])
+            if parts[0].isdigit():
+                insertions += int(parts[0])
+            if parts[1].isdigit():
+                deletions += int(parts[1])
         message = (
             f"fetched {branch}@{guest_sha} ({files_changed} files, "
             f"+{insertions}/-{deletions}, stash={stash_count})"
@@ -1142,10 +1267,82 @@ class LibvirtProvisioner(Provisioner):
             spec=export,
         )
 
-    def _push_destination(self, export: ExportSpec) -> tuple[str, str]:
-        branch = (export.branch or "").strip()
+    @staticmethod
+    def _reject_option_like(value: str, what: str) -> None:
+        """Reject an empty/option-like/unsafe argv token (git argv injection)."""
+        if not value:
+            raise ProvisionerError(f"invalid {what}: empty")
+        if value.startswith("-"):
+            raise ProvisionerError(f"unsafe {what} rejected (looks like an option): {value!r}")
+        if _CTRL_OR_SPACE_RE.search(value):
+            raise ProvisionerError(
+                f"unsafe {what} rejected (whitespace/control characters): {value!r}"
+            )
+
+    @staticmethod
+    def _is_explicit_remote(remote: str) -> bool:
+        """A path, URL, or ``origin`` is a legitimate explicit destination."""
+        return (
+            remote == "origin"
+            or remote.startswith(("/", "./", "../", "~"))
+            or bool(_REMOTE_SCHEME_RE.match(remote))
+        )
+
+    @staticmethod
+    def _validate_branch_name(branch: str) -> None:
         if not branch:
             raise ProvisionerError("export.branch is required to push")
+        if (
+            branch.startswith("-")
+            or _CTRL_OR_SPACE_RE.search(branch)
+            or ".." in branch
+            or "@{" in branch
+            or branch.endswith(("/", "."))
+        ):
+            raise ProvisionerError(f"invalid branch name: {branch!r}")
+
+    @staticmethod
+    def _validate_ref_name(name: str) -> None:
+        if not name.startswith("refs/"):
+            raise ProvisionerError(f"destination must be a fully-qualified ref: {name!r}")
+        if not _REFSPEC_RE.match(name):
+            raise ProvisionerError(f"unsafe destination ref: {name!r}")
+        if ".." in name or "@{" in name or "//" in name or name.endswith(("/", ".")):
+            raise ProvisionerError(f"invalid destination ref: {name!r}")
+
+    def _check_remote_allowed(self, host_repo: str, remote: str) -> None:
+        """Restrict pushes to an allowlist, known remotes, or explicit paths/URLs.
+
+        ``origin`` is always allowed: it is git's default push remote, and an
+        allowlist that silently forbade it would break the common case. An
+        allowlist therefore *adds* remotes; it does not remove ``origin``.
+        """
+        allow = tuple(self.config.export.allowed_remotes or ())
+        if allow:
+            if remote == "origin" or remote in allow:
+                return
+            raise ProvisionerError(
+                f"remote {remote!r} is not 'origin' or in the configured "
+                f"export.allowed_remotes allowlist {allow}"
+            )
+        if self._is_explicit_remote(remote):
+            return
+        known = self._git(host_repo, "remote", timeout=30)
+        names = set(known.stdout.split()) if known.ok else set()
+        if remote not in names:
+            raise ProvisionerError(
+                f"remote {remote!r} is not 'origin', a known remote, or an explicit path/URL"
+            )
+
+    def _push_destination(self, export: ExportSpec) -> tuple[str, str]:
+        """Resolve ``export.ref`` to ``(remote, fully-qualified ref)`` safely.
+
+        Every component is validated before it can reach a ``git`` argv: the
+        branch and ref must be well-formed, and no component may start with
+        ``-`` (which git would parse as an option, e.g. ``--upload-pack``).
+        """
+        branch = (export.branch or "").strip()
+        self._validate_branch_name(branch)
         ref = (export.ref or "").strip()
         if ref and ":" in ref:
             remote, destination = ref.split(":", 1)
@@ -1153,33 +1350,53 @@ class LibvirtProvisioner(Provisioner):
             remote, destination = ref, f"refs/heads/{branch}"
         else:
             remote, destination = "origin", f"refs/heads/{branch}"
-        if not remote or not destination:
-            raise ProvisionerError(f"invalid push destination: {ref!r}")
+        remote = remote.strip()
+        destination = destination.strip()
+        self._reject_option_like(remote, "push remote")
+        self._reject_option_like(destination, "push destination")
         if not destination.startswith("refs/"):
             destination = f"refs/heads/{destination}"
+        self._validate_ref_name(destination)
         return remote, destination
 
     def push(self, export: ExportSpec, fetched: FetchResult) -> PushResult:
-        """Push a verified bundle host-side, idempotently, verifying remote SHA."""
+        """Push a verified bundle host-side, idempotently, verifying remote SHA.
+
+        Security: the remote and destination are validated (no option-like
+        tokens, fully-qualified ref, known/allowlisted remote), the fetched SHA
+        must be a real object id, and ``git check-ref-format`` is the
+        authoritative ref check. ``--`` end-of-options is used on the
+        ``ls-remote``/``push`` invocations.
+        """
         if not fetched.ok or not fetched.sha:
             return PushResult(ok=False, message="refusing to push an unverified bundle")
+        if not _SAFE_SHA_RE.match(fetched.sha or ""):
+            return PushResult(ok=False, message=f"invalid fetched SHA: {fetched.sha!r}")
         host_repo = str(Path(export.repo).expanduser())
         if not self._git(host_repo, "rev-parse", "--git-dir", timeout=30).ok:
             return PushResult(ok=False, message=f"host repo is not a git repo: {host_repo}")
         try:
             remote, destination = self._push_destination(export)
+            self._check_remote_allowed(host_repo, remote)
         except ProvisionerError as exc:
             return PushResult(ok=False, message=str(exc))
-        existing = self._git(host_repo, "ls-remote", remote, destination, timeout=60)
+        branch = (export.branch or "").strip()
+        if not self.host(["git", "check-ref-format", "--branch", branch], timeout=30).ok:
+            return PushResult(ok=False, message=f"invalid branch name: {branch!r}")
+        if not self.host(["git", "check-ref-format", destination], timeout=30).ok:
+            return PushResult(ok=False, message=f"invalid destination ref: {destination!r}")
+        existing = self._git(host_repo, "ls-remote", "--", remote, destination, timeout=60)
         if existing.ok and existing.stdout.split() and existing.stdout.split()[0] == fetched.sha:
             return PushResult(ok=True, sha=fetched.sha, message="remote already at SHA")
-        result = self._git(host_repo, "push", remote, f"{fetched.sha}:{destination}", timeout=600)
+        result = self._git(
+            host_repo, "push", "--", remote, f"{fetched.sha}:{destination}", timeout=600
+        )
         if not result.ok:
             return PushResult(
                 ok=False,
                 message=f"git push failed: {result.stderr.strip() or result.stdout.strip()}",
             )
-        remote_check = self._git(host_repo, "ls-remote", remote, destination, timeout=60)
+        remote_check = self._git(host_repo, "ls-remote", "--", remote, destination, timeout=60)
         remote_sha = remote_check.stdout.split()[0] if remote_check.stdout.split() else None
         if remote_sha != fetched.sha:
             return PushResult(
@@ -1215,7 +1432,7 @@ class LibvirtProvisioner(Provisioner):
         )
 
     def list_vms(self) -> list[VmInfo]:
-        """All manager-owned seat domains in any state (never the templates).
+        """All **managed (seat)** domains in any state; templates excluded.
 
         Only ``omavroom-seat-*`` domains are returned. The
         ``omavroom-base``/``omavroom-term`` template domains are deliberately
@@ -1316,19 +1533,25 @@ class LibvirtProvisioner(Provisioner):
         if not result.ok:
             raise ProvisionerError(f"input injection failed on {vm_ref}: {result.stderr.strip()}")
 
+    #: Allowed click buttons -> ydotool BTN_* key codes.
+    _CLICK_BUTTONS: dict[str, str] = {"1": "272", "2": "274", "3": "273"}
+
     @staticmethod
     def _click_command(value: str) -> str:
         parts = [p.strip() for p in value.split(",")]
-        if (
-            len(parts) < 2
-            or not parts[0].lstrip("-").isdigit()
-            or not parts[1].lstrip("-").isdigit()
-        ):
-            raise ProvisionerError(f"click value must be 'x,y[,button]', got {value!r}")
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            raise ProvisionerError(
+                f"click value must be 'x,y[,button]' with non-negative integers, got {value!r}"
+            )
         x, y = parts[0], parts[1]
         button = parts[2] if len(parts) > 2 and parts[2] else "1"
-        mapping = {"1": "272", "2": "274", "3": "273"}
-        code = mapping.get(button, button)
+        if button not in LibvirtProvisioner._CLICK_BUTTONS:
+            # Never interpolate an unvalidated client string into the guest shell.
+            raise ProvisionerError(
+                f"click button must be one of {sorted(LibvirtProvisioner._CLICK_BUTTONS)}, "
+                f"got {button!r}"
+            )
+        code = LibvirtProvisioner._CLICK_BUTTONS[button]
         return (
             f"ydotool mousemove --absolute {x} {y} || ydotool mousemove {x} {y}; "
             f"ydotool click {code}"
@@ -1347,8 +1570,11 @@ __all__ = [
     "CommandResult",
     "LibvirtProvisioner",
     "build_domain_xml",
+    "is_safe_ref_token",
+    "is_safe_sha",
     "load_template",
     "png_dimensions",
     "repo_name_from",
     "safe_branch_name",
+    "url_has_userinfo",
 ]

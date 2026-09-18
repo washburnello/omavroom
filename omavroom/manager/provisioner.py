@@ -221,13 +221,15 @@ class Provisioner(ABC):
     # -- reattach / adopt seam (Phase 4A FIX 4) --------------------------
     @abstractmethod
     def list_vms(self) -> list[VmInfo]:
-        """Every domain the provisioner knows about, in any state.
+        """Every **managed (seat)** domain the provisioner knows about.
 
-        This is **all** domains, not running-only: it includes ``defined``
-        and in-flight/stopped VMs so the reconciler can see reality. Because
-        an in-flight VM may not be persisted on a seat row yet, callers must
-        match by seat/``VmInfo.name`` identity, never assume "not referenced
-        by ``vm_name``" means orphan.
+        This is all *managed* domains, not running-only: it includes
+        ``defined`` and in-flight/stopped seat VMs so the reconciler can see
+        reality. Template/base domains (e.g. ``omavroom-base`` /
+        ``omavroom-term``) are **excluded** — the reconciler would otherwise
+        destroy them as orphans. Because an in-flight VM may not be persisted
+        on a seat row yet, callers must match by seat/``VmInfo.name``
+        identity, never assume "not referenced by ``vm_name``" means orphan.
         """
 
     @abstractmethod
@@ -246,6 +248,17 @@ class Provisioner(ABC):
     @abstractmethod
     def peek_endpoint(self, vm_ref: str) -> str:
         """Return the on-demand viewer endpoint (never auto-opened)."""
+
+    # -- autostart invariant --------------------------------------------
+    def verify_autostart_invariant(self) -> None:
+        """Assert autostart is disabled on base/template and seat domains.
+
+        The ABC documents autostart as never-enabled. Provisioners with a
+        real control plane override this to actively check; the base
+        implementation is a no-op for control-plane-free fakes. It is safe to
+        call at daemon startup.
+        """
+        return None
 
 
 class FakeProvisioner(Provisioner):
@@ -428,6 +441,17 @@ class FakeProvisioner(Provisioner):
             self._maybe_fail("fetch_bundle")
             if self.fail_exports:
                 return FetchResult(ok=False, message="simulated export fetch failure", spec=export)
+            with self._lock:
+                present = vm_ref in self.vms
+            if not present:
+                # Mirror the real provisioner: a vanished VM cannot be
+                # exported. Without this the fake would silently "succeed" on
+                # a gone VM and mask the release-after-teardown recovery bug.
+                return FetchResult(
+                    ok=False,
+                    message=f"fake provisioner: unknown VM {vm_ref!r}",
+                    spec=export,
+                )
             with self._lock:
                 self.exported.append(vm_ref)
             name = vm_ref.rsplit("/", 1)[-1]
