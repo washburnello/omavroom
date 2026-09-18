@@ -111,6 +111,27 @@ Phase 3 audit deltas (binding on the daemon design):
   objects indefinitely) — accepted as a benign public test artifact
   (4-line text file, no secrets); "GC will clean it" is struck.
 
+Phase 4B1 deltas (binding, from the real LibvirtProvisioner audit):
+- **`list_vms` scope.** The provisioner returns managed seat domains only
+  (`omavroom-seat-*`); the `omavroom-base`/`omavroom-term` templates are
+  never returned, because `reconcile` destroys any unreferenced VM it
+  sees. The 4A "all domains" wording is superseded.
+- **Overlay quota limitation.** A qcow2 overlay must span the golden's full
+  virtual disk and qcow2 has no per-image quota. `overlay_max_gb` is a
+  sparse-aware allocated-bytes monitor/refuse check at provision and
+  ready, not a hard block-layer quota. True per-seat disk quota (guest
+  filesystem project quota / in-guest enforcement) is deferred to Phase 7.
+  CPU/RAM caps remain hard (`cputune`/`memtune`).
+- **Exec transport.** `LibvirtProvisioner.run` (pinned-key, blocking SSH)
+  and `agent_exec` (qemu-guest-agent) are the real exec primitives;
+  Phase 5's `exec_*` wraps `run` on a worker thread.
+- **Manager-mediated export needs branch/ref plumbed** through
+  `export_seat`/`release_seat` (4B2), or release-with-export is unusable
+  outside direct provisioner calls.
+- Golden ownership note: libvirt dynamic DAC relabel can chown read-only
+  golden files to `libvirt-qemu`; content is untouched and mode stays 444,
+  but rebuild-with-force then needs care.
+
 ## Phase 5 — MCP server + opencode wiring
 
 Spec: FastMCP server exposing the async toolset (`pool_status`,

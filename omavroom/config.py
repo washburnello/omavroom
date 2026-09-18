@@ -15,6 +15,12 @@ defaults for anything unset:
     min_seats = 0
     max_seats = 2
     image = "omavroom-base"
+    [images.golden-desktop]
+    golden = "~/.local/share/omavroom/images/golden-desktop.qcow2"
+    seat_type = "desktop"
+    [images.golden-term]
+    golden = "~/.local/share/omavroom/images/golden-term.qcow2"
+    seat_type = "terminal"
     [resources.desktop]
     cpu_vcpus = 2
     memory_mb = 4096
@@ -56,6 +62,12 @@ between lanes):
   least this many seats provisioned (each still bounded by admission).
 - ``resources.<type>`` are the mandatory per-seat caps handed to libvirt
   (CPU/RAM) plus the overlay disk quota.
+- ``seats.<type>.image`` names the image a seat is provisioned from, and
+  ``[images.<name>]`` maps that name to a read-only golden qcow2
+  (``golden``) and the seat type it may serve (``seat_type``). The
+  provisioner resolves the name with :meth:`Config.golden_for`; an
+  unregistered name (including the stock default ``omavroom-base``) falls
+  back to the seat type's ``golden-<type>`` entry.
 - ``admission`` controls the dynamic live-RAM check: ``dynamic`` enables
   it, ``override`` is a manual escape hatch (``auto`` = normal,
   ``allow`` = skip the live-RAM gate but still honour static bounds,
@@ -84,6 +96,10 @@ CONFIG_ENV_VAR = "OMAVROOM_CONFIG"
 SEAT_TYPES: tuple[str, ...] = ("desktop", "terminal")
 
 DEFAULT_IMAGE = "omavroom-base"
+DEFAULT_GOLDEN_BY_TYPE: dict[str, str] = {
+    "desktop": "golden-desktop",
+    "terminal": "golden-term",
+}
 ADMISSION_OVERRIDES: tuple[str, ...] = ("auto", "allow", "deny")
 
 _INT = "int"
@@ -199,6 +215,34 @@ class ResourceConfig:
         for name in ("cpu_vcpus", "memory_mb", "overlay_max_gb"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1")
+
+
+def default_images_dir() -> Path:
+    """Default directory holding read-only golden qcow2 images."""
+    return Path.home() / ".local" / "share" / "omavroom" / "images"
+
+
+@dataclass
+class ImageConfig:
+    """One named golden image: where it lives and which seat type it serves.
+
+    ``seat_type`` is optional but, when set, a seat of another type may not
+    be provisioned from it (the provisioner enforces the match).
+    """
+
+    golden: str = ""
+    seat_type: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.golden, str) or not self.golden.strip():
+            raise ValueError("golden must be a non-empty string")
+        if self.seat_type is not None and self.seat_type not in SEAT_TYPES:
+            raise ValueError(f"seat_type must be one of {SEAT_TYPES}, got {self.seat_type!r}")
+
+    @property
+    def path(self) -> Path:
+        """The golden qcow2 path with ``~`` expanded."""
+        return Path(self.golden).expanduser()
 
 
 @dataclass
@@ -347,6 +391,14 @@ def _default_resources() -> dict[str, ResourceConfig]:
     }
 
 
+def _default_images() -> dict[str, ImageConfig]:
+    directory = default_images_dir()
+    return {
+        name: ImageConfig(golden=str(directory / f"{name}.qcow2"), seat_type=seat_type)
+        for seat_type, name in DEFAULT_GOLDEN_BY_TYPE.items()
+    }
+
+
 @dataclass
 class Config:
     """Root config object; see module docstring for the TOML layout."""
@@ -354,6 +406,7 @@ class Config:
     capacity: CapacityConfig = field(default_factory=CapacityConfig)
     seats: dict[str, SeatTypeConfig] = field(default_factory=_default_seats)
     resources: dict[str, ResourceConfig] = field(default_factory=_default_resources)
+    images: dict[str, ImageConfig] = field(default_factory=_default_images)
     host: HostConfig = field(default_factory=HostConfig)
     admission: AdmissionConfig = field(default_factory=AdmissionConfig)
     leases: LeaseConfig = field(default_factory=LeaseConfig)
@@ -392,10 +445,38 @@ class Config:
         """Mandatory resource caps for a seat type."""
         return self.resources[seat_type]
 
+    def golden_for(self, seat_type: str, image: str | None = None) -> Path:
+        """Resolve a seat's image name to the golden qcow2 path.
+
+        A registered image (``[images.<name>]``) wins and, when it declares a
+        ``seat_type``, must match the requested seat type. An unregistered
+        image name (including the historical default ``omavroom-base``) falls
+        back to the seat type's own ``golden-<seat_type>`` entry, so the
+        stock config provisions ``golden-desktop`` for desktop seats and
+        ``golden-term`` for terminal seats without any TOML.
+        """
+        if seat_type not in SEAT_TYPES:
+            raise ValueError(f"unknown seat type: {seat_type!r}")
+        name = image or self.image_for(seat_type)
+        entry = self.images.get(name)
+        if entry is None:
+            fallback_name = DEFAULT_GOLDEN_BY_TYPE.get(seat_type)
+            fallback = self.images.get(fallback_name) if fallback_name else None
+            if fallback is None:
+                raise KeyError(
+                    f"no golden image registered for {name!r} or seat type {seat_type!r}"
+                )
+            return fallback.path
+        if entry.seat_type is not None and entry.seat_type != seat_type:
+            raise ValueError(
+                f"image {name!r} is for seat type {entry.seat_type!r}, not {seat_type!r}"
+            )
+        return entry.path
+
     @classmethod
     def _from_dict(cls, data: dict, source: str | None = None) -> Config:
         where = f" in {source}" if source is not None else ""
-        allowed_sections = set(_SECTION_SCHEMA) | {"seats", "resources"}
+        allowed_sections = set(_SECTION_SCHEMA) | {"seats", "resources", "images"}
         unknown_sections = set(data) - allowed_sections
         if unknown_sections:
             raise ValueError(f"unknown config sections: {sorted(unknown_sections)}")
@@ -417,6 +498,24 @@ class Config:
         resources_data = cls._parse_typed_table(
             data, "resources", _RESOURCE_KEYS, where, allow_unknown_keys=False
         )
+        images_data = data.get("images", {})
+        if not isinstance(images_data, dict):
+            raise ValueError(f"[images] must be a table, got {type(images_data).__name__}{where}")
+        for name, overrides in images_data.items():
+            dotted = f"images.{name}"
+            if not isinstance(overrides, dict):
+                raise ValueError(
+                    f"[{dotted}] must be a table, got {type(overrides).__name__}{where}"
+                )
+            unknown = set(overrides) - {"golden", "seat_type"}
+            if unknown:
+                raise ValueError(f"unknown keys in [{dotted}]: {sorted(unknown)}{where}")
+            golden = overrides.get("golden")
+            if golden is not None and (not isinstance(golden, str) or not golden.strip()):
+                raise ValueError(f"{dotted}.golden must be a non-empty string{where}")
+            seat_type = overrides.get("seat_type")
+            if seat_type is not None and seat_type not in SEAT_TYPES:
+                raise ValueError(f"{dotted}.seat_type must be one of {SEAT_TYPES}{where}")
         cfg = cls.default()
         if section_values["capacity"]:
             cfg.capacity = CapacityConfig(**section_values["capacity"])
@@ -446,6 +545,12 @@ class Config:
                 cpu_vcpus=overrides.get("cpu_vcpus", base.cpu_vcpus),
                 memory_mb=overrides.get("memory_mb", base.memory_mb),
                 overlay_max_gb=overrides.get("overlay_max_gb", base.overlay_max_gb),
+            )
+        for name, overrides in images_data.items():
+            base = cfg.images.get(name)
+            cfg.images[name] = ImageConfig(
+                golden=overrides.get("golden", base.golden if base is not None else ""),
+                seat_type=overrides.get("seat_type", base.seat_type if base is not None else None),
             )
         return cfg
 

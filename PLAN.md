@@ -278,8 +278,12 @@ task, or investigation, owning tabs and panes, with agent states
   measurement admits.
 - MCP API is async-first (`exec_start`/`exec_poll`/`exec_kill`,
   pending seat requests, independent `heartbeat`); nothing blocks.
-- Per-seat CPU/RAM caps + overlay disk quota are mandatory from day one
-  (no decision needed — requirement, values tuned from measurement).
+- Per-seat CPU/RAM caps are mandatory and hard from day one (`cputune`
+  quota + `memtune`). Overlay disk is different: a qcow2 overlay must span
+  the golden's full virtual disk and qcow2 has no per-image quota, so
+  `overlay_max_gb` is a monitor/refuse check on measured allocated bytes,
+  not a hard cap. True per-seat disk quota (guest filesystem project
+  quota or in-guest enforcement) is deferred to Phase 7.
 - Golden image v1: hand-build + snapshot (slow layer baked, per-VM fast
   layer injected at provision); scripted builds later.
 - Seat split: user-configured min/max seat counts per seat type
