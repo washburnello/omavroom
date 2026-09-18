@@ -166,6 +166,7 @@ def settings_dict(config: Config) -> dict:
             "max_retries": config.prewarm.max_retries,
             "backoff_s": config.prewarm.backoff_s,
         },
+        "golden": {"profile": config.golden.profile},
     }
 
 
@@ -197,6 +198,7 @@ def settings_report(config: Config) -> str:
     export = snapshot["export"]
     host = snapshot["host"]
     admission = snapshot["admission"]
+    golden = snapshot["golden"]
     return "\n".join(
         [
             f"capacity: total_units={snapshot['capacity']['total_units']}",
@@ -230,6 +232,7 @@ def settings_report(config: Config) -> str:
             ),
             f"prewarm: max_retries={snapshot['prewarm']['max_retries']}"
             f" backoff_s={snapshot['prewarm']['backoff_s']}",
+            f"golden: profile={golden['profile']}",
         ]
     )
 

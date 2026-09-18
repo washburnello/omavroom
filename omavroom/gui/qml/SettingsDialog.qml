@@ -10,7 +10,7 @@ Dialog {
     modal: true
     title: "Settings"
     width: 680
-    height: 660
+    height: 740
     anchors.centerIn: parent
 
     property string pendingAdmission: backend.admissionOverride
@@ -38,6 +38,40 @@ Dialog {
                     text: "Apply"
                     enabled: backend.daemonOk
                     onClicked: backend.setAdmission(dialog.pendingAdmission)
+                }
+            }
+        }
+
+        GroupBox {
+            Layout.fillWidth: true
+            title: "Golden image source"
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 4
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Label { text: "Source" }
+                    ComboBox {
+                        id: goldenBox
+                        objectName: "goldenProfileBox"
+                        model: [
+                            { label: "Stock Omarchy", value: "stock" },
+                            { label: "Mirror this machine", value: "mirror" }
+                        ]
+                        textRole: "label"
+                        valueRole: "value"
+                        currentIndex: Math.max(0, goldenBox.indexOfValue(backend.goldenProfile))
+                        onActivated: backend.setGoldenProfile(currentValue)
+                    }
+                    Label { text: "current: " + backend.goldenProfile; color: "#8b949e" }
+                    Item { Layout.fillWidth: true }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: "Changing the golden image source requires rebuilding the golden image."
+                    color: "#6e7681"
+                    wrapMode: Text.Wrap
                 }
             }
         }

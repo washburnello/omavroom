@@ -78,7 +78,7 @@ import sys
 import threading
 from pathlib import Path
 
-from omavroom.config import Config
+from omavroom.config import Config, set_config_value
 from omavroom.manager import Manager
 from omavroom.manager.execs import DEFAULT_LIST_OUTPUT_BUDGET_BYTES
 from omavroom.manager.provisioner import (
@@ -437,6 +437,7 @@ class Protocol:
             "input": self._input,
             "peek_endpoint": self._peek_endpoint,
             "set_admission_override": self._set_admission_override,
+            "set_config_value": self._set_config_value,
             "clear_prewarm_backoff": self._clear_prewarm_backoff,
             "request_seat": self._request_seat,
             "cancel_request": self._cancel_request,
@@ -605,6 +606,26 @@ class Protocol:
         seat_type = _optional_str(params, "seat_type")
         self.manager.clear_prewarm_backoff(seat_type)
         return {"seat_type": seat_type}
+
+    # -- config ----------------------------------------------------------
+    def _set_config_value(self, params: dict) -> dict:
+        # Validate through the same schema as file loading, persist to the
+        # per-user config (preserving every other key), then apply it to the
+        # running config so subsequent reads agree. A bad value raises
+        # ValueError -> the ``invalid`` error code.
+        section = _required_str(params, "section")
+        key = _required_str(params, "key")
+        if "value" not in params:
+            raise ValueError("missing required parameter: 'value'")
+        value = params["value"]
+        coerced, path = set_config_value(section, key, value)
+        self.manager.config.set_value(section, key, coerced)
+        return {
+            "section": section,
+            "key": key,
+            "value": coerced,
+            "path": str(path),
+        }
 
     # -- long ops (job) --------------------------------------------------
     def _request_seat(self, params: dict) -> dict:

@@ -444,6 +444,15 @@ class DaemonClient:
     def clear_prewarm_backoff(self, seat_type: str | None = None) -> dict:
         return self.call("clear_prewarm_backoff", seat_type=seat_type)
 
+    def set_config_value(self, section: str, key: str, value: object) -> dict:
+        """Validate and persist one ``section.key = value`` via the daemon.
+
+        The daemon writes the per-user config and returns the applied
+        ``{section, key, value, path}``. A bad value raises
+        :class:`DaemonRequestError` with ``code == "invalid"``.
+        """
+        return self.call("set_config_value", section=section, key=key, value=value)
+
     # -- job calls -------------------------------------------------------
     def job_poll(self, job_id: str) -> dict:
         return self.call("job_poll", job_id=job_id)

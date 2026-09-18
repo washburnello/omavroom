@@ -79,7 +79,7 @@ _COMMAND_HELP: dict[str, str] = {
     "events": "show the daemon's recent event log",
     "admission": "show or set the runtime admission override",
     "image": "inspect locally configured golden images",
-    "settings": "show the effective (merged) configuration; no daemon needed",
+    "settings": ("show the effective configuration, or 'settings set <section>.<key> <value>'"),
     "config": "configuration helpers (alias of 'settings')",
     "tui": "open the metadata-only Textual monitor wall (over SSH friendly)",
     "gui": "open the native Qt6/QML Command Center (monitor wall + queue)",
@@ -226,6 +226,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_json(image_list)
 
     settings = subparsers.add_parser("settings", help=_COMMAND_HELP["settings"])
+    settings_sub = settings.add_subparsers(dest="settings_command", metavar="<action>")
+    settings_show = settings_sub.add_parser(
+        "show", help="show the effective (merged) configuration (no daemon)"
+    )
+    _add_json(settings_show)
+    settings_set = settings_sub.add_parser(
+        "set", help="validate and persist a config value through the daemon"
+    )
+    settings_set.add_argument("assignment", metavar="<section>.<key>", help="e.g. golden.profile")
+    settings_set.add_argument("value", help="new value (JSON scalar, else a string)")
+    _add_json(settings_set)
     _add_json(settings)
 
     config = subparsers.add_parser("config", help=_COMMAND_HELP["config"])
@@ -683,6 +694,46 @@ def _settings(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _parse_set_value(text: str) -> object:
+    """Interpret a CLI value as JSON when possible, else as a plain string."""
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return text
+
+
+def _settings_set(args: argparse.Namespace) -> int:
+    """Persist one ``section.key=value`` through the daemon.
+
+    The daemon is the single writer: it validates against the config schema,
+    updates ``~/.config/omavroom/config.toml`` preserving other keys, and
+    returns the applied value. A bad value surfaces as a daemon ``invalid``
+    error (exit 1).
+    """
+    from omavroom.client import DaemonClientError
+
+    section, separator, key = args.assignment.partition(".")
+    if not separator or not section or not key:
+        print(
+            "omavroom settings set: expected <section>.<key> (e.g. golden.profile)",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    value = _parse_set_value(args.value)
+    client = _client(args)
+    try:
+        result = client.set_config_value(section, key, value)
+    except DaemonClientError as exc:
+        return _fail("settings set", exc)
+    finally:
+        client.close()
+    if args.json:
+        _dump(result)
+    else:
+        print(f"{result.get('section')}.{result.get('key')} = {result.get('value')!r}")
+    return EXIT_OK
+
+
 def _tui(args: argparse.Namespace) -> int:
     try:
         from omavroom.tui import run_tui
@@ -753,7 +804,6 @@ def main(argv: list[str] | None = None) -> int:
         "peek": _peek,
         "events": _events,
         "admission": _admission,
-        "settings": _settings,
         "tui": _tui,
         "gui": _gui,
     }
@@ -767,6 +817,11 @@ def main(argv: list[str] | None = None) -> int:
             return _settings(args)
         print("omavroom config: choose an action (try 'omavroom config show')", file=sys.stderr)
         return EXIT_USAGE
+    if args.command == "settings":
+        if getattr(args, "settings_command", None) == "set":
+            return _settings_set(args)
+        # Bare ``settings`` and ``settings show`` both print the effective config.
+        return _settings(args)
     handler = handlers.get(args.command)
     if handler is None:  # pragma: no cover - parser only yields known commands
         print(f"omavroom {args.command}: unknown command", file=sys.stderr)

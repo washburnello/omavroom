@@ -52,6 +52,16 @@ defaults for anything unset:
     [prewarm]
     max_retries = 1
     backoff_s = 60
+    [golden]
+    profile = "stock"
+
+Config discovery precedence (first that exists wins): an explicit ``path``
+argument, then ``$OMAVROOM_CONFIG``, then the per-user XDG config
+``$XDG_CONFIG_HOME/omavroom/config.toml`` (``~/.config`` when unset), then the
+built-in defaults. The ``[golden]`` section selects where golden images come
+from: ``stock`` (the default) builds from the stock Omarchy image, ``mirror``
+mirrors this machine's Omarchy. Only the setting is modelled here; the golden
+build itself lives elsewhere.
 
 Phase 4 scheduler policy is deliberately *per seat type* (a locked PLAN.md
 decision: the operator, not the scheduler, decides how capacity splits
@@ -88,8 +98,9 @@ sections, and wrongly typed values are all rejected with ValueError
 from __future__ import annotations
 
 import os
+import threading
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, replace
 from pathlib import Path
 
 CONFIG_ENV_VAR = "OMAVROOM_CONFIG"
@@ -102,6 +113,13 @@ DEFAULT_GOLDEN_BY_TYPE: dict[str, str] = {
     "terminal": "golden-term",
 }
 ADMISSION_OVERRIDES: tuple[str, ...] = ("auto", "allow", "deny")
+#: Golden-image source profiles: ``stock`` (default) or ``mirror``.
+GOLDEN_PROFILES: tuple[str, ...] = ("stock", "mirror")
+DEFAULT_GOLDEN_PROFILE = "stock"
+
+#: Serializes writes to the per-user config file (the daemon is the only
+#: writer, but a single daemon may serve concurrent clients).
+_CONFIG_WRITE_LOCK = threading.Lock()
 
 _INT = "int"
 _BOOL = "bool"
@@ -132,6 +150,7 @@ _SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "allowed_remotes": _STR_LIST,
     },
     "prewarm": {"max_retries": _INT, "backoff_s": _INT},
+    "golden": {"profile": _STR},
 }
 
 _SEAT_KEYS: dict[str, str] = {
@@ -392,6 +411,34 @@ class PrewarmConfig:
             raise ValueError("backoff_s must be >= 0")
 
 
+@dataclass
+class GoldenConfig:
+    """Golden-image source profile.
+
+    ``stock`` builds (out of scope here) from the stock Omarchy image;
+    ``mirror`` mirrors this machine's Omarchy. The profile is persisted but
+    this package only models the setting and its plumbing.
+    """
+
+    profile: str = DEFAULT_GOLDEN_PROFILE
+
+    def __post_init__(self) -> None:
+        if self.profile not in GOLDEN_PROFILES:
+            raise ValueError(
+                f"golden.profile must be one of {GOLDEN_PROFILES}, got {self.profile!r}"
+            )
+
+
+def default_config_path() -> Path:
+    """Per-user config file: ``$XDG_CONFIG_HOME/omavroom/config.toml``.
+
+    ``XDG_CONFIG_HOME`` falls back to ``~/.config`` per the XDG base-dir spec.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "omavroom" / "config.toml"
+
+
 def _default_seats() -> dict[str, SeatTypeConfig]:
     return {
         "desktop": SeatTypeConfig(cost_units=4, min_seats=0, max_seats=1),
@@ -428,6 +475,7 @@ class Config:
     exec: ExecConfig = field(default_factory=ExecConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
     prewarm: PrewarmConfig = field(default_factory=PrewarmConfig)
+    golden: GoldenConfig = field(default_factory=GoldenConfig)
 
     @classmethod
     def default(cls) -> Config:
@@ -444,13 +492,54 @@ class Config:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
-        """Load config from `path`, `$OMAVROOM_CONFIG`, or defaults, in order."""
-        if path is None:
-            env_path = os.environ.get(CONFIG_ENV_VAR)
-            path = env_path if env_path else None
-        if path is None:
-            return cls.default()
-        return cls.from_toml(path)
+        """Load the effective config, in precedence order.
+
+        First that exists wins: an explicit ``path``, ``$OMAVROOM_CONFIG``, the
+        per-user :func:`default_config_path` (``~/.config/omavroom/config.toml``),
+        then the built-in defaults.
+        """
+        if path is not None:
+            return cls.from_toml(path)
+        env_path = os.environ.get(CONFIG_ENV_VAR)
+        if env_path:
+            return cls.from_toml(env_path)
+        user_path = default_config_path()
+        if user_path.exists():
+            return cls.from_toml(user_path)
+        return cls.default()
+
+    @classmethod
+    def validate_value(cls, section: str, key: str, value: object) -> object:
+        """Validate one scalar ``section.key`` against the schema; return it coerced.
+
+        Uses the same strict rules as file loading (:func:`_coerce`) and the
+        same error style. Unknown sections/keys and wrongly typed values all
+        raise :class:`ValueError`.
+        """
+        schema = _SECTION_SCHEMA.get(section)
+        if schema is None:
+            raise ValueError(f"unknown config section: {section!r}")
+        if key not in schema:
+            raise ValueError(f"unknown key in [{section}]: {key!r}")
+        return _coerce(schema[key], f"{section}.{key}", value, "")
+
+    def set_value(self, section: str, key: str, value: object) -> object:
+        """Validate ``section.key = value`` and apply it in place; return the value.
+
+        Every other field of the section is preserved (the section dataclass is
+        rebuilt with :func:`dataclasses.replace`).
+        """
+        coerced = self.validate_value(section, key, value)
+        current = getattr(self, section, None)
+        if current is None or not is_dataclass(current):
+            raise ValueError(f"unknown config section: {section!r}")
+        setattr(self, section, replace(current, **{key: coerced}))
+        return coerced
+
+    @property
+    def golden_profile(self) -> str:
+        """The configured golden-image source profile (``stock``/``mirror``)."""
+        return self.golden.profile
 
     def image_for(self, seat_type: str) -> str:
         """Default golden image for a seat type."""
@@ -546,6 +635,8 @@ class Config:
             cfg.export = ExportConfig(**section_values["export"])
         if section_values["prewarm"]:
             cfg.prewarm = PrewarmConfig(**section_values["prewarm"])
+        if section_values["golden"]:
+            cfg.golden = GoldenConfig(**section_values["golden"])
         for seat_type, overrides in seats_data.items():
             base = cfg.seats[seat_type]
             cfg.seats[seat_type] = SeatTypeConfig(
@@ -603,3 +694,84 @@ class Config:
                 for key, value in overrides.items()
             }
         return parsed
+
+
+def _toml_value(value: object) -> str:
+    """Serialize one TOML scalar/list value (config values are scalars/lists)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    raise ValueError(f"cannot serialize {value!r} to TOML")
+
+
+def _dump_toml(data: dict) -> str:
+    """Serialize a config document back to TOML text.
+
+    The schema is at most two levels deep (sections, plus ``seats.<type>`` /
+    ``resources.<type>`` / ``images.<name>``). Key order and comments are not
+    preserved; every key is.
+    """
+    lines: list[str] = []
+    for key, value in data.items():
+        if not isinstance(value, dict):
+            lines.append(f"{key} = {_toml_value(value)}")
+    for section, body in data.items():
+        if not isinstance(body, dict):
+            continue
+        if lines:
+            lines.append("")
+        lines.append(f"[{section}]")
+        for key, value in body.items():
+            if not isinstance(value, dict):
+                lines.append(f"{key} = {_toml_value(value)}")
+        for name, overrides in body.items():
+            if not isinstance(overrides, dict):
+                continue
+            lines.append("")
+            lines.append(f"[{section}.{name}]")
+            for key, value in overrides.items():
+                lines.append(f"{key} = {_toml_value(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def set_config_value(
+    section: str,
+    key: str,
+    value: object,
+    *,
+    path: str | Path | None = None,
+) -> tuple[object, Path]:
+    """Validate and persist one ``section.key = value`` to the user config.
+
+    Validation reuses :meth:`Config.validate_value`, and the merged document is
+    re-parsed with :meth:`Config._from_dict` before writing, so a persisted file
+    can never be one the loader would reject. Returns ``(coerced_value, path)``;
+    raises :class:`ValueError` for an unknown section/key or a bad value.
+    """
+    coerced = Config.validate_value(section, key, value)
+    target = Path(path) if path is not None else default_config_path()
+    with _CONFIG_WRITE_LOCK:
+        data: dict = {}
+        if target.exists():
+            data = tomllib.loads(target.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("config TOML must be a table at the top level")
+        body = data.get(section)
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise ValueError(f"[{section}] must be a table, got {type(body).__name__}")
+        body[key] = coerced
+        data[section] = body
+        Config._from_dict(data, source=str(target))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_dump_toml(data), encoding="utf-8")
+    return coerced, target

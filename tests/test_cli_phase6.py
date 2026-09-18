@@ -229,8 +229,9 @@ def test_admission_override_round_trip(fake_daemon, capsys):
         assert "admission override: deny" in capsys.readouterr().out
 
 
-def test_image_list_offline(monkeypatch, capsys):
+def test_image_list_offline(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("OMAVROOM_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert cli.main(["image", "list"]) == 0
     assert "golden-desktop" in capsys.readouterr().out
     assert cli.main(["image", "list", "--json"]) == 0
@@ -246,8 +247,9 @@ def test_events_table(fake_daemon, capsys):
 
 
 # -- settings / config show --------------------------------------------------
-def test_settings_offline_human_and_json(monkeypatch, capsys):
+def test_settings_offline_human_and_json(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("OMAVROOM_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert cli.main(["settings"]) == 0
     out = capsys.readouterr().out
     assert "headroom_floor_mb=2048" in out

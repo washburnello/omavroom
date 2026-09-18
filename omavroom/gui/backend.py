@@ -32,6 +32,7 @@ drives a real render pass and asserts on the visual ``SlotTile`` delegates.
 
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 import threading
@@ -40,7 +41,7 @@ from pathlib import Path
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 
 from omavroom.client import DaemonClient, DaemonClientError, DaemonRequestError, DaemonTimeout
-from omavroom.config import Config
+from omavroom.config import GOLDEN_PROFILES, Config
 from omavroom.gui.viewmodel import (
     MonitorWall,
     grid_columns,
@@ -57,6 +58,14 @@ ACTION_TIMEOUT_S = 300.0
 #: is only a join cap: the worker is interrupted cooperatively first, so the
 #: app returns within this bound even if a daemon call is still in flight.
 SHUTDOWN_WAIT_MS = 1500
+
+
+def _parse_config_value(text: str) -> object:
+    """Interpret a config value as JSON when possible, else as a plain string."""
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return text
 
 
 class WallBackend(QObject):
@@ -77,6 +86,8 @@ class WallBackend(QObject):
     requestPollInterval = Signal(float)
     #: Ask the worker to change the screenshot capture width (sharp tiles).
     requestScreenshotWidth = Signal(int)
+    #: Ask the worker to persist a config value (section, key, value) via the daemon.
+    requestConfigValue = Signal(str, str, str)
 
     def __init__(
         self,
@@ -142,6 +153,11 @@ class WallBackend(QObject):
     @Property(str, notify=statusChanged)
     def admissionOverride(self) -> str:
         return self._wall.state.admission_override
+
+    @Property(str, notify=statusChanged)
+    def goldenProfile(self) -> str:
+        """Golden-image source profile (``stock`` or ``mirror``)."""
+        return self.config.golden.profile
 
     @Property(str, notify=statusChanged)
     def settingsText(self) -> str:
@@ -263,6 +279,22 @@ class WallBackend(QObject):
     @Slot(str)
     def setAdmission(self, override: str) -> None:
         self.requestAdmission.emit(str(override))
+
+    @Slot(str)
+    def setGoldenProfile(self, profile: str) -> None:
+        """Apply a golden-image source profile and persist it via the daemon.
+
+        The local config is updated optimistically so the dialog reflects the
+        choice immediately; the worker performs the validated daemon write.
+        """
+        profile = str(profile)
+        if profile not in GOLDEN_PROFILES:
+            self._set_notice(f"unknown golden profile {profile!r}")
+            return
+        self.config.set_value("golden", "profile", profile)
+        self._refresh_settings_text()
+        self.statusChanged.emit()
+        self.requestConfigValue.emit("golden", "profile", profile)
 
     @Slot(float)
     def setPollInterval(self, seconds: float) -> None:
@@ -611,6 +643,22 @@ class PollWorker(QObject):
         except DaemonClientError as exc:
             self._close_client()
             self.actionResult.emit("admission", False, str(exc), 0, "")
+        finally:
+            self.poll_once()
+
+    @Slot(str, str, str)
+    def set_config_value(self, section: str, key: str, value: str) -> None:
+        """Persist a config value through the daemon (validated server-side)."""
+        if self._stop.is_set():
+            return
+        try:
+            client = self._ensure_client()
+            result = client.set_config_value(section, key, _parse_config_value(value))
+            applied = result.get("value", value) if isinstance(result, dict) else value
+            self.actionResult.emit("config", True, f"{section}.{key} = {applied}", 0, "")
+        except DaemonClientError as exc:
+            self._close_client()
+            self.actionResult.emit("config", False, str(exc), 0, "")
         finally:
             self.poll_once()
 

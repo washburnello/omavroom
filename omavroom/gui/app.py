@@ -109,6 +109,7 @@ def run_gui(
     backend.requestPoll.connect(worker.poll_once)
     backend.requestAction.connect(worker.perform_action)
     backend.requestAdmission.connect(worker.set_admission)
+    backend.requestConfigValue.connect(worker.set_config_value)
     backend.requestPollInterval.connect(worker.set_interval)
     backend.requestScreenshotWidth.connect(worker.set_screenshot_width)
 

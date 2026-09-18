@@ -584,3 +584,41 @@ def test_open_viewer_launches_only_when_explicitly_called(monkeypatch):
     monkeypatch.setattr("subprocess.Popen", lambda argv, **kw: (calls.append(argv), _Proc())[1])
     backend.openViewer("vnc://127.0.0.1:5900")
     assert calls == [["vncviewer", "vnc://127.0.0.1:5900"]]
+
+
+# --------------------------------------------------------------------------
+# Settings dialog: golden-image source profile
+# --------------------------------------------------------------------------
+def test_settings_dialog_exposes_golden_profile_combo():
+    app = _qapp()
+    backend = WallBackend(_config())
+    engine = _build_engine(backend)
+    try:
+        root = engine.rootObjects()[0]
+        dialog = root.findChild(QObject, "settingsDialog")
+        assert dialog is not None
+        dialog.setProperty("visible", True)
+        _render(app, root)
+
+        combos = _find(root, "goldenProfileBox")
+        assert combos, "golden profile combo did not render"
+        combo = combos[0]
+        assert combo.property("count") == 2
+        assert backend.goldenProfile == "stock"
+
+        # Selecting a profile forwards the change to the backend/daemon path.
+        seen: list = []
+        backend.requestConfigValue.connect(
+            lambda section, key, value: seen.append((section, key, value))
+        )
+        backend.setGoldenProfile("mirror")
+        assert seen == [("golden", "profile", "mirror")]
+        assert backend.goldenProfile == "mirror"
+
+        # An unknown profile is refused and never reaches the daemon.
+        backend.setGoldenProfile("bogus")
+        assert seen == [("golden", "profile", "mirror")]
+        assert "unknown golden profile" in backend.lastMessage
+    finally:
+        engine.deleteLater()
+        app.processEvents()
