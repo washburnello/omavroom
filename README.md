@@ -8,8 +8,11 @@ host) or headless `terminal` — does its work, pushes it to a repo, and
 releases the seat, which destroys the VM. See `PLAN.md` for the full
 design and `PHASES.md` for the build order.
 
-> Phase 0 skeleton: package layout, config schema, sqlite stub, and CLI
-> stubs only. No VMs yet.
+> Phase 4A: scheduler + state core complete and VM-free (atomic claiming,
+> fair queue, leases/heartbeats with auto-reclaim, dynamic admission,
+> destroy-on-release, content-gated export, reattach/reconcile). The
+> libvirt provisioner, MCP server, and CLI/TUI are still to come; the
+> scheduler is exercised against an in-process `FakeProvisioner`.
 
 ## Quickstart
 
@@ -24,6 +27,7 @@ uv run omavroom --help
 ```
 
 Configuration is optional: without a config file, sane defaults apply
-(4-unit capacity budget, `desktop` = 4 units, `terminal` = 1 unit). To
-override, point `$OMAVROOM_CONFIG` at a TOML file using the section
-layout documented in `omavroom/config.py`.
+(per-seat-type min/max, mandatory resource caps, dynamic admission with a
+headroom floor, bounded prewarm, and export content-gate limits). To
+override, point `$OMAVROOM_CONFIG` at a TOML file using the section layout
+documented in `omavroom/config.py`.
