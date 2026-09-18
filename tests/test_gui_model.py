@@ -467,17 +467,24 @@ def test_wall_layout_fills_the_available_space():
 
 
 def test_focus_makes_the_selected_tile_largest_and_keeps_the_rest_visible():
+    width, height = 930.0, 700.0
     seat_types = ["desktop", "terminal", "terminal"]
-    rects = wall_layout(seat_types, 930.0, 700.0, focus_index=1)
+    rects = wall_layout(seat_types, width, height, focus_index=1)
     assert rects[1].focused is True
     assert all(not rect.focused for index, rect in enumerate(rects) if index != 1)
+    # Focused tile spans the full width across the TOP so it stays landscape.
+    assert rects[1].x == 0.0 and rects[1].y == 0.0
+    assert rects[1].width == width
+    assert rects[1].width > rects[1].height  # landscape, not a portrait panel
     focused_area = rects[1].width * rects[1].height
     for index, rect in enumerate(rects):
         if index != 1:
             assert focused_area > rect.width * rect.height
-            # The others are still on the wall (not collapsed to nothing).
+            # The others sit in the strip BELOW the focused monitor.
+            assert rect.y >= rects[1].height
+            # ...and are still on the wall (not collapsed to nothing).
             assert rect.width > 1.0 and rect.height > 1.0
-    _assert_inside(rects, 930.0, 700.0)
+    _assert_inside(rects, width, height)
     _assert_no_overlap(rects)
 
 

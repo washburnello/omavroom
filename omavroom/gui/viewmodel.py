@@ -202,7 +202,9 @@ def tile_row_span(seat_type: str) -> int:
 
 #: Gap between tiles, in pixels.
 WALL_GAP = 10.0
-#: How much of the wall width the focused tile takes in focus mode.
+#: How much of the wall the focused tile takes in focus mode, along its main
+#: axis. Applied to the HEIGHT so the focused monitor stays landscape (full
+#: width across the top) instead of becoming a portrait side panel.
 FOCUS_MASTER_RATIO = 0.68
 #: Tiles are shaped toward this width/height ratio when the fit is ambiguous.
 TARGET_TILE_ASPECT = 1.6
@@ -299,7 +301,8 @@ def wall_layout(
     """Lay every slot out so they ALL fit inside ``width`` x ``height``.
 
     No scrolling: tiles scale down to fit. With ``focus_index`` set, that tile
-    becomes the large master panel and the rest shrink into a side strip.
+    becomes the large master panel across the TOP (full width, so it stays
+    landscape) and the rest shrink into a strip along the bottom.
     """
     count = len(seat_types)
     if count == 0:
@@ -308,18 +311,18 @@ def wall_layout(
     wall_h = max(1.0, float(height))
 
     if focus_index is not None and 0 <= focus_index < count and count > 1:
-        master_w = max(1.0, (wall_w - WALL_GAP) * FOCUS_MASTER_RATIO)
-        strip_w = max(1.0, wall_w - WALL_GAP - master_w)
+        master_h = max(1.0, (wall_h - WALL_GAP) * FOCUS_MASTER_RATIO)
+        strip_h = max(1.0, wall_h - WALL_GAP - master_h)
         rects: list[SlotRect | None] = [None] * count
-        rects[focus_index] = SlotRect(0.0, 0.0, master_w, wall_h, True)
+        rects[focus_index] = SlotRect(0.0, 0.0, wall_w, master_h, True)
         others = [index for index in range(count) if index != focus_index]
-        tile_h = max(1.0, (wall_h - (len(others) - 1) * WALL_GAP) / len(others))
+        tile_w = max(1.0, (wall_w - (len(others) - 1) * WALL_GAP) / len(others))
         for order, index in enumerate(others):
             rects[index] = SlotRect(
-                master_w + WALL_GAP,
-                order * (tile_h + WALL_GAP),
-                strip_w,
-                tile_h,
+                order * (tile_w + WALL_GAP),
+                master_h + WALL_GAP,
+                tile_w,
+                strip_h,
                 False,
             )
         return [rect for rect in rects if rect is not None]
