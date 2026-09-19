@@ -132,6 +132,24 @@ Phase 4B1 deltas (binding, from the real LibvirtProvisioner audit):
   golden files to `libvirt-qemu`; content is untouched and mode stays 444,
   but rebuild-with-force then needs care.
 
+## Seat lifetime (added after the first real agent test)
+
+The first end-to-end agent test exposed that agents had to babysit
+heartbeats: an agent doing GUI work for ~5 minutes never called
+`heartbeat`, the daemon reclaimed the seat (`reason=heartbeat_timeout`) and
+destroyed the VM under it. Decisions:
+
+- The **MCP server auto-heartbeats** seats the session holds; heartbeat
+  timeout now only detects a dead agent/MCP process.
+- A stale seat enters **stasis** (`held`): VM and overlay preserved,
+  reason recorded, listed under Needs attention. Nothing destroys a stale
+  seat except an explicit `force_discard`/`retry_release` or
+  `lease.held_ttl_s > 0` (discard without export; default 0 = keep).
+- On stasis, an **automated gated export** runs if a host export intent was
+  recorded (explicit `export_seat`); otherwise hold for inspection.
+- Export intent is a host repo path; a `prepare_repo` clone URL is never an
+  export target.
+
 ## Phase 5 — MCP server + opencode wiring
 
 Spec: FastMCP server exposing the async toolset (`pool_status`,

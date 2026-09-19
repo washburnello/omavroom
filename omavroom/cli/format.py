@@ -147,6 +147,7 @@ def settings_dict(config: Config) -> dict:
             "lease_timeout_s": config.leases.lease_timeout_s,
             "heartbeat_interval_s": config.leases.heartbeat_interval_s,
             "heartbeat_timeout_s": config.leases.heartbeat_timeout_s,
+            "held_ttl_s": config.leases.held_ttl_s,
         },
         "exec": {
             "max_output_bytes": config.exec.max_output_bytes,
@@ -216,6 +217,7 @@ def settings_report(config: Config) -> str:
                 f"leases: lease_timeout_s={leases['lease_timeout_s']}"
                 f" heartbeat_interval_s={leases['heartbeat_interval_s']}"
                 f" heartbeat_timeout_s={leases['heartbeat_timeout_s']}"
+                f" held_ttl_s={leases['held_ttl_s']}"
             ),
             (
                 f"exec: max_output_bytes={execution['max_output_bytes']}"

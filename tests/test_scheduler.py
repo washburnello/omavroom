@@ -134,19 +134,25 @@ def test_warm_seat_is_reused_without_reprovisioning(make_manager):
 # leases / reclaim / wall-clock caps
 # ---------------------------------------------------------------------------
 def test_dead_lease_is_reclaimed_by_heartbeat_timeout(make_manager, clock):
+    """Reclaim is now stasis: the VM is preserved, never destroyed."""
     cfg = _base_config()
     fake = FakeProvisioner()
     mgr = make_manager(cfg, provisioner=fake, free_ram_mb=lambda: 10**9)
     handle = mgr.request_seat("A", "terminal")
     mgr.run_until_idle()
-    vm = mgr.seat_status(handle.request_id).seat.vm_name
+    seat = mgr.seat_status(handle.request_id).seat
+    vm = seat.vm_name
 
     clock.advance(cfg.leases.heartbeat_timeout_s + 1)
     report = mgr.tick()
     assert report.reclaimed == 1
-    assert fake.destroyed == [vm]
-    assert mgr.seat_status(handle.request_id).status == "expired"
-    assert mgr.seat_status(handle.request_id).seat.state == "off"
+    assert fake.destroyed == []
+    assert fake.vms.get(vm) is not None
+    view = mgr.seat_status(handle.request_id)
+    assert view.status == "expired"
+    assert view.seat.state == "held"
+    assert view.seat.last_error == "stale: heartbeat_timeout"
+    assert seat.id in mgr.pool_status().needs_attention
 
 
 def test_wall_clock_cap_reclaims_despite_heartbeats(make_manager, clock):

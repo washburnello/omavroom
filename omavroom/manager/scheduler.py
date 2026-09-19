@@ -14,6 +14,8 @@ Lifecycle / transition table
     ready/busy --reset--> resetting --ok--> ready
     any --> releasing --destroy--> off
     releasing --export failed--> held
+    any --stale lease/heartbeat--> held     (stasis: VM + overlay preserved)
+    held --retry_release/force_discard/held_ttl--> off
     error --prewarm retry--> queued        (bounded, see [prewarm])
     error --reap--> off                     (VM destroyed, row closed)
 
@@ -48,8 +50,12 @@ Leases
 Acquired at admission, not at readiness, so a stuck provision also times
 out. ``expires_at`` is an absolute wall-clock cap (never renewed);
 ``last_heartbeat`` is renewed by the independent heartbeat channel. A lease
-is dead when either passes. Reclaim re-checks liveness inside the release
-transaction, so a heartbeat that lands during the scan saves the seat.
+is dead when either passes. Reclaim moves the seat to **stasis** (``held``)
+with a recorded reason, preserving the VM; if the seat has a recorded export
+intent the normal gated export is attempted automatically. Reclaim re-checks
+liveness inside the stasis transaction, so a heartbeat that lands during the
+scan saves the seat. Stasis is bounded only by ``leases.held_ttl_s`` (0 =
+keep until an operator acts).
 """
 
 from __future__ import annotations
@@ -178,6 +184,7 @@ class PumpReport:
 
     reaped: int = 0
     reclaimed: int = 0
+    held_reaped: int = 0
     evicted: int = 0
     assigned: int = 0
     admitted: int = 0
@@ -191,6 +198,7 @@ class PumpReport:
         return (
             self.reaped
             + self.reclaimed
+            + self.held_reaped
             + self.evicted
             + self.assigned
             + self.admitted
@@ -208,6 +216,9 @@ class ReleaseOutcome:
     held: bool
     export: ExportOutcome | None = None
     message: str = ""
+    #: A seat with no VM to preserve was finalized straight to ``off``
+    #: (stasis had nothing to hold). Counts as reclaimed.
+    finalized: bool = False
 
 
 @dataclass(frozen=True)
@@ -457,6 +468,7 @@ class Scheduler:
         # reach a terminal state, so freeing them before admission matters.
         report.resumed = self.resume_interrupted(now)
         report.reaped = self._reap_errors(now)
+        report.held_reaped = self._reap_held(now)
         report.reclaimed = self.reclaim_expired(now)
         report.evicted = self._evict_idle_for_head(now)
         report.assigned = self._assign_idle(now)
@@ -506,7 +518,13 @@ class Scheduler:
 
     # -- reclaim ---------------------------------------------------------
     def reclaim_expired(self, now: datetime | None = None) -> int:
-        """Destroy seats whose lease died; re-check liveness before acting."""
+        """Move seats whose lease died into **stasis** (``held``), never destroy.
+
+        An expired lease only proves the *agent process* stopped talking, so
+        the VM and overlay are preserved for an operator (or a retry) to
+        recover. Liveness is re-checked inside the transition, so a heartbeat
+        that lands during the scan still saves the seat.
+        """
         moment = now or self._now()
         leases = self.store.read(
             lambda c: st.expired_leases(c, moment, self.config.leases.heartbeat_timeout_s)
@@ -519,19 +537,181 @@ class Scheduler:
             reason = (
                 "lease_expired" if lease.expires_at <= st.fmt_time(moment) else "heartbeat_timeout"
             )
+            repo = seat.export_repo
+            repo_key = repo if repo is not None else None
+            with self.locks.seat_then_repo(seat.name, repo_key):
+                outcome = self._stasis_seat_locked(
+                    seat.id,
+                    now=moment,
+                    reason=f"stale: {reason}",
+                    request_status=st.RequestStatus.EXPIRED.value,
+                    require_dead_lease=True,
+                )
+            if outcome.held or outcome.destroyed or outcome.finalized:
+                reclaimed += 1
+        return reclaimed
+
+    def _stasis_seat_locked(
+        self,
+        seat_id: int,
+        *,
+        now: datetime,
+        reason: str,
+        request_status: str | None,
+        require_dead_lease: bool = False,
+    ) -> ReleaseOutcome:
+        """Preserve a seat in ``held`` (stasis) instead of destroying it.
+
+        The recorded export intent (if any) is attempted through the normal
+        gated ``fetch -> gate -> push`` path so stranded work is not lost. A
+        successful export still leaves the seat ``held`` — only an explicit
+        ``retry_release``/``force_discard`` tears the VM down. A seat with no
+        VM (e.g. a ``queued``/``provisioning`` seat whose lease lapsed) has
+        nothing to preserve, so it is finalized to ``off`` instead of parking
+        in ``held``. Caller holds the seat (and, when exporting, repo) lock.
+        """
+        now_text = st.fmt_time(now)
+        with self.store.transaction() as conn:
+            seat = st.seat_by_id(conn, seat_id)
+            if seat is None:
+                return ReleaseOutcome(seat_id, destroyed=False, held=False, message="no seat")
+            if seat.state in (st.SeatState.OFF.value, st.SeatState.HELD.value):
+                return ReleaseOutcome(
+                    seat_id, destroyed=False, held=False, message=f"state is {seat.state}"
+                )
+            if require_dead_lease:
+                lease = st.active_lease_for_seat(conn, seat_id)
+                if lease is not None and not self._lease_is_dead(lease, now):
+                    return ReleaseOutcome(
+                        seat_id, destroyed=False, held=False, message="lease_still_live"
+                    )
+            repo = seat.export_repo
+            branch = seat.export_branch
+            ref = seat.export_ref
+            if seat.vm_name is None:
+                # Nothing to preserve (queued/provisioning, or a VM that
+                # already vanished): finalize to ``off`` rather than parking a
+                # VM-less row in ``held`` and occupying capacity forever.
+                st.update_seat(
+                    conn,
+                    seat_id,
+                    state=st.SeatState.OFF.value,
+                    vm_name=None,
+                    agent_label=None,
+                    last_error=reason,
+                    pending_action=None,
+                    pending_export=None,
+                    pending_repo=None,
+                    pending_branch=None,
+                    pending_ref=None,
+                    pending_request_status=None,
+                    export_repo=None,
+                    export_branch=None,
+                    export_ref=None,
+                    now=now_text,
+                )
+                self._close_lease(conn, seat_id, request_status, now_text)
+                st.log_event(
+                    conn,
+                    event_type="seat_stasis_finalized",
+                    now=now_text,
+                    seat_id=seat_id,
+                    detail=f"{reason} (no VM to preserve)",
+                )
+                return ReleaseOutcome(
+                    seat_id,
+                    destroyed=False,
+                    held=False,
+                    finalized=True,
+                    message=reason,
+                )
+            st.update_seat(
+                conn,
+                seat_id,
+                state=st.SeatState.HELD.value,
+                last_error=reason,
+                pending_action="release",
+                pending_export=1 if repo is not None else 0,
+                pending_repo=repo,
+                pending_branch=branch,
+                pending_ref=ref,
+                pending_request_status=request_status,
+                now=now_text,
+            )
+            self._close_lease(conn, seat_id, request_status, now_text)
+            st.log_event(
+                conn,
+                event_type="seat_stasis",
+                now=now_text,
+                seat_id=seat_id,
+                detail=reason,
+            )
+            seat = st.seat_by_id(conn, seat_id)
+        export_outcome: ExportOutcome | None = None
+        if repo is not None and seat.vm_name is not None:
+            export_outcome = self._export_locked(
+                seat, ExportSpec(repo=repo, branch=branch, ref=ref)
+            )
+            with self.store.transaction() as conn:
+                if not export_outcome.ok:
+                    # Surface why the auto-export failed in `omavroom status`
+                    # / needs-attention, keeping the "stale: ..." stasis
+                    # context so the operator can see the seat was reclaimed.
+                    st.update_seat(
+                        conn,
+                        seat_id,
+                        last_error=f"{reason}: export failed: {export_outcome.message}",
+                        now=st.fmt_time(self._now()),
+                    )
+                st.log_event(
+                    conn,
+                    event_type="seat_stasis_export",
+                    now=st.fmt_time(self._now()),
+                    seat_id=seat_id,
+                    detail=(
+                        f"repo={repo} ok={export_outcome.ok}"
+                        + ("" if export_outcome.ok else f": {export_outcome.message}")
+                    ),
+                )
+        return ReleaseOutcome(
+            seat_id, destroyed=False, held=True, export=export_outcome, message=reason
+        )
+
+    # -- held-TTL reaper -------------------------------------------------
+    def _reap_held(self, now: datetime) -> int:
+        """Auto-discard ``held`` seats once ``leases.held_ttl_s`` has elapsed.
+
+        ``held_ttl_s = 0`` (the default) keeps stasis seats until an operator
+        acts; a positive value bounds how long a preserved VM occupies
+        capacity. Auto-discard never exports (the operator path still can).
+        """
+        ttl = self.config.leases.held_ttl_s
+        if ttl <= 0:
+            return 0
+        held = self.store.read(
+            lambda c: [s for s in st.list_seats(c) if s.state == st.SeatState.HELD.value]
+        )
+        reaped = 0
+        for seat in held:
+            try:
+                held_since = st.parse_time(seat.updated_at)
+            except (ValueError, TypeError):
+                continue
+            if now < st.plus_seconds(held_since, ttl):
+                continue
             with self.locks.seat(seat.name):
                 outcome = self._release_seat_locked(
                     seat.id,
-                    now=moment,
+                    now=now,
                     export=False,
                     repo=None,
                     request_status=st.RequestStatus.EXPIRED.value,
-                    reason=reason,
-                    require_dead_lease=True,
+                    reason="held_ttl_expired",
+                    require_state=st.SeatState.HELD.value,
                 )
-            if outcome.destroyed or outcome.held:
-                reclaimed += 1
-        return reclaimed
+            if outcome.destroyed:
+                reaped += 1
+        return reaped
 
     # -- error-seat reaper (FIX 3) --------------------------------------
     def _reap_errors(self, now: datetime) -> int:
@@ -1423,6 +1603,37 @@ class Scheduler:
                 )
         return ExportOutcome(fetched=fetched, gate=decision, pushed=pushed)
 
+    def record_export_intent(
+        self,
+        seat_id: int,
+        *,
+        repo: str | None,
+        branch: str | None = None,
+        ref: str | None = None,
+    ) -> None:
+        """Persist the durable export intent stasis re-runs on reclaim.
+
+        Called only by explicit export requests (:meth:`export_seat`), whose
+        ``repo`` is the **host path** the real push path uses — never the
+        clone URL from ``prepare_repo``. ``repo is None`` is a no-op so a
+        repo-less request never erases a real intent.
+        """
+        if repo is None:
+            return
+        now_text = st.fmt_time(self._now())
+        with self.store.transaction() as conn:
+            seat = st.seat_by_id(conn, seat_id)
+            if seat is None:
+                raise KeyError(f"no such seat: {seat_id}")
+            st.update_seat(
+                conn,
+                seat_id,
+                export_repo=repo,
+                export_branch=branch,
+                export_ref=ref,
+                now=now_text,
+            )
+
     def export_seat(
         self,
         seat_id: int,
@@ -1437,11 +1648,13 @@ class Scheduler:
         host-side push knows the task branch and explicit destination; without
         them a manager-mediated export cannot resolve a push target. Failure
         never mutates the seat: it stays ``ready`` (no push, no destroy) so
-        the caller can retry or release later.
+        the caller can retry or release later. The destination is recorded as
+        the seat's durable export intent so a later stasis can re-run it.
         """
         seat = self._get_seat(seat_id)
         if seat.vm_name is None:
             return ExportOutcome(fetched=FetchResult(ok=False, message="seat has no VM to export"))
+        self.record_export_intent(seat_id, repo=repo, branch=branch, ref=ref)
         with self.locks.seat_then_repo(seat.name, repo):
             fresh = self._get_seat(seat_id)
             if fresh.vm_name is None:

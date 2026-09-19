@@ -258,7 +258,19 @@ task, or investigation, owning tabs and panes, with agent states
   push-from-guest was a leftover from before the host-side-agent topology
   was locked; host-driven export fits that topology and removes the
   secret entirely.)
-- Git auth in VMs: plain scoped fine-grained **PAT** for v1; proxy later.
+- Seat lifetime: **agents never babysit heartbeats.** The MCP server
+  refreshes the lease on the agent's behalf for any seat the session is
+  using; a heartbeat timeout therefore only means the agent process/MCP
+  actually died, never "the agent was busy for five minutes".
+- Stasis, not teardown: a stale seat is **preserved** (state `held`) with a
+  reason, never destroyed. It surfaces in Needs attention with
+  retry-release (export → destroy) and force-discard. `lease.held_ttl_s`
+  (`0` = keep until an operator acts) is the only automatic teardown, and it
+  discards without export — a capacity-vs-work-loss trade-off.
+- Automated exfiltration: on entering stasis, if a host export intent was
+  recorded (an explicit `export_seat`), the normal gated export runs
+  automatically and the outcome is recorded; with no intent the VM is held.
+  Export intent is a **host repo path**, never a clone URL.
 - Daemon language: **Python** (FastMCP server; fastest path to a working
   proof; clean QEMU/MCP boundary preserved in case of a later rewrite).
 - Command Center: accepted as the post-core UI milestone — a **native

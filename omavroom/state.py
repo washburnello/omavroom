@@ -35,7 +35,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 
@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS seats (
     pending_branch TEXT,
     pending_ref TEXT,
     pending_request_status TEXT,
+    export_repo TEXT,
+    export_branch TEXT,
+    export_ref TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -165,6 +168,16 @@ _SEAT_PENDING_COLUMNS: tuple[tuple[str, str], ...] = (
     ("pending_request_status", "TEXT"),
 )
 
+#: ``seats`` columns added by the v4 migration: the durable export intent
+#: (repo/branch/ref) recorded by ``prepare_repo``/``export_seat``. Stasis
+#: (heartbeat/lease reclaim) re-runs the normal gated export against this
+#: intent instead of destroying the VM.
+_SEAT_EXPORT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("export_repo", "TEXT"),
+    ("export_branch", "TEXT"),
+    ("export_ref", "TEXT"),
+)
+
 
 def utcnow() -> datetime:
     """Return the current time as a timezone-aware UTC datetime."""
@@ -203,6 +216,9 @@ class Seat:
     pending_branch: str | None
     pending_ref: str | None
     pending_request_status: str | None
+    export_repo: str | None
+    export_branch: str | None
+    export_ref: str | None
     created_at: str
     updated_at: str
 
@@ -268,9 +284,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     events/audit table. That skeleton was never deployed, so a database
     still at ``user_version = 0`` that already has a ``seats`` table is
     dropped and recreated. Later versions are migrated in place: v1 added
-    ``seats.attempts`` (bounded prewarm retries) and v3 added the
+    ``seats.attempts`` (bounded prewarm retries), v3 added the
     ``pending_*`` release/reset intent columns (interrupted-operation
-    recovery).
+    recovery), and v4 added the durable ``export_*`` intent columns that
+    stasis re-runs instead of destroying the VM.
     """
     version = conn.execute("PRAGMA user_version;").fetchone()[0]
     existing = set(list_tables(conn))
@@ -290,6 +307,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     if "seats" in existing and version < 3:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(seats);").fetchall()}
         for name, ddl in _SEAT_PENDING_COLUMNS:
+            if name not in columns:
+                conn.execute(f"ALTER TABLE seats ADD COLUMN {name} {ddl};")
+    if "seats" in existing and version < 4:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(seats);").fetchall()}
+        for name, ddl in _SEAT_EXPORT_COLUMNS:
             if name not in columns:
                 conn.execute(f"ALTER TABLE seats ADD COLUMN {name} {ddl};")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION};")
@@ -323,6 +345,9 @@ def _seat(row: sqlite3.Row) -> Seat:
         pending_branch=row["pending_branch"],
         pending_ref=row["pending_ref"],
         pending_request_status=row["pending_request_status"],
+        export_repo=row["export_repo"],
+        export_branch=row["export_branch"],
+        export_ref=row["export_ref"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -406,6 +431,9 @@ def update_seat(
     pending_branch: object = _UNSET,
     pending_ref: object = _UNSET,
     pending_request_status: object = _UNSET,
+    export_repo: object = _UNSET,
+    export_branch: object = _UNSET,
+    export_ref: object = _UNSET,
     now: str,
 ) -> None:
     sets = ["updated_at = ?"]
@@ -422,6 +450,9 @@ def update_seat(
         ("pending_branch", pending_branch),
         ("pending_ref", pending_ref),
         ("pending_request_status", pending_request_status),
+        ("export_repo", export_repo),
+        ("export_branch", export_branch),
+        ("export_ref", export_ref),
     ):
         if value is not _UNSET:
             sets.append(f"{column} = ?")

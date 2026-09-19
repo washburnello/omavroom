@@ -30,7 +30,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from omavroom.client import DaemonClient
 from omavroom.config import Config
+from omavroom.daemon import DaemonServer
 from omavroom.manager import Manager
 from omavroom.manager.libvirt_provisioner import (
     SEAT_DOMAIN_PREFIX,
@@ -38,6 +40,7 @@ from omavroom.manager.libvirt_provisioner import (
 )
 from omavroom.manager.provisioner import ExportSpec, RepoSpec, ResourceCaps
 from omavroom.manager.scheduler import read_free_ram_mb
+from omavroom.mcp.server import OmavroomTools
 
 pytestmark = pytest.mark.integration
 
@@ -455,3 +458,81 @@ def test_two_concurrent_terminal_seats_get_distinct_static_ips(env, tmp_path: Pa
             except Exception:  # noqa: BLE001 - teardown must be best-effort
                 pass
     _assert_clean(env.prov)
+
+
+# --------------------------------------------------------------------------
+# seat-lifetime automation: MCP auto-heartbeat + stasis (never destroy)
+# --------------------------------------------------------------------------
+def test_seat_stasis_and_mcp_autoheartbeat(env, tmp_path: Path) -> None:
+    """Reproduce the original failure and prove the fix on a real seat.
+
+    (a) Holding the seat past the heartbeat timeout without an explicit
+        heartbeat survives, because the MCP server beats on the agent's behalf.
+    (b) With beating stopped the seat enters stasis (``held``): it is NOT
+        destroyed, the VM is preserved for recovery, and an operator can still
+        discard it.
+    """
+    env.cfg.leases.heartbeat_timeout_s = 15
+    env.cfg.leases.heartbeat_interval_s = 5
+    env.cfg.leases.lease_timeout_s = 600
+
+    mgr = _manager(env, tmp_path)
+    socket_path = tmp_path / "run" / "daemon.sock"
+    server = DaemonServer(mgr, socket_path=socket_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not socket_path.exists():
+        if time.monotonic() >= deadline:  # pragma: no cover - startup guard
+            raise RuntimeError("integration daemon never started")
+        time.sleep(0.05)
+    client = DaemonClient(socket_path=socket_path)
+    tools = OmavroomTools(client, heartbeat_interval_s=5, heartbeat_timeout_s=15)
+    seat_id: int | None = None
+    try:
+        handle = mgr.request_seat("integration-stasis", "terminal")
+        view = handle.wait_ready(timeout=300)
+        assert view.seat is not None and view.seat.state == "ready", view
+        seat_id = view.seat.id
+        vm_ref = view.seat.vm_name
+        assert vm_ref is not None
+        # Register the seat with the MCP server (its normal tracking path).
+        tools.wait_for_seat(handle.request_id, timeout_s=5)
+        assert seat_id in tools.heartbeats.tracked()
+        print(f"\n[stasis] ready seat={view.seat.name} vm={vm_ref}")
+
+        # (a) No explicit heartbeat for > heartbeat_timeout_s: MCP keeps it.
+        time.sleep(env.cfg.leases.heartbeat_timeout_s + 5)
+        live = next(s for s in mgr.pool_status().seats if s.id == seat_id)
+        assert live.state in ("ready", "busy"), live
+        info = env.prov.attach(vm_ref)
+        assert info is not None and info.state == "running", info
+        print("[stasis] seat survived past heartbeat timeout via MCP auto-heartbeat")
+
+        # (b) Stop beating (simulate the MCP server process dying).
+        tools.stop()
+        deadline = time.monotonic() + (env.cfg.leases.heartbeat_timeout_s + 45)
+        held = None
+        while time.monotonic() < deadline:
+            row = next(s for s in mgr.list_seats(include_history=True) if s.id == seat_id)
+            if row.state == "held":
+                held = row
+                break
+            time.sleep(1)
+        assert held is not None, "seat never entered stasis"
+        assert held.vm_name == vm_ref, "stasis destroyed or lost the VM reference"
+        assert env.prov.attach(vm_ref) is not None, "stasis destroyed the VM"
+        assert held.last_error == "stale: heartbeat_timeout", held.last_error
+        assert seat_id in mgr.pool_status().needs_attention
+        print("[stasis] heartbeat lapse -> held; VM and overlay preserved")
+    finally:
+        tools.stop()
+        client.close()
+        if seat_id is not None:
+            try:
+                mgr.force_discard(seat_id, reason="integration_cleanup").result(timeout=180)
+            except Exception:  # noqa: BLE001 - teardown must be best-effort
+                pass
+        server.shutdown()
+        thread.join(timeout=5)
+        _assert_clean(env.prov)

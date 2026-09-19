@@ -38,6 +38,16 @@ for long commands (test suites, builds, servers): ``exec_start`` returns an
 ``stdout``/``stderr``/``exit_code``/``truncated``, and ``exec_kill``
 terminates it.
 
+Auto-heartbeat
+--------------
+While this server holds a seat it beats that seat's lease for the agent
+(:class:`HeartbeatMonitor`): a background thread refreshes every tracked seat
+at ``min(heartbeat_interval_s, heartbeat_timeout_s / 2)`` and each tool call
+refreshes opportunistically. Agents therefore never have to babysit
+``heartbeat``; a heartbeat timeout only detects a dead MCP server process. When
+that happens the daemon puts the seat into **stasis** (``held``) rather than
+destroying it.
+
 Auto-start
 ----------
 If the daemon socket is not live, the server starts ``python -m
@@ -58,6 +68,7 @@ import os
 import socket as _socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -66,7 +77,13 @@ from pathlib import Path
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 
-from omavroom.client import DaemonClient, DaemonClientError, DaemonNotRunning
+from omavroom.client import (
+    DaemonClient,
+    DaemonClientError,
+    DaemonNotRunning,
+    DaemonRequestError,
+)
+from omavroom.config import Config
 from omavroom.daemon import (
     PROVISIONER_CHOICES,
     default_log_path,
@@ -85,6 +102,10 @@ DEFAULT_EXEC_RUN_TIMEOUT_S = 30
 DEFAULT_WAIT_TIMEOUT_S = 60.0
 DEFAULT_JOB_TIMEOUT_S = 600.0
 POLL_INTERVAL_S = 0.05
+#: Fallback auto-heartbeat cadence/budget for this MCP server, used only when
+#: the caller does not pass the daemon's effective ``[leases]`` values.
+DEFAULT_HEARTBEAT_INTERVAL_S = 60
+DEFAULT_HEARTBEAT_TIMEOUT_S = 300
 #: Engine timeout headroom for ``exec_run`` so its bounded client-side kill is
 #: deterministic rather than racing the engine's own wall-clock timeout.
 _EXEC_RUN_KILL_GRACE_S = 5
@@ -133,6 +154,81 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
 
 class MCPDaemonError(RuntimeError):
     """The MCP server could not reach or start the daemon."""
+
+
+class HeartbeatMonitor:
+    """Best-effort heartbeat refresher for seats this MCP server is using.
+
+    The MCP server is the agent's proxy, so the agent must not have to call
+    ``heartbeat`` itself. Every tracked seat is beaten on a background daemon
+    thread at a safe cadence -- ``min(interval, timeout/2)`` -- and
+    opportunistically on each tool call. A heartbeat timeout then only detects
+    a genuinely dead MCP server process (which stops beating), never a busy
+    agent. Beats never raise into a tool call and never kill the thread.
+
+    ``beat(seat_id)`` returns ``False`` when the seat no longer has an active
+    lease (gone/held/off), which stops tracking; anything else keeps it.
+    """
+
+    #: Floor for the cadence so a pathological config cannot busy-loop.
+    MIN_INTERVAL_S = 0.05
+
+    def __init__(self, beat: Callable[[int], bool], *, interval_s: float, timeout_s: float) -> None:
+        self._beat = beat
+        self.interval_s = max(self.MIN_INTERVAL_S, min(float(interval_s), float(timeout_s) / 2.0))
+        self._seats: set[int] = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def track(self, seat_id: int) -> None:
+        """Start (or keep) beating a seat."""
+        with self._lock:
+            self._seats.add(int(seat_id))
+
+    def forget(self, seat_id: int) -> None:
+        """Stop beating a seat (released, discarded, or no longer leased)."""
+        with self._lock:
+            self._seats.discard(int(seat_id))
+
+    def tracked(self) -> set[int]:
+        with self._lock:
+            return set(self._seats)
+
+    def refresh(self, seat_id: int | None = None) -> None:
+        """Best-effort beat now (one seat, or every tracked seat); never raises."""
+        targets = [seat_id] if seat_id is not None else sorted(self.tracked())
+        for target in targets:
+            self._beat_one(target)
+
+    def _beat_one(self, seat_id: int) -> None:
+        try:
+            alive = self._beat(seat_id)
+        except Exception:  # noqa: BLE001 - a heartbeat must never break a tool call
+            log.debug("heartbeat refresh failed for seat %s", seat_id, exc_info=True)
+            return
+        if alive is False:
+            self.forget(seat_id)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="omavroom-mcp-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            self.refresh()
+
+    def stop(self) -> None:
+        """Stop the background thread (idempotent; safe from any thread)."""
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
 
 
 # --------------------------------------------------------------------------
@@ -251,9 +347,50 @@ class OmavroomTools:
         client: DaemonClient,
         *,
         client_factory: Callable[[], DaemonClient] | None = None,
+        heartbeat_interval_s: float | None = None,
+        heartbeat_timeout_s: float | None = None,
+        autostart_heartbeat: bool = True,
     ) -> None:
         self.client = client
         self._client_factory = client_factory
+        self.heartbeats = HeartbeatMonitor(
+            self._beat_seat,
+            interval_s=(
+                DEFAULT_HEARTBEAT_INTERVAL_S
+                if heartbeat_interval_s is None
+                else heartbeat_interval_s
+            ),
+            timeout_s=(
+                DEFAULT_HEARTBEAT_TIMEOUT_S if heartbeat_timeout_s is None else heartbeat_timeout_s
+            ),
+        )
+        if autostart_heartbeat:
+            self.heartbeats.start()
+
+    # -- auto-heartbeat --------------------------------------------------
+    def _beat_seat(self, seat_id: int) -> bool:
+        """One best-effort beat; ``False`` means the seat is no longer leased.
+
+        ``not_found`` (no active lease: released, held, or off) stops
+        tracking. Any other failure (daemon briefly unavailable, timeout) is
+        transient and keeps the seat tracked.
+        """
+        try:
+            self.client.heartbeat(seat_id=seat_id)
+        except DaemonRequestError as exc:
+            return exc.code != "not_found"
+        except DaemonClientError:
+            return True
+        return True
+
+    def _use_seat(self, seat_id: int) -> None:
+        """Track a seat and refresh it opportunistically (best-effort)."""
+        self.heartbeats.track(seat_id)
+        self.heartbeats.refresh(seat_id)
+
+    def stop(self) -> None:
+        """Stop the auto-heartbeat thread (call on server shutdown)."""
+        self.heartbeats.stop()
 
     @contextmanager
     def _desktop_session(self):
@@ -307,6 +444,7 @@ class OmavroomTools:
         ``max_total_output_bytes=None`` for the full per-record rings
         (use ``exec_poll`` for one exec's output).
         """
+        self._use_seat(seat_id)
         return self.client.list_execs(
             seat_id,
             include_output=include_output,
@@ -328,11 +466,14 @@ class OmavroomTools:
         """
         pending = self.client.request_seat(agent_label, seat_type, image=image, project=project)
         view = pending.status()
+        seat = view.get("seat")
+        if isinstance(seat, dict) and seat.get("id") is not None:
+            self._use_seat(int(seat["id"]))
         return {
             "request_id": pending.request_id,
             "status": view.get("status"),
             "position": view.get("position"),
-            "seat": view.get("seat"),
+            "seat": seat,
         }
 
     def wait_for_seat(self, request_id: int, timeout_s: float = DEFAULT_WAIT_TIMEOUT_S) -> dict:
@@ -347,6 +488,9 @@ class OmavroomTools:
                 break
             time.sleep(POLL_INTERVAL_S)
             view = self.client.seat_status(request_id)
+        seat = view.get("seat")
+        if isinstance(seat, dict) and seat.get("id") is not None:
+            self._use_seat(int(seat["id"]))
         return view
 
     def heartbeat(
@@ -356,7 +500,10 @@ class OmavroomTools:
         lease_id: int | None = None,
     ) -> dict:
         """Renew the lease on the independent channel (long execs stay live)."""
-        return self.client.heartbeat(seat_id=seat_id, request_id=request_id, lease_id=lease_id)
+        lease = self.client.heartbeat(seat_id=seat_id, request_id=request_id, lease_id=lease_id)
+        if isinstance(lease, dict) and lease.get("seat_id") is not None:
+            self.heartbeats.track(int(lease["seat_id"]))
+        return lease
 
     # -- exec ------------------------------------------------------------
     def exec_start(
@@ -371,6 +518,7 @@ class OmavroomTools:
         Output streams into a bounded ring buffer; poll with ``exec_poll`` and
         stop it with ``exec_kill``. Use ``exec_run`` instead for short commands.
         """
+        self._use_seat(seat_id)
         exec_id = _new_exec_id()
         view = self.client.exec_start(
             seat_id, exec_id, command=command, label=label, timeout_s=timeout_s
@@ -381,6 +529,7 @@ class OmavroomTools:
 
     def exec_poll(self, seat_id: int, exec_id: str) -> dict:
         """Poll an exec: ``state``, bounded ``stdout``/``stderr``, ``exit_code``."""
+        self._use_seat(seat_id)
         return self.client.exec_poll(seat_id, exec_id)
 
     def exec_kill(self, seat_id: int, exec_id: str, signal: int = 9) -> dict:
@@ -390,6 +539,7 @@ class OmavroomTools:
         **not** delivered to the guest process. The transport kills the local
         ``ssh`` process, closing the channel.
         """
+        self._use_seat(seat_id)
         return self.client.exec_kill(seat_id, exec_id, signal=signal)
 
     def exec_run(
@@ -407,6 +557,7 @@ class OmavroomTools:
         """
         if timeout_s is None or timeout_s < 1:
             raise ValueError("timeout_s must be >= 1")
+        self._use_seat(seat_id)
         exec_id = _new_exec_id()
         # The engine gets a longer timeout than the agent-facing deadline, so
         # the bounded client-side kill is the deterministic path; the engine
@@ -440,6 +591,7 @@ class OmavroomTools:
         Returns MCP image content (so the agent can look at it) plus the same
         PNG as base64 text for callers that want the bytes.
         """
+        self._use_seat(seat_id)
         with self._desktop_session() as client:
             data = client.screenshot(seat_id, max_width=max_width, max_bytes=max_bytes)
         return [Image(data=data, format="png"), base64.b64encode(data).decode("ascii")]
@@ -457,11 +609,13 @@ class OmavroomTools:
                 wire.append(InputEvent(kind=event.get("kind"), value=event.get("value")))
             else:
                 raise ValueError("each input event must be an object")
+        self._use_seat(seat_id)
         with self._desktop_session() as client:
             return client.input(seat_id, wire)
 
     def peek_endpoint(self, seat_id: int) -> dict:
         """Resolve the on-demand viewer endpoint (never opens a window)."""
+        self._use_seat(seat_id)
         with self._desktop_session() as client:
             return {"endpoint": client.peek_endpoint(seat_id)}
 
@@ -476,6 +630,7 @@ class OmavroomTools:
     # -- repo / teardown (long ops: return a job_id) ---------------------
     def prepare_repo(self, seat_id: int, url: str, branch: str | None = None) -> dict:
         """Clone a credential-free repository into the seat (long op -> job_id)."""
+        self._use_seat(seat_id)
         handle = self.client.prepare_repo(seat_id, RepoSpec(url=url, branch=branch))
         return {"job_id": handle.job_id}
 
@@ -487,6 +642,7 @@ class OmavroomTools:
         ref: str | None = None,
     ) -> dict:
         """Export the seat's committed work (long op -> job_id; keeps the seat)."""
+        self._use_seat(seat_id)
         handle = self.client.export_seat(seat_id, repo=repo, branch=branch, ref=ref)
         return {"job_id": handle.job_id}
 
@@ -499,22 +655,27 @@ class OmavroomTools:
         ref: str | None = None,
     ) -> dict:
         """Export (optional), then destroy the seat VM (long op -> job_id)."""
+        self._use_seat(seat_id)
         handle = self.client.release_seat(seat_id, repo=repo, export=export, branch=branch, ref=ref)
         return {"job_id": handle.job_id}
 
     def reset_seat(self, seat_id: int) -> dict:
         """Revert a seat's overlay to the golden image (long op -> job_id)."""
+        self._use_seat(seat_id)
         handle = self.client.reset_seat(seat_id)
         return {"job_id": handle.job_id}
 
     def retry_release(self, seat_id: int) -> dict:
         """Retry a stuck seat's persisted release/export (long op -> job_id)."""
+        self._use_seat(seat_id)
         handle = self.client.retry_release(seat_id)
         return {"job_id": handle.job_id}
 
     def force_discard(self, seat_id: int, reason: str = "force_discard") -> dict:
         """Operator escape hatch: destroy a stuck seat without export (long op)."""
+        self._use_seat(seat_id)
         handle = self.client.force_discard(seat_id, reason=reason)
+        self.heartbeats.forget(seat_id)
         return {"job_id": handle.job_id}
 
     def reconcile(self) -> dict:
@@ -620,7 +781,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"omavroom-mcp: {exc}", file=sys.stderr)
         return 1
 
-    tools = OmavroomTools(client, client_factory=_client_factory_from(client))
+    # Use the same lease budget the daemon enforces; fall back to the built-in
+    # defaults if the local config cannot be read.
+    try:
+        leases = Config.load().leases
+    except (OSError, ValueError):
+        leases = None
+    tools = OmavroomTools(
+        client,
+        client_factory=_client_factory_from(client),
+        heartbeat_interval_s=leases.heartbeat_interval_s if leases else None,
+        heartbeat_timeout_s=leases.heartbeat_timeout_s if leases else None,
+    )
     server = build_server(tools)
     try:
         server.run()
@@ -628,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"omavroom-mcp: daemon connection lost: {exc}", file=sys.stderr)
         return 1
     finally:
+        tools.stop()
         client.close()
     return 0
 
@@ -638,9 +811,12 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "DEFAULT_EXEC_RUN_TIMEOUT_S",
+    "DEFAULT_HEARTBEAT_INTERVAL_S",
+    "DEFAULT_HEARTBEAT_TIMEOUT_S",
     "DEFAULT_INSTRUCTIONS",
     "MCP_TOOL_NAMES",
     "MCPDaemonError",
+    "HeartbeatMonitor",
     "OmavroomTools",
     "build_server",
     "ensure_daemon_client",

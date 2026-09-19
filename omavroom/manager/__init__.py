@@ -613,7 +613,14 @@ class Manager:
         return self._submit(job)
 
     def prepare_repo(self, seat_id: int, spec: RepoSpec) -> Handle:
-        """Inject a repository into a ready seat on the worker."""
+        """Inject a repository into a ready seat on the worker.
+
+        ``spec.url`` is a *clone source*, not an export destination, so it is
+        deliberately **not** recorded as the seat's durable export intent. A
+        later stasis re-runs the export only for an explicit
+        ``export_seat``/release intent, whose ``repo`` is the host path the
+        real push path uses.
+        """
 
         def job() -> None:
             with self._seat_guard(seat_id) as vm_ref:

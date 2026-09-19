@@ -5,14 +5,17 @@ ever touching the operator's desktop session. Agents run on the host; each
 agent gets its own disposable VM seat — `desktop` (a real Omarchy/Hyprland
 guest whose screen exists only as a framebuffer, never rendered on the
 host) or headless `terminal` — does its work, pushes it to a repo, and
-releases the seat, which destroys the VM. See `PLAN.md` for the full
-design and `PHASES.md` for the build order.
+releases the seat, which destroys the VM. If an agent instead goes away
+without releasing, omavroom preserves the seat's VM in stasis (`held`) for
+recovery, never destroying it. See `PLAN.md` for the full design and
+`PHASES.md` for the build order.
 
 > Phase 6 adds the operator CLI and the metadata-only Textual TUI companion.
 > Phase 5 landed the real exec engine (per-exec worker threads, streaming ring
 > buffers, kill/timeout) and the FastMCP server. Phase 4 added the scheduler +
-> state core (atomic claiming, fair queue, leases/heartbeats with auto-reclaim,
-> dynamic admission, destroy-on-release, content-gated export,
+> state core (atomic claiming, fair queue, auto-heartbeat/leases with
+> stasis-on-stale — a lapsed lease preserves the VM, it never auto-destroys,
+> dynamic admission, destroy-on-explicit-release, content-gated export,
 > reattach/reconcile) and the Phase 4B libvirt provisioner. Tests exercise
 > everything against an in-process `FakeProvisioner` (no VMs, no sudo).
 

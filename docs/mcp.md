@@ -102,7 +102,7 @@ of them with `"tools": { "omavroom*": false }`.
 | `list_execs` | `list_execs(seat_id, include_output=True, max_total_output_bytes=8192)` | `list[dict]` (bounded; `None` = full rings) |
 | `request_seat` | `request_seat(agent_label, seat_type, image=None, project=None)` | `dict` with `request_id` (queues if full) |
 | `wait_for_seat` | `wait_for_seat(request_id, timeout_s=60)` | `dict` (bounded poll) |
-| `heartbeat` | `heartbeat(seat_id=None, request_id=None, lease_id=None)` | `dict` (lease view) |
+| `heartbeat` | `heartbeat(seat_id=None, request_id=None, lease_id=None)` | `dict` (lease view; automatic — agents normally need not call it) |
 | `exec_start` | `exec_start(seat_id, command, label=None, timeout_s=None)` | `dict` with `exec_id` (async) |
 | `exec_poll` | `exec_poll(seat_id, exec_id)` | `dict` — `state`, bounded `stdout`/`stderr`, `exit_code`, `truncated` |
 | `exec_kill` | `exec_kill(seat_id, exec_id, signal=9)` | `dict` (terminal view) |
@@ -142,8 +142,21 @@ exec_kill(seat_id, exec_id)  -> terminal view
 `job_id` immediately. Poll with `job_poll` or `job_wait` (bounded). Nothing
 agent-facing blocks indefinitely.
 
-**Heartbeats.** `heartbeat` is its own channel: a long-running exec never
-makes the agent look dead, as long as the agent keeps heartbeating the lease.
+**Heartbeats and seat lifetime.** Agents do **not** babysit heartbeats.
+omavroom owns the seat lifetime: the MCP server auto-beats every tracked
+seat's lease on a background thread (at `min(heartbeat_interval_s,
+heartbeat_timeout_s/2)`) and refreshes opportunistically on each tool call.
+A long-running exec therefore never makes the agent look dead. A heartbeat
+timeout only detects a genuinely dead MCP server process.
+
+When a lease does lapse, the daemon does not destroy the seat: it puts it
+into **stasis** (`held`), preserving the VM and overlay. If a durable export
+intent was recorded by an explicit `export_seat`, the normal gated
+fetch → gate → push runs automatically; a seat with nothing to preserve (no
+VM) is finalized to `off` instead. Stasis is visible in `omavroom status`
+and the *needs-attention* panel. Recover with `retry_release` (re-run the
+export, then destroy) or tear it down with `force_discard`; `leases.held_ttl_s`
+(default `0` = keep indefinitely) can bound how long stasis holds a seat.
 
 **Screenshots.** `screenshot` returns the PNG as MCP image content (the agent
 reads it) *and* as base64 text. The daemon downscales to `max_width` (default
@@ -168,7 +181,7 @@ wait_for_seat(request_id)              # -> seat.id
 prepare_repo(seat_id, url) + job_wait  # optional
 exec_run(seat_id, "git status")        # short
 exec_start(seat_id, "make test")       # long
-exec_poll(seat_id, exec_id) ... heartbeat(seat_id=...) ...
+exec_poll(seat_id, exec_id) ...          # heartbeat is automatic
 screenshot(seat_id); input(seat_id, [...])
 export_seat(seat_id, repo=...) + job_wait
 release_seat(seat_id, repo=..., branch="task") + job_wait

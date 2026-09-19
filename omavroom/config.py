@@ -47,6 +47,7 @@ defaults for anything unset:
     lease_timeout_s = 1800
     heartbeat_interval_s = 60
     heartbeat_timeout_s = 300
+    held_ttl_s = 0
     [exec]
     max_output_bytes = 1048576
     max_runtime_s = 3600
@@ -156,6 +157,7 @@ _SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "lease_timeout_s": _INT,
         "heartbeat_interval_s": _INT,
         "heartbeat_timeout_s": _INT,
+        "held_ttl_s": _INT,
     },
     "exec": {
         "max_output_bytes": _INT,
@@ -437,11 +439,17 @@ class AdmissionConfig:
 
 @dataclass
 class LeaseConfig:
-    """Lease + heartbeat timeouts (reclaim logic lives in the scheduler)."""
+    """Lease + heartbeat timeouts (reclaim logic lives in the scheduler).
+
+    ``held_ttl_s`` bounds how long a seat may sit in ``held`` (stasis) before
+    the pump auto-discards it. ``0`` (the default) means "keep until an
+    operator acts" — stasis never destroys on its own.
+    """
 
     lease_timeout_s: int = 1800
     heartbeat_interval_s: int = 60
     heartbeat_timeout_s: int = 300
+    held_ttl_s: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -455,6 +463,8 @@ class LeaseConfig:
             raise ValueError("heartbeat_timeout_s must be >= heartbeat_interval_s")
         if self.lease_timeout_s < self.heartbeat_timeout_s:
             raise ValueError("lease_timeout_s must be >= heartbeat_timeout_s")
+        if self.held_ttl_s < 0:
+            raise ValueError("held_ttl_s must be >= 0")
 
 
 @dataclass
