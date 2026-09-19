@@ -871,3 +871,39 @@ def test_ensure_identity_pins_known_hosts_at_static_ip(tmp_path: Path) -> None:
     known_hosts = (prov.seats_dir / "terminal-1" / "known_hosts").read_text(encoding="utf-8")
     assert known_hosts.startswith("192.168.122.209 ssh-ed25519 ")
     assert any("Address=192.168.122.209/24" in cmd for cmd in prov.agent_commands)
+
+
+# --------------------------------------------------------------------------
+# peek_endpoint: autoport VNC port recovery
+# --------------------------------------------------------------------------
+def test_peek_endpoint_falls_back_to_live_xml_on_port_zero(tmp_path: Path) -> None:
+    """``domdisplay`` reporting ``:0`` must not strand a real autoport VNC.
+
+    Some libvirt/QEMU combinations leave ``domdisplay`` at ``vnc://...:0`` for
+    a running autoport domain while the live XML holds the assigned port.
+    """
+
+    def runner(argv, timeout, input_text) -> CommandResult:
+        if "domdisplay" in argv:
+            return CommandResult(0, "vnc://127.0.0.1:0\n", "")
+        if "dumpxml" in argv:
+            return CommandResult(
+                0,
+                "<graphics type='vnc' port='5903' autoport='yes' listen='127.0.0.1'>\n"
+                "</graphics>\n",
+                "",
+            )
+        return CommandResult(1, "", "unexpected")
+
+    prov = LibvirtProvisioner(Config.default(), base_dir=tmp_path, host_runner=runner)
+    assert prov.peek_endpoint("omavroom-seat-desktop-1") == "vnc://127.0.0.1:5903"
+
+
+def test_peek_endpoint_prefers_a_real_domdisplay_port(tmp_path: Path) -> None:
+    def runner(argv, timeout, input_text) -> CommandResult:
+        if "domdisplay" in argv:
+            return CommandResult(0, "vnc://127.0.0.1:5901\n", "")
+        return CommandResult(1, "", "unexpected")
+
+    prov = LibvirtProvisioner(Config.default(), base_dir=tmp_path, host_runner=runner)
+    assert prov.peek_endpoint("omavroom-seat-desktop-1") == "vnc://127.0.0.1:5901"

@@ -84,9 +84,9 @@ captures every desktop seat as a cheap ``thumbnail_width`` still on the slow
 ``wall_interval_s`` cadence, and only the focused monitor at ``focused_width``
 on the fast ``focused_interval_s`` cadence, so enlarging a monitor gets crisp,
 current frames without re-capturing the whole wall at high resolution.
-``live_mode`` is ``stills`` (default) or ``vnc``; ``vnc`` is reserved for a
-future streaming package and is accepted and validated now, but the GUI still
-renders stills and logs a notice. ``focused_width`` must be at least
+``live_mode`` is ``stills`` (default) or ``vnc``; ``vnc`` streams the focused
+desktop monitor over its passwordless VNC endpoint (falling back to stills with
+a notice on any stream error). ``focused_width`` must be at least
 ``thumbnail_width`` and ``wall_interval_s`` at least ``focused_interval_s``.
 
 ``[network]`` pins the static address the provisioner gives each seat so two
@@ -159,8 +159,8 @@ GOLDEN_PROFILES: tuple[str, ...] = ("stock", "mirror")
 DEFAULT_GOLDEN_PROFILE = "stock"
 
 #: GUI capture modes: ``stills`` (default) renders periodic PNG framebuffers;
-#: ``vnc`` is reserved for a future live-streaming package and is accepted but
-#: not yet active (the GUI logs a notice and keeps rendering stills).
+#: ``vnc`` streams the focused desktop monitor in real time, falling back to
+#: stills for that seat (with a notice) on any VNC error.
 LIVE_MODES: tuple[str, ...] = ("stills", "vnc")
 DEFAULT_LIVE_MODE = "stills"
 
@@ -633,9 +633,9 @@ class GuiConfig:
     - ``focused_interval_s``: fast cadence for the focused monitor.
     - ``wall_interval_s``: slow cadence for the rest of the wall. Must be at
       least ``focused_interval_s`` (the wall is the slower pass).
-    - ``live_mode``: ``stills`` (default) or ``vnc``. ``vnc`` is reserved for
-      package C and is accepted/validated now, but the GUI still renders
-      stills and logs a notice.
+    - ``live_mode``: ``stills`` (default) or ``vnc``. ``vnc`` streams the
+      focused desktop monitor over its VNC endpoint; any stream error falls
+      back to stills for that seat with a notice.
     """
 
     thumbnail_width: int = 480

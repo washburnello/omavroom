@@ -11,11 +11,14 @@ Rectangle {
     property var slotData: ({})
     //: True while this monitor is the enlarged/focused one.
     property bool focused: false
+    //: Live (VNC) image URL for this tile, or "" to show the still thumbnail.
+    property string liveSource: ""
     signal peekRequested()
     signal focusRequested()
 
     readonly property bool occupied: slotData.occupied === true
     readonly property bool desktop: slotData.seat_type === "desktop"
+    readonly property bool live: liveSource !== ""
     readonly property string thumb: slotData.thumbnail_source || ""
     readonly property string terminal: slotData.terminal_text || ""
     readonly property string offText: slotData.off_text || "off / no signal"
@@ -48,8 +51,10 @@ Rectangle {
                 id: thumbImage
                 anchors.fill: parent
                 anchors.margins: 1
-                visible: tile.desktop && tile.occupied && tile.thumb !== ""
-                source: tile.thumb
+                visible: tile.live || (tile.desktop && tile.occupied && tile.thumb !== "")
+                // Live VNC frames come from the image provider (cache-busted by
+                // the live revision); stills keep the base64 thumbnail path.
+                source: tile.live ? tile.liveSource : tile.thumb
                 fillMode: Image.PreserveAspectFit
                 asynchronous: true
                 cache: false

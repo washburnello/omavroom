@@ -690,7 +690,8 @@ def test_settings_dialog_exposes_capture_controls():
         assert ("gui", "live_mode", "vnc") in seen
         assert ("gui", "focused_width", "1600") in seen
         assert backend.liveMode == "vnc"
-        assert "vnc is not yet active" in backend.liveModeNotice
+        # Package C: vnc is now an active mode (no longer a reserved notice).
+        assert backend.liveModeNotice == ""
         assert backend.focusedWidth == 1600
 
         # A bad value is refused and never reaches the daemon.

@@ -115,6 +115,7 @@ def run_gui(
         ) from exc
 
     from omavroom.gui.backend import SHUTDOWN_WAIT_MS, PollWorker, WallBackend
+    from omavroom.gui.frames import FrameImageProvider
 
     application = QGuiApplication.instance() or QGuiApplication(sys.argv[:1])
     application.setApplicationName("omavroom")
@@ -156,9 +157,13 @@ def run_gui(
     backend.requestConfigValues.connect(worker.set_config_values)
     backend.requestCaptureConfig.connect(worker.set_capture_config)
     backend.requestFocus.connect(worker.set_focus)
+    backend.requestLiveEndpoint.connect(worker.resolve_live_endpoint)
 
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("backend", backend)
+    # Serve the focused monitor's live frames from the backend's frame source.
+    provider = FrameImageProvider(backend.frame_source)
+    engine.addImageProvider("omavroom", provider)
     qml_path = Path(__file__).with_name("qml") / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))
     if not engine.rootObjects():
@@ -178,6 +183,7 @@ def run_gui(
         the timer is stopped on its owner) and returns promptly. The join is
         still hard-capped so a truly wedged daemon cannot hang the close.
         """
+        backend.shutdown_live()
         if not thread.isRunning():
             return
         worker.interrupt()

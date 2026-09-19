@@ -109,7 +109,7 @@ Dialog {
                         objectName: "liveModeBox"
                         model: [
                             { label: "Stills", value: "stills" },
-                            { label: "VNC (coming soon)", value: "vnc" }
+                            { label: "VNC (live focused monitor)", value: "vnc" }
                         ]
                         textRole: "label"
                         valueRole: "value"

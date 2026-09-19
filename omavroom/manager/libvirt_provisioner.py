@@ -1856,12 +1856,42 @@ class LibvirtProvisioner(Provisioner):
         )
 
     def peek_endpoint(self, vm_ref: str) -> str:
-        """Return the on-demand VNC viewer endpoint (never auto-opened)."""
+        """Return the on-demand VNC viewer endpoint (never auto-opened).
+
+        ``virsh domdisplay`` is authoritative when it names a real port. On
+        some libvirt/QEMU combinations with autoport VNC it reports ``:0`` for
+        a running domain even though the assigned port is in the live domain
+        XML, so that case falls back to the XML. The listener is always bound
+        to ``127.0.0.1`` by the seat template.
+        """
         result = self._virsh("domdisplay", vm_ref, timeout=30)
         endpoint = result.stdout.strip()
-        if not result.ok or not endpoint:
-            raise ProvisionerError(f"no display endpoint for {vm_ref}: {result.stderr.strip()}")
-        return endpoint
+        if result.ok and endpoint:
+            try:
+                port = urlsplit(endpoint).port
+            except ValueError:
+                port = None
+            if port:
+                return endpoint
+        port = self._live_vnc_port(vm_ref)
+        if port:
+            return f"vnc://127.0.0.1:{port}"
+        raise ProvisionerError(
+            f"no display endpoint for {vm_ref}: {result.stderr.strip() or endpoint or 'unknown'}"
+        )
+
+    def _live_vnc_port(self, vm_ref: str) -> int | None:
+        """The real autoport VNC port parsed from the live domain XML."""
+        result = self._virsh("dumpxml", vm_ref, timeout=30)
+        if not result.ok:
+            return None
+        for line in result.stdout.splitlines():
+            if "<graphics" in line and "vnc" in line:
+                match = re.search(r"port=['\"](\d+)['\"]", line)
+                if match:
+                    port = int(match.group(1))
+                    return port if port > 0 else None
+        return None
 
 
 __all__ = [

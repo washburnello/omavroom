@@ -279,6 +279,14 @@ task, or investigation, owning tabs and panes, with agent states
   ceiling ~3–5 fps) or `vnc` (opt-in real-time stream of the focused
   monitor). Screenshot capture at 1024 px costs ~0.3 s of one core per frame,
   so true real-time is only viable via the VNC stream, not stills polling.
+- Live mode (`gui.live_mode="vnc"`, opt-in): the focused desktop seat is
+  streamed over the seat's **localhost passwordless VNC** by a pure-Python
+  RFB client (Raw + DesktopSize, true-colour only; no auth/zlib/hextile),
+  delivered to QML through a `QQuickImageProvider`
+  (`image://omavroom/<seat>?v=<rev>`). Unfocused tiles keep adaptive stills.
+  Any VNC error falls back to stills for that seat with a notice; the UI
+  thread never blocks. Known advisories: no backoff before re-trying a failed
+  endpoint each poll, and no staleness watchdog for a silent-but-open socket.
 - Daemon language: **Python** (FastMCP server; fastest path to a working
   proof; clean QEMU/MCP boundary preserved in case of a later rewrite).
 - Command Center: accepted as the post-core UI milestone — a **native

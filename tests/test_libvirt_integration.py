@@ -391,6 +391,87 @@ def test_desktop_smoke_if_ram(env, tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# package C: live VNC frames from a real desktop seat
+# --------------------------------------------------------------------------
+def test_desktop_vnc_live_frames(env, tmp_path: Path) -> None:
+    """Stream a real desktop seat's framebuffer over the pure-Python RFB client.
+
+    One desktop seat is admitted with the manual override (the live-RAM gate
+    would otherwise refuse on a ~5 GiB host), the client resolves its VNC
+    endpoint, and ``VncFrameSource`` must deliver at least a few non-empty
+    1280x800 frames with an advancing revision. The seat is released, the
+    override restored, and no seat domain may survive.
+    """
+    from omavroom.gui.frames import VncFrameSource
+
+    free_mb = read_free_ram_mb()
+    if free_mb < 4096:
+        pytest.skip(f"desktop VNC integration skipped: only {free_mb} MiB free (< 4096)")
+    mgr = _manager(env, tmp_path)
+    socket_path = tmp_path / "run" / "daemon.sock"
+    server = DaemonServer(mgr, socket_path=socket_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not socket_path.exists():
+        if time.monotonic() >= deadline:  # pragma: no cover - startup guard
+            raise RuntimeError("integration daemon never started")
+        time.sleep(0.05)
+    client = DaemonClient(socket_path=socket_path)
+    source = VncFrameSource(connect_timeout=5.0, read_timeout=0.5)
+    seat_id: int | None = None
+    try:
+        client.set_admission_override("allow")
+        handle = client.request_seat("integration-vnc", "desktop")
+        view = handle.wait_ready(timeout=420)
+        seat = view.get("seat")
+        assert seat is not None and seat["state"] == "ready", view
+        seat_id = int(seat["id"])
+        print(f"\n[vnc] ready seat={seat['name']} vm={seat['vm_name']}")
+
+        endpoint = client.peek_endpoint(seat_id)
+        assert endpoint.startswith("vnc://"), endpoint
+        assert not endpoint.endswith(":0"), endpoint
+        print(f"[vnc] endpoint {endpoint}")
+
+        source.start(seat_id, 1024, endpoint)
+        frames = 0
+        last_revision = -1
+        dimensions: tuple[int, int] | None = None
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and frames < 5:
+            revision = source.revision(seat_id)
+            image = source.frame(seat_id)
+            if image is not None and not image.isNull() and revision > last_revision:
+                dimensions = (image.width(), image.height())
+                last_revision = revision
+                frames += 1
+            time.sleep(0.2)
+        error = source.error(seat_id)
+        assert error is None, f"VNC stream error: {error}"
+        assert frames >= 5, f"only received {frames} VNC frames"
+        assert source.revision(seat_id) >= 5
+        assert dimensions == (1280, 800), dimensions
+        print(f"[vnc] frames={frames} dims={dimensions} revision={source.revision(seat_id)}")
+    finally:
+        if seat_id is not None:
+            source.stop(seat_id)
+        try:
+            client.set_admission_override("auto")
+        except Exception:  # noqa: BLE001 - teardown must be best-effort
+            pass
+        if seat_id is not None:
+            try:
+                client.force_discard(seat_id, reason="integration_cleanup").result(timeout=180)
+            except Exception:  # noqa: BLE001 - teardown must be best-effort
+                pass
+        client.close()
+        server.shutdown()
+        thread.join(timeout=5)
+        _assert_clean(env.prov)
+
+
+# --------------------------------------------------------------------------
 # issue #1: two terminal seats booted together must not share one DHCP IP
 # --------------------------------------------------------------------------
 def test_two_concurrent_terminal_seats_get_distinct_static_ips(env, tmp_path: Path) -> None:

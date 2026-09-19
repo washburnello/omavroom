@@ -148,6 +148,13 @@ ApplicationWindow {
                     height: r.height || 0
                     focused: r.focused === true
                     slotData: d
+                    // Live VNC applies only to the focused desktop seat; every
+                    // other tile keeps its adaptive still. The revision in the
+                    // URL busts QML's image cache each delivered frame.
+                    liveSource: (backend.liveMode === "vnc" && backend.liveSeatId >= 0
+                                 && d.seat_id === backend.liveSeatId)
+                        ? ("image://omavroom/" + d.seat_id + "?v=" + backend.liveRevision)
+                        : ""
                     onFocusRequested: backend.toggleFocus(d.key)
                     onPeekRequested: backend.requestPeek(d.seat_id)
                     Behavior on x { NumberAnimation { duration: 220; easing.type: Easing.InOutQuad } }

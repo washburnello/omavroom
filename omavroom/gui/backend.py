@@ -28,6 +28,18 @@ updates never recreate delegates; ``revision`` re-evaluates each delegate's
 ``d`` binding in place. ``Main.qml`` also mirrors the model into a non-visual
 ``Instantiator`` of ``slotProbe-*`` objects; the Qt smoke test additionally
 drives a real render pass and asserts on the visual ``SlotTile`` delegates.
+
+Live (VNC) path
+---------------
+When ``gui.live_mode`` is ``"vnc"`` the focused desktop seat streams through
+the backend's :class:`~omavroom.gui.frames.FrameSource` (a
+:class:`~omavroom.gui.frames.VncFrameSource`) instead of the base64 still
+snapshot. ``WallBackend`` only tracks *which* seat should stream and asks the
+worker thread to resolve its endpoint (``requestLiveEndpoint`` -> the existing
+``actionResult``); the source runs its own socket thread and the GUI thread
+polls its revision counter, exposing ``liveSeatId``/``liveRevision`` so QML can
+render ``image://omavroom/<seat_id>?v=<revision>``. Every other tile keeps its
+adaptive still, and any stream error falls back to stills with a notice.
 """
 
 from __future__ import annotations
@@ -44,6 +56,7 @@ from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 from omavroom.client import DaemonClient, DaemonClientError, DaemonRequestError, DaemonTimeout
 from omavroom.config import GOLDEN_PROFILES, Config
 from omavroom.gui.capture import MAX_WIDTH, MIN_WIDTH, CapturePlanner
+from omavroom.gui.frames import FrameSource, VncFrameSource
 from omavroom.gui.viewmodel import (
     MonitorWall,
     grid_columns,
@@ -70,11 +83,9 @@ def _parse_config_value(text: str) -> object:
         return text
 
 
-def _live_mode_notice(mode: str) -> str:
-    """Human notice for a capture mode that is accepted but not yet active."""
-    if mode == "vnc":
-        return "live_mode=vnc is not yet active (package C); rendering stills"
-    return ""
+#: How often the GUI thread polls the live frame source for a new revision.
+#: ~30 Hz: cheap (a lock + an int compare) and smooth enough for the wall.
+LIVE_POLL_INTERVAL_MS = 33
 
 
 class WallBackend(QObject):
@@ -87,6 +98,7 @@ class WallBackend(QObject):
     queueChanged = Signal()
     attentionChanged = Signal()
     noticeChanged = Signal()
+    liveChanged = Signal()
     peekReady = Signal(int, str)
     #: Emitted to ask the worker (another thread) to do something blocking.
     requestPoll = Signal()
@@ -96,6 +108,8 @@ class WallBackend(QObject):
     requestCaptureConfig = Signal(object)
     #: Tell the worker which desktop seat is focused (-1 for none).
     requestFocus = Signal(int)
+    #: Resolve the VNC endpoint for a focused desktop seat (worker thread).
+    requestLiveEndpoint = Signal(int)
     #: Ask the worker to persist a config value (section, key, value) via the daemon.
     requestConfigValue = Signal(str, str, str)
     #: Persist a whole section's keys atomically (section, values dict).
@@ -110,6 +124,7 @@ class WallBackend(QObject):
         focused_width: int | None = None,
         focused_interval_s: float | None = None,
         viewer_command: str | None = None,
+        frame_source: FrameSource | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -146,9 +161,16 @@ class WallBackend(QObject):
             else float(gui.focused_interval_s)
         )
         self._live_mode = str(gui.live_mode)
-        self._live_mode_notice = _live_mode_notice(self._live_mode)
-        if self._live_mode_notice:
-            self._notice = self._live_mode_notice
+        self._live_mode_notice = ""
+        #: Live VNC state: the seat currently streaming (-1 none), the focus we
+        #: want to stream (or None), and the last frame revision delivered.
+        self._frame_source: FrameSource = frame_source or VncFrameSource()
+        self._live_seat_id = -1
+        self._live_target: int | None = None
+        self._live_revision = 0
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(LIVE_POLL_INTERVAL_MS)
+        self._live_timer.timeout.connect(self._poll_live)
         self._viewer_command = viewer_command
         self._settings_text = ""
         self._refresh_settings_text()
@@ -226,13 +248,28 @@ class WallBackend(QObject):
 
     @Property(str, notify=statusChanged)
     def liveMode(self) -> str:
-        """Capture mode (``stills`` or the reserved ``vnc``)."""
+        """Capture mode: ``stills`` (default) or ``vnc`` (focused monitor)."""
         return self._live_mode
+
+    @Property(int, notify=liveChanged)
+    def liveSeatId(self) -> int:
+        """The seat currently streaming over VNC, or ``-1`` for none."""
+        return self._live_seat_id
+
+    @Property(int, notify=liveChanged)
+    def liveRevision(self) -> int:
+        """Monotonic counter bumped per delivered live frame (cache buster)."""
+        return self._live_revision
 
     @Property(str, notify=noticeChanged)
     def liveModeNotice(self) -> str:
-        """Non-empty when ``live_mode`` is accepted but not yet active."""
+        """Live-mode status/notice; non-empty only when VNC fell back."""
         return self._live_mode_notice
+
+    @property
+    def frame_source(self) -> FrameSource:
+        """The frame source behind the QML image provider (read-only)."""
+        return self._frame_source
 
     @Property(str, notify=noticeChanged)
     def lastMessage(self) -> str:
@@ -313,6 +350,9 @@ class WallBackend(QObject):
     def on_action_result(
         self, action: str, ok: bool, message: str, seat_id: int, endpoint: str
     ) -> None:
+        if action == "live-endpoint":
+            self._on_live_endpoint(seat_id, ok, message, endpoint)
+            return
         self._set_notice(f"{action}: {message}" if message else action)
         if action == "peek" and ok and endpoint:
             self.peekReady.emit(seat_id, endpoint)
@@ -389,12 +429,11 @@ class WallBackend(QObject):
         self._focused_interval = float(self.config.gui.focused_interval_s)
         self._wall_interval = float(self.config.gui.wall_interval_s)
         self._live_mode = str(self.config.gui.live_mode)
-        self._live_mode_notice = _live_mode_notice(self._live_mode)
+        self._live_mode_notice = ""
         self._refresh_settings_text()
         self._emit_capture_config()
+        self._sync_live()
         self.statusChanged.emit()
-        if self._live_mode_notice:
-            self._set_notice(self._live_mode_notice)
         self.requestConfigValues.emit("gui", coerced)
 
     @Slot(str, str)
@@ -423,12 +462,11 @@ class WallBackend(QObject):
             self._wall_interval = float(coerced)
         elif key == "live_mode":
             self._live_mode = str(coerced)
-            self._live_mode_notice = _live_mode_notice(self._live_mode)
+            self._live_mode_notice = ""
         self._refresh_settings_text()
         self._emit_capture_config()
+        self._sync_live()
         self.statusChanged.emit()
-        if self._live_mode_notice:
-            self._set_notice(self._live_mode_notice)
         self.requestConfigValue.emit("gui", key, str(coerced))
 
     @Slot(int)
@@ -502,6 +540,103 @@ class WallBackend(QObject):
         if seat_id != self._focused_seat_id_sent:
             self._focused_seat_id_sent = seat_id
             self.requestFocus.emit(-1 if seat_id is None else seat_id)
+        self._sync_live()
+
+    # -- live VNC path ---------------------------------------------------
+    def _live_desired_seat(self) -> int | None:
+        """The seat that should be streaming, or ``None``.
+
+        Live VNC is opted into with ``live_mode="vnc"`` and applies only to an
+        occupied desktop seat (terminal seats have no display).
+        """
+        if self._live_mode != "vnc":
+            return None
+        seat_id = self._current_focused_seat_id()
+        if seat_id is None:
+            return None
+        for slot in self._wall.state.slots:
+            if slot.seat_id == seat_id:
+                return seat_id if slot.occupied and slot.seat_type == "desktop" else None
+        return None
+
+    def _sync_live(self) -> None:
+        """Start/stop the focused seat's stream as focus or ``live_mode`` changes.
+
+        The endpoint is resolved by the worker thread (it owns the daemon
+        client); this method only manages the desired target and the source.
+        """
+        desired = self._live_desired_seat()
+        if desired == self._live_target:
+            return
+        if self._live_target is not None:
+            self._frame_source.stop(self._live_target)
+        self._live_target = desired
+        if self._live_seat_id != -1:
+            self._live_seat_id = -1
+            self.liveChanged.emit()
+        if desired is None:
+            self._live_timer.stop()
+            return
+        self.requestLiveEndpoint.emit(desired)
+
+    def _on_live_endpoint(self, seat_id: int, ok: bool, message: str, endpoint: str) -> None:
+        """Worker resolved (or failed to resolve) a live endpoint."""
+        if seat_id != self._live_target:
+            return  # focus moved while the endpoint was in flight
+        if not ok or not endpoint:
+            self._live_target = None
+            self._live_timer.stop()
+            self._live_fallback(seat_id, message or "no endpoint")
+            return
+        try:
+            self._frame_source.start(seat_id, self._focused_width, endpoint)
+        except Exception as exc:  # noqa: BLE001 - never let a stream kill the GUI
+            self._live_target = None
+            self._live_timer.stop()
+            self._live_fallback(seat_id, str(exc))
+            return
+        self._live_seat_id = int(seat_id)
+        self._live_revision = 0
+        self._live_mode_notice = ""
+        self._live_timer.start()
+        self.liveChanged.emit()
+        self.noticeChanged.emit()
+
+    def _live_fallback(self, seat_id: int, reason: str) -> None:
+        """Abandon live VNC for ``seat_id`` and tell the operator why."""
+        if self._live_seat_id != -1:
+            self._live_seat_id = -1
+            self.liveChanged.emit()
+        self._live_mode_notice = f"live VNC unavailable for seat {seat_id}: {reason}; using stills"
+        self._set_notice(self._live_mode_notice)
+
+    @Slot()
+    def _poll_live(self) -> None:
+        """GUI-thread timer: publish a frame revision when a new one arrives."""
+        seat_id = self._live_seat_id
+        if seat_id < 0:
+            return
+        error = self._frame_source.error(seat_id)
+        if error:
+            self._frame_source.stop(seat_id)
+            self._live_target = None
+            self._live_timer.stop()
+            self._live_fallback(seat_id, error)
+            return
+        revision = self._frame_source.revision(seat_id)
+        if revision != self._live_revision:
+            self._live_revision = revision
+            self.liveChanged.emit()
+
+    @Slot()
+    def shutdown_live(self) -> None:
+        """Stop the live timer and every stream (called on app shutdown)."""
+        self._live_timer.stop()
+        stop_all = getattr(self._frame_source, "stop_all", None)
+        if callable(stop_all):
+            stop_all()
+        self._live_seat_id = -1
+        self._live_target = None
 
     def _slot_rects(self):
         slots = self._wall.state.slots
@@ -632,11 +767,6 @@ class PollWorker(QObject):
         self._status: dict | None = None
         self._seats: list[dict] = []
         self._execs: dict[int, list[dict]] = {}
-        if self._live_mode == "vnc":
-            print(
-                "omavroom-gui: live_mode=vnc is not yet active (package C); rendering stills",
-                file=sys.stderr,
-            )
 
     @Slot()
     def start(self) -> None:
@@ -708,6 +838,26 @@ class PollWorker(QObject):
         if value is not None:
             self.poll_once()
 
+    @Slot(int)
+    def resolve_live_endpoint(self, seat_id: int) -> None:
+        """Resolve a focused seat's VNC endpoint for the live (VNC) path.
+
+        Runs on the worker thread where the daemon client lives, then reports
+        the endpoint over the existing ``actionResult`` signal so the GUI
+        thread can start the stream without touching the daemon socket.
+        """
+        if self._stop.is_set():
+            return
+        try:
+            client = self._ensure_client()
+            endpoint = client.peek_endpoint(int(seat_id))
+            self.actionResult.emit(
+                "live-endpoint", True, "endpoint resolved", int(seat_id), endpoint
+            )
+        except DaemonClientError as exc:
+            self._close_client()
+            self.actionResult.emit("live-endpoint", False, str(exc), int(seat_id), "")
+
     @Slot(object)
     def set_capture_config(self, cfg: object) -> None:
         """Apply an effective capture-config map (widths/cadence/live mode)."""
@@ -734,15 +884,10 @@ class PollWorker(QObject):
                 self._timer.setInterval(interval_ms)
 
     def _set_live_mode(self, mode: str) -> None:
-        """Record the capture mode; ``vnc`` is accepted but still renders stills."""
+        """Record the capture mode; the wall's live source handles ``vnc``."""
         if mode == self._live_mode:
             return
         self._live_mode = mode
-        if mode == "vnc":
-            print(
-                "omavroom-gui: live_mode=vnc is not yet active (package C); rendering stills",
-                file=sys.stderr,
-            )
 
     @Slot()
     def poll_once(self) -> None:
@@ -981,4 +1126,10 @@ class PollWorker(QObject):
             return None
 
 
-__all__ = ["ACTION_TIMEOUT_S", "POLL_REQUEST_TIMEOUT_S", "PollWorker", "WallBackend"]
+__all__ = [
+    "ACTION_TIMEOUT_S",
+    "LIVE_POLL_INTERVAL_MS",
+    "POLL_REQUEST_TIMEOUT_S",
+    "PollWorker",
+    "WallBackend",
+]
