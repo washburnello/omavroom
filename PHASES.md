@@ -233,3 +233,81 @@ Herder-binding guide, contributor notes; versioned release on GitHub.
 
 Accept: a clean-machine (fresh user account on this box) install following
 only the docs, ending in a passing Phase 1 proof run.
+
+## Remaining work (backlog)
+
+Consolidated list of what is left, carried review advisories, and loose
+ends. Nothing here blocks day-to-day use. Phase specs/statuses are above;
+this is the single backlog of record.
+
+### Phase 7 — Golden automation + multi-image (L, largest remaining)
+- [ ] `golden build --profile stock|mirror`: `mirror` is plumbing only today;
+      `stock` = Omarchy repo install, `mirror` = install Omarchy + copy this
+      host's package set/config
+- [ ] Durable guest identity: first-boot machine-id/DUID regeneration in the
+      golden (removes the shared-identity window; non-urgent now that static
+      IPs fixed the collision)
+- [ ] Automate the ESP restore (the Omarchy install rewrites it; it broke boot
+      during the hand build)
+- [ ] Named images + default-per-seat-type + pin a request to a non-default
+      image; in-GUI image management
+- [ ] Herder workspace → image mapping
+
+### Phase 8B — Command Center completeness (M)
+- [ ] Editable settings: min/max seats, timeouts, images (currently
+      display-only; `[gui]` knobs + admission override are editable)
+- [ ] In-GUI image management (list/build/set-default)
+- [ ] Needs-attention: show the stasis reason and add an inspect action
+      (peek/screenshot)
+- [ ] Move PySide6 from core deps to an optional `gui` extra (648 MB)
+
+### Phase 9 — Visual polish (M/L)
+- [ ] Easing animations throughout (queue→slot glide, power on/off, state
+      transitions)
+- [ ] Live boot/install/init streaming on the monitor
+- [ ] Per-monitor CRT shader
+- [ ] Cadence: skip unchanged frames, adaptive throttle
+
+### Phase 10 — Docs + release (M)
+- [ ] Install guide, capacity-tuning guide, example agent workflows,
+      Herder-binding guide, contributor notes
+- [ ] Versioned GitHub release
+- [ ] Clean-machine install test (fresh account, ends in a Phase 1 proof)
+
+### Quick wins / loose ends (S)
+- [ ] Stale docs from the collision fix: the `omavroom` skill and the
+      omarchy-pomodoro `AGENTS.md` still say "one seat at a time until the
+      collision is fixed" — it is fixed
+- [ ] Expose `cancel_request` as an MCP/CLI tool (agents cannot withdraw a
+      queued request today)
+- [ ] `omarchy-fcitx5` user-service restart loop in the golden (log spam)
+- [ ] Re-run the pomodoro agent test end-to-end as the regression (seats no
+      longer die; a dead agent should now land in Needs attention)
+
+### Carried advisories (from reviews; none gate-blocking)
+- Stasis: auto-export runs inline on the pump thread (a hung remote can stall
+  reclaim) — med
+- Stasis: no per-session lease ownership (any session referencing a seat
+  renews it; no auth model) — med
+- Stasis: `held_ttl_s>0` discards without export (documented, untested) — low
+- VNC live: no backoff before re-trying a failed endpoint each poll (churn) —
+  med
+- VNC live: no staleness watchdog (a silent-but-open socket freezes the tile)
+  — med
+- VNC live: `stop()` can join up to 2s on the GUI thread — low
+- VNC live: unbounded server-controlled RFB reads (localhost only) — low
+- Concurrency: static IP pool overlaps libvirt's DHCP range (duplicate risk
+  with non-seat VMs) — med
+- Concurrency: allocation TOCTOU (only matters with multiple daemons) — low
+- Concurrency: frozen `static_ip` vs a later subnet config change — low
+- Capture A: status cadence is now tied to `wall_interval_s` (document) — low
+- Ops: quickshell "no network backend" warning (no NetworkManager by design)
+  — cosmetic
+- Testing: desktop-seat screenshot/input only partly integration-tested at
+  full RAM — low
+
+### Suggested order
+1. Quick wins (stale docs, `cancel_request`, fcitx5)
+2. Re-run the pomodoro regression (confirms seat-lifetime in the real flow)
+3. Phase 7 `golden build` (mirror profile) — last big functional gap
+4. Phase 8B, then 9, then 10
