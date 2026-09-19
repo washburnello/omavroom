@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 
 from omavroom.client import DaemonClient, DaemonClientError, DaemonRequestError, DaemonTimeout
 from omavroom.config import GOLDEN_PROFILES, Config
+from omavroom.gui.capture import MAX_WIDTH, MIN_WIDTH, CapturePlanner
 from omavroom.gui.viewmodel import (
     MonitorWall,
     grid_columns,
@@ -68,6 +70,13 @@ def _parse_config_value(text: str) -> object:
         return text
 
 
+def _live_mode_notice(mode: str) -> str:
+    """Human notice for a capture mode that is accepted but not yet active."""
+    if mode == "vnc":
+        return "live_mode=vnc is not yet active (package C); rendering stills"
+    return ""
+
+
 class WallBackend(QObject):
     """QML-facing view of the wall, queue, attention list and settings."""
 
@@ -83,17 +92,23 @@ class WallBackend(QObject):
     requestPoll = Signal()
     requestAction = Signal(str, int)
     requestAdmission = Signal(str)
-    requestPollInterval = Signal(float)
-    #: Ask the worker to change the screenshot capture width (sharp tiles).
-    requestScreenshotWidth = Signal(int)
+    #: Push the effective adaptive-capture settings to the worker thread.
+    requestCaptureConfig = Signal(object)
+    #: Tell the worker which desktop seat is focused (-1 for none).
+    requestFocus = Signal(int)
     #: Ask the worker to persist a config value (section, key, value) via the daemon.
     requestConfigValue = Signal(str, str, str)
+    #: Persist a whole section's keys atomically (section, values dict).
+    requestConfigValues = Signal(str, object)
 
     def __init__(
         self,
         config: Config,
         *,
-        poll_interval_s: float = 2.0,
+        poll_interval_s: float | None = None,
+        screenshot_width: int | None = None,
+        focused_width: int | None = None,
+        focused_interval_s: float | None = None,
         viewer_command: str | None = None,
         parent: QObject | None = None,
     ) -> None:
@@ -107,12 +122,33 @@ class WallBackend(QObject):
         self._viewport_h = 0
         #: Key of the enlarged/focused slot, or None for the uniform wall.
         self._focused_key: str | None = None
+        #: Last focus seat id pushed to the worker, so we only emit on change.
+        self._focused_seat_id_sent: int | None = None
         self._layout_revision = 0
-        self._screenshot_request_width = 0
         self._daemon_ok = False
         self._daemon_message = "connecting to daemon..."
         self._notice = ""
-        self._poll_interval = float(poll_interval_s)
+        # Effective capture settings: config values, optionally overridden for
+        # this session by the CLI (``--interval`` / ``--screenshot-width``).
+        gui = config.gui
+        self._wall_interval = (
+            float(poll_interval_s) if poll_interval_s is not None else float(gui.wall_interval_s)
+        )
+        self._thumbnail_width = (
+            int(screenshot_width) if screenshot_width is not None else int(gui.thumbnail_width)
+        )
+        self._focused_width = (
+            int(focused_width) if focused_width is not None else int(gui.focused_width)
+        )
+        self._focused_interval = (
+            float(focused_interval_s)
+            if focused_interval_s is not None
+            else float(gui.focused_interval_s)
+        )
+        self._live_mode = str(gui.live_mode)
+        self._live_mode_notice = _live_mode_notice(self._live_mode)
+        if self._live_mode_notice:
+            self._notice = self._live_mode_notice
         self._viewer_command = viewer_command
         self._settings_text = ""
         self._refresh_settings_text()
@@ -165,7 +201,38 @@ class WallBackend(QObject):
 
     @Property(float, notify=statusChanged)
     def pollInterval(self) -> float:
-        return self._poll_interval
+        """Wall cadence in seconds (the slow pass)."""
+        return self._wall_interval
+
+    @Property(int, notify=statusChanged)
+    def thumbnailWidth(self) -> int:
+        """Wall-scale capture width in pixels."""
+        return self._thumbnail_width
+
+    @Property(int, notify=statusChanged)
+    def focusedWidth(self) -> int:
+        """Focused-monitor capture width in pixels."""
+        return self._focused_width
+
+    @Property(float, notify=statusChanged)
+    def focusedInterval(self) -> float:
+        """Fast cadence for the focused monitor, in seconds."""
+        return self._focused_interval
+
+    @Property(float, notify=statusChanged)
+    def wallInterval(self) -> float:
+        """Slow wall cadence in seconds."""
+        return self._wall_interval
+
+    @Property(str, notify=statusChanged)
+    def liveMode(self) -> str:
+        """Capture mode (``stills`` or the reserved ``vnc``)."""
+        return self._live_mode
+
+    @Property(str, notify=noticeChanged)
+    def liveModeNotice(self) -> str:
+        """Non-empty when ``live_mode`` is accepted but not yet active."""
+        return self._live_mode_notice
 
     @Property(str, notify=noticeChanged)
     def lastMessage(self) -> str:
@@ -234,7 +301,9 @@ class WallBackend(QObject):
         if plan_changed:
             self.slotKeysChanged.emit()
             self._bump_layout()
-            self._emit_screenshot_width()
+        # A seat swap or teardown can change *which* seat is focused even when
+        # the focused key survives; keep the worker's focus in step.
+        self._sync_focus()
         self.revisionChanged.emit()
         self.queueChanged.emit()
         self.attentionChanged.emit()
@@ -296,13 +365,71 @@ class WallBackend(QObject):
         self.statusChanged.emit()
         self.requestConfigValue.emit("golden", "profile", profile)
 
-    @Slot(float)
-    def setPollInterval(self, seconds: float) -> None:
-        value = max(0.25, float(seconds))
-        self._poll_interval = value
+    @Slot("QVariantMap")
+    def applyCaptureSettings(self, values: object) -> None:
+        """Apply the whole ``[gui]`` capture set atomically.
+
+        The settings dialog submits every field at once, so a valid combined
+        change (for example raising ``thumbnail_width`` and ``focused_width``
+        together, or ``focused_interval_s`` above the old ``wall_interval_s``)
+        is validated and applied as one unit instead of being rejected
+        mid-sequence. The local config is updated optimistically; the worker
+        persists the same set through the daemon in a single write.
+        """
+        if not isinstance(values, dict) or not values:
+            return
+        parsed = {str(key): _parse_config_value(value) for key, value in values.items()}
+        try:
+            coerced = self.config.set_values("gui", parsed)
+        except ValueError as exc:
+            self._set_notice(str(exc))
+            return
+        self._thumbnail_width = int(self.config.gui.thumbnail_width)
+        self._focused_width = int(self.config.gui.focused_width)
+        self._focused_interval = float(self.config.gui.focused_interval_s)
+        self._wall_interval = float(self.config.gui.wall_interval_s)
+        self._live_mode = str(self.config.gui.live_mode)
+        self._live_mode_notice = _live_mode_notice(self._live_mode)
         self._refresh_settings_text()
-        self.requestPollInterval.emit(value)
+        self._emit_capture_config()
         self.statusChanged.emit()
+        if self._live_mode_notice:
+            self._set_notice(self._live_mode_notice)
+        self.requestConfigValues.emit("gui", coerced)
+
+    @Slot(str, str)
+    def setGuiSetting(self, key: str, value: str) -> None:
+        """Validate, apply and persist one ``[gui]`` setting.
+
+        The local config is updated optimistically so the dialog and the worker
+        reflect the choice immediately; the worker performs the validated
+        daemon write. A bad value (or a cross-field conflict such as
+        ``wall_interval_s < focused_interval_s``) is refused with a notice.
+        """
+        key = str(key)
+        try:
+            coerced = self.config.validate_value("gui", key, _parse_config_value(value))
+            self.config.set_value("gui", key, coerced)
+        except ValueError as exc:
+            self._set_notice(str(exc))
+            return
+        if key == "thumbnail_width":
+            self._thumbnail_width = int(coerced)
+        elif key == "focused_width":
+            self._focused_width = int(coerced)
+        elif key == "focused_interval_s":
+            self._focused_interval = float(coerced)
+        elif key == "wall_interval_s":
+            self._wall_interval = float(coerced)
+        elif key == "live_mode":
+            self._live_mode = str(coerced)
+            self._live_mode_notice = _live_mode_notice(self._live_mode)
+        self._refresh_settings_text()
+        self._emit_capture_config()
+        self.statusChanged.emit()
+        if self._live_mode_notice:
+            self._set_notice(self._live_mode_notice)
+        self.requestConfigValue.emit("gui", key, str(coerced))
 
     @Slot(int)
     def setViewportWidth(self, width: int) -> None:
@@ -330,7 +457,6 @@ class WallBackend(QObject):
         self._viewport_h = h
         self._columns = grid_columns(w)
         self._bump_layout()
-        self._emit_screenshot_width()
 
     @Slot(int, result="QVariantMap")
     def slotRectAt(self, index: int) -> dict:
@@ -353,12 +479,29 @@ class WallBackend(QObject):
         key = str(key)
         self._focused_key = None if key == self._focused_key else key
         self._bump_layout()
+        self._sync_focus()
 
     @Slot()
     def clearFocus(self) -> None:
         if self._focused_key is not None:
             self._focused_key = None
             self._bump_layout()
+            self._sync_focus()
+
+    def _current_focused_seat_id(self) -> int | None:
+        if not self._focused_key:
+            return None
+        for slot in self._wall.state.slots:
+            if slot.key == self._focused_key and slot.seat_id is not None:
+                return int(slot.seat_id)
+        return None
+
+    def _sync_focus(self) -> None:
+        """Push the focused seat id to the worker when it changes."""
+        seat_id = self._current_focused_seat_id()
+        if seat_id != self._focused_seat_id_sent:
+            self._focused_seat_id_sent = seat_id
+            self.requestFocus.emit(-1 if seat_id is None else seat_id)
 
     def _slot_rects(self):
         slots = self._wall.state.slots
@@ -380,20 +523,18 @@ class WallBackend(QObject):
         self._layout_revision += 1
         self.layoutChanged.emit()
 
-    def _emit_screenshot_width(self) -> None:
-        """Ask the worker for screenshots as wide as the largest tile.
+    def _effective_capture_config(self) -> dict:
+        """The session-effective capture settings (config + any CLI override)."""
+        return {
+            "thumbnail_width": self._thumbnail_width,
+            "focused_width": self._focused_width,
+            "focused_interval_s": self._focused_interval,
+            "wall_interval_s": self._wall_interval,
+            "live_mode": self._live_mode,
+        }
 
-        Capturing at the display size (2x for crispness, hard-capped) keeps
-        the monitor sharp instead of upscaling a small thumbnail.
-        """
-        rects = self._slot_rects()
-        if not rects:
-            return
-        widest = max(rect.width for rect in rects)
-        desired = int(max(640, min(2048, widest * 2)))
-        if desired != self._screenshot_request_width:
-            self._screenshot_request_width = desired
-            self.requestScreenshotWidth.emit(desired)
+    def _emit_capture_config(self) -> None:
+        self.requestCaptureConfig.emit(self._effective_capture_config())
 
     @Slot(str)
     def openViewer(self, endpoint: str) -> None:
@@ -436,7 +577,14 @@ class WallBackend(QObject):
             body = settings_report(self.config)
         except Exception as exc:  # pragma: no cover - defensive
             body = f"(cannot render settings: {exc})"
-        self._settings_text = f"{body}\nscreenshot_poll_interval_s={self._poll_interval:g}"
+        self._settings_text = (
+            f"{body}\n"
+            f"effective: thumbnail_width={self._thumbnail_width}"
+            f" focused_width={self._focused_width}"
+            f" focused_interval_s={self._focused_interval:g}"
+            f" wall_interval_s={self._wall_interval:g}"
+            f" live_mode={self._live_mode}"
+        )
 
 
 class PollWorker(QObject):
@@ -451,26 +599,50 @@ class PollWorker(QObject):
         *,
         poll_interval_s: float = 2.0,
         screenshot_max_width: int = 480,
+        focused_width: int = 1024,
+        focused_interval_s: float = 0.5,
+        live_mode: str = "stills",
+        planner: CapturePlanner | None = None,
+        client: DaemonClient | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._socket_path = socket_path
-        self._interval_s = max(0.25, float(poll_interval_s))
-        self._screenshot_max_width = int(screenshot_max_width)
-        self._client: DaemonClient | None = None
+        #: The pure scheduler decides which seats to capture on each tick.
+        self._planner = planner or CapturePlanner(
+            thumbnail_width=screenshot_max_width,
+            focused_width=focused_width,
+            focused_interval_s=focused_interval_s,
+            wall_interval_s=poll_interval_s,
+        )
+        self._live_mode = str(live_mode)
+        self._client: DaemonClient | None = client
         self._timer: QTimer | None = None
+        #: Re-entrancy guard: a slow capture must coalesce, not stack ticks.
+        self._polling = False
         #: Thread-safe interrupt. Set directly from the GUI thread at
         #: shutdown; read between per-seat calls so a long tick abandons
         #: early. Deliberately *not* a Qt slot invocation: a queued slot
         #: cannot run while ``poll_once`` is blocked inside a socket read.
         self._stop = threading.Event()
         self._client_lock = threading.Lock()
+        #: Last successful status/seat/exec snapshot, reused by fast ticks that
+        #: only capture the focused seat (status is refreshed on the wall
+        #: cadence). ``None`` forces the next tick to be a full wall pass.
+        self._status: dict | None = None
+        self._seats: list[dict] = []
+        self._execs: dict[int, list[dict]] = {}
+        if self._live_mode == "vnc":
+            print(
+                "omavroom-gui: live_mode=vnc is not yet active (package C); rendering stills",
+                file=sys.stderr,
+            )
 
     @Slot()
     def start(self) -> None:
         self._stop.clear()
         self._timer = QTimer(self)
-        self._timer.setInterval(int(self._interval_s * 1000))
+        self._timer.setInterval(max(50, int(self._planner.focused_interval_s * 1000)))
         self._timer.timeout.connect(self.poll_once)
         self._timer.start()
         self.poll_once()
@@ -524,60 +696,144 @@ class PollWorker(QObject):
     def stop_requested(self) -> bool:
         return self._stop.is_set()
 
-    @Slot(float)
-    def set_interval(self, seconds: float) -> None:
-        self._interval_s = max(0.25, float(seconds))
-        if self._timer is not None:
-            self._timer.setInterval(int(self._interval_s * 1000))
-
     @Slot(int)
-    def set_screenshot_width(self, max_width: int) -> None:
-        """Capture width for desktop thumbnails (kept sharp to the tile)."""
-        self._screenshot_max_width = max(160, min(2048, int(max_width)))
+    def set_focus(self, seat_id: int) -> None:
+        """Point the high-resolution capture at one seat (``-1`` clears).
+
+        Polls immediately when a seat is focused so the enlarged monitor gets a
+        crisp frame right away rather than on the next scheduled tick.
+        """
+        value = None if int(seat_id) < 0 else int(seat_id)
+        self._planner.set_focus(value)
+        if value is not None:
+            self.poll_once()
+
+    @Slot(object)
+    def set_capture_config(self, cfg: object) -> None:
+        """Apply an effective capture-config map (widths/cadence/live mode)."""
+        if not isinstance(cfg, dict):
+            return
+        planner = self._planner
+        if "thumbnail_width" in cfg:
+            planner.thumbnail_width = max(MIN_WIDTH, min(MAX_WIDTH, int(cfg["thumbnail_width"])))
+        if "focused_width" in cfg:
+            planner.focused_width = max(MIN_WIDTH, min(MAX_WIDTH, int(cfg["focused_width"])))
+        # The focused monitor is the high-resolution view; whichever width just
+        # changed, it may never end up below the wall thumbnail.
+        if planner.focused_width < planner.thumbnail_width:
+            planner.focused_width = planner.thumbnail_width
+        if "focused_interval_s" in cfg:
+            planner.focused_interval_s = max(0.05, float(cfg["focused_interval_s"]))
+        if "wall_interval_s" in cfg:
+            planner.wall_interval_s = max(planner.focused_interval_s, float(cfg["wall_interval_s"]))
+        if "live_mode" in cfg:
+            self._set_live_mode(str(cfg["live_mode"]))
+        if self._timer is not None:
+            interval_ms = max(50, int(planner.focused_interval_s * 1000))
+            if self._timer.interval() != interval_ms:
+                self._timer.setInterval(interval_ms)
+
+    def _set_live_mode(self, mode: str) -> None:
+        """Record the capture mode; ``vnc`` is accepted but still renders stills."""
+        if mode == self._live_mode:
+            return
+        self._live_mode = mode
+        if mode == "vnc":
+            print(
+                "omavroom-gui: live_mode=vnc is not yet active (package C); rendering stills",
+                file=sys.stderr,
+            )
 
     @Slot()
     def poll_once(self) -> None:
-        if self._stop.is_set():
+        """One worker tick, driven by the QTimer.
+
+        The fast tick only captures the focused seat's screenshot at
+        ``focused_interval_s``; ``pool_status``/``list_execs`` (and daemon-down
+        detection) run on the slower ``wall_interval_s`` cadence. A tick whose
+        capture raises must never escape into the Qt event loop, so every
+        failure is reported as a non-fatal snapshot and the timer keeps ticking.
+        """
+        if self._stop.is_set() or self._polling:
             return
+        self._polling = True
         try:
-            client = self._ensure_client()
-            status = client.pool_status()
+            now = self._planner.now()
+            if self._status is None or self._planner.wall_due(now):
+                self._wall_tick()
+            else:
+                self._fast_tick()
         except DaemonClientError as exc:
             self._close_client()
+            self._status = None
             self.snapshotReady.emit({"ok": False, "error": str(exc)})
-            return
+        except Exception as exc:  # noqa: BLE001 - must never kill the timer/GUI
+            print(f"omavroom-gui: capture error: {exc}", file=sys.stderr)
+            self.snapshotReady.emit({"ok": False, "error": f"capture error: {exc}"})
+        finally:
+            self._polling = False
+
+    def _wall_tick(self) -> None:
+        """Slow pass: refresh status/execs *and* capture the whole wall."""
+        client = self._ensure_client()
+        status = client.pool_status()
         if self._stop.is_set():
             return
-        execs: dict[int, list[dict]] = {}
-        screenshots: dict[int, str] = {}
         seats = status.get("seats") if isinstance(status, dict) else None
-        for seat in seats if isinstance(seats, list) else []:
+        seat_list = (
+            [seat for seat in seats if isinstance(seat, dict)] if isinstance(seats, list) else []
+        )
+        execs: dict[int, list[dict]] = {}
+        for seat in seat_list:
             if self._stop.is_set():
                 return
-            if not isinstance(seat, dict):
+            if str(seat.get("seat_type") or "") != "terminal":
                 continue
-            seat_id = seat.get("id")
-            if seat_id is None:
-                continue
-            state = str(seat.get("state") or "")
-            seat_type = str(seat.get("seat_type") or "")
-            if state not in ("ready", "busy"):
+            if str(seat.get("state") or "") not in ("ready", "busy"):
                 continue
             try:
-                numeric_id = int(seat_id)
+                numeric_id = int(seat.get("id"))
             except (TypeError, ValueError):
                 continue
-            if seat_type == "terminal":
-                execs[numeric_id] = self._list_execs(client, numeric_id)
-            elif seat_type == "desktop" and seat.get("vm_name"):
-                shot = self._screenshot(client, numeric_id)
-                if shot is not None:
-                    screenshots[numeric_id] = shot
+            execs[numeric_id] = self._list_execs(client, numeric_id)
+        plan = self._planner.plan(self._planner.now(), seat_list)
+        screenshots = self._capture_plan(client, plan.captures)
+        if self._stop.is_set():
+            return
+        # Cache only after a fully successful pass, so a partial failure forces
+        # the next tick to retry rather than showing a half-stale wall.
+        self._status = status if isinstance(status, dict) else {}
+        self._seats = seat_list
+        self._execs = execs
+        self.snapshotReady.emit(
+            {"ok": True, "status": self._status, "execs": execs, "screenshots": screenshots}
+        )
+
+    def _fast_tick(self) -> None:
+        """Fast pass: capture only the focused monitor; reuse the last status."""
+        client = self._ensure_client()
+        plan = self._planner.plan(self._planner.now(), self._seats)
+        screenshots = self._capture_plan(client, plan.captures)
         if self._stop.is_set():
             return
         self.snapshotReady.emit(
-            {"ok": True, "status": status, "execs": execs, "screenshots": screenshots}
+            {
+                "ok": True,
+                "status": self._status or {},
+                "execs": self._execs,
+                "screenshots": screenshots,
+            }
         )
+
+    def _capture_plan(self, client: DaemonClient, captures) -> dict[int, str]:
+        screenshots: dict[int, str] = {}
+        for capture in captures:
+            if self._stop.is_set():
+                return screenshots
+            shot = self._screenshot(client, capture.seat_id, capture.width)
+            if shot is not None:
+                screenshots[capture.seat_id] = shot
+        return screenshots
 
     def _await_job(self, job) -> None:
         """Wait for a recovery job, polling the interrupt flag as we go.
@@ -662,6 +918,26 @@ class PollWorker(QObject):
         finally:
             self.poll_once()
 
+    @Slot(str, object)
+    def set_config_values(self, section: str, values: object) -> None:
+        """Persist a whole section's keys in one daemon write (atomic).
+
+        The settings dialog submits all ``[gui]`` capture fields together so a
+        valid cross-field change survives the round trip as a unit.
+        """
+        if self._stop.is_set() or not isinstance(values, dict):
+            return
+        try:
+            client = self._ensure_client()
+            result = client.set_config_values(section, values)
+            applied = result.get("values", values) if isinstance(result, dict) else values
+            self.actionResult.emit("config", True, f"{section} = {applied}", 0, "")
+        except DaemonClientError as exc:
+            self._close_client()
+            self.actionResult.emit("config", False, str(exc), 0, "")
+        finally:
+            self.poll_once()
+
     # -- internals -------------------------------------------------------
     def _ensure_client(self) -> DaemonClient:
         with self._client_lock:
@@ -686,16 +962,23 @@ class PollWorker(QObject):
         except DaemonClientError:
             return []
 
-    def _screenshot(self, client: DaemonClient, seat_id: int) -> str | None:
+    def _screenshot(self, client: DaemonClient, seat_id: int, width: int) -> str | None:
+        """Return one base64 frame, or ``None`` to skip this seat this tick.
+
+        Deliberately catches **every** exception (not just ``DaemonClientError``)
+        and logs it: this runs on a QTimer slot, where an escaping exception can
+        tear down the whole GUI process. A bad frame is non-fatal.
+        """
         import base64
 
         try:
-            data = client.screenshot(seat_id, max_width=self._screenshot_max_width)
-        except DaemonClientError:
+            data = client.screenshot(seat_id, max_width=width)
+            if not data:
+                return None
+            return base64.b64encode(data).decode("ascii")
+        except Exception as exc:  # noqa: BLE001 - a capture must never kill the GUI
+            print(f"omavroom-gui: screenshot seat {seat_id} failed: {exc}", file=sys.stderr)
             return None
-        if not data:
-            return None
-        return base64.b64encode(data).decode("ascii")
 
 
 __all__ = ["ACTION_TIMEOUT_S", "POLL_REQUEST_TIMEOUT_S", "PollWorker", "WallBackend"]

@@ -271,6 +271,14 @@ task, or investigation, owning tabs and panes, with agent states
   recorded (an explicit `export_seat`), the normal gated export runs
   automatically and the outcome is recorded; with no intent the VM is held.
   Export intent is a **host repo path**, never a clone URL.
+- Monitor capture is **adaptive** (`[gui]`): wall tiles at
+  `thumbnail_width` (480) every `wall_interval_s` (2 s); the focused monitor
+  at `focused_width` (1024) every `focused_interval_s` (0.5 s). Status/exec
+  polling stays on the wall cadence (the fast tick only captures the focused
+  frame). `live_mode` selects the frame source: `stills` (default, measured
+  ceiling ~3–5 fps) or `vnc` (opt-in real-time stream of the focused
+  monitor). Screenshot capture at 1024 px costs ~0.3 s of one core per frame,
+  so true real-time is only viable via the VNC stream, not stills polling.
 - Daemon language: **Python** (FastMCP server; fastest path to a working
   proof; clean QEMU/MCP boundary preserved in case of a later rewrite).
 - Command Center: accepted as the post-core UI milestone — a **native

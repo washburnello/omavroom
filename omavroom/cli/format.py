@@ -168,6 +168,13 @@ def settings_dict(config: Config) -> dict:
             "backoff_s": config.prewarm.backoff_s,
         },
         "golden": {"profile": config.golden.profile},
+        "gui": {
+            "thumbnail_width": config.gui.thumbnail_width,
+            "focused_width": config.gui.focused_width,
+            "focused_interval_s": config.gui.focused_interval_s,
+            "wall_interval_s": config.gui.wall_interval_s,
+            "live_mode": config.gui.live_mode,
+        },
     }
 
 
@@ -200,6 +207,7 @@ def settings_report(config: Config) -> str:
     host = snapshot["host"]
     admission = snapshot["admission"]
     golden = snapshot["golden"]
+    gui = snapshot["gui"]
     return "\n".join(
         [
             f"capacity: total_units={snapshot['capacity']['total_units']}",
@@ -235,6 +243,13 @@ def settings_report(config: Config) -> str:
             f"prewarm: max_retries={snapshot['prewarm']['max_retries']}"
             f" backoff_s={snapshot['prewarm']['backoff_s']}",
             f"golden: profile={golden['profile']}",
+            (
+                f"gui: thumbnail_width={gui['thumbnail_width']}"
+                f" focused_width={gui['focused_width']}"
+                f" focused_interval_s={gui['focused_interval_s']:g}"
+                f" wall_interval_s={gui['wall_interval_s']:g}"
+                f" live_mode={gui['live_mode']}"
+            ),
         ]
     )
 

@@ -410,10 +410,30 @@ class DaemonClient:
     def screenshot(
         self, seat_id: int, *, max_width: int | None = None, max_bytes: int | None = None
     ) -> bytes:
+        """Fetch one framebuffer as raw PNG bytes.
+
+        Any malformed daemon reply (missing/wrong-typed ``png_base64`` or
+        invalid base64) is normalized into a :class:`DaemonRequestError` so a
+        single bad response can never raise ``KeyError``/``TypeError``/
+        ``binascii.Error`` into a caller's QTimer slot.
+        """
         import base64
+        import binascii
 
         result = self.call("screenshot", seat_id=seat_id, max_width=max_width, max_bytes=max_bytes)
-        return base64.b64decode(result["png_base64"])
+        if not isinstance(result, dict):
+            raise DaemonRequestError("bad_response", "screenshot response is not a JSON object")
+        encoded = result.get("png_base64")
+        if not isinstance(encoded, str):
+            raise DaemonRequestError(
+                "bad_response", "screenshot response is missing a string png_base64"
+            )
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise DaemonRequestError(
+                "bad_response", f"invalid base64 in screenshot response: {exc}"
+            ) from exc
 
     def input(self, seat_id: int, events: list[InputEvent] | list[dict]) -> dict:
         wire = [
@@ -452,6 +472,17 @@ class DaemonClient:
         :class:`DaemonRequestError` with ``code == "invalid"``.
         """
         return self.call("set_config_value", section=section, key=key, value=value)
+
+    def set_config_values(self, section: str, values: dict[str, object]) -> dict:
+        """Validate and persist several ``section`` keys in one atomic write.
+
+        Used by the GUI's settings dialog so a cross-field change (for example
+        raising ``thumbnail_width`` and ``focused_width`` together) is validated
+        as a whole instead of being rejected mid-sequence. Returns the daemon's
+        ``{section, values, path}`` reply; a bad value raises
+        :class:`DaemonRequestError` with ``code == "invalid"``.
+        """
+        return self.call("set_config_values", section=section, values=values)
 
     # -- job calls -------------------------------------------------------
     def job_poll(self, job_id: str) -> dict:

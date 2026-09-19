@@ -178,6 +178,28 @@ def test_daemon_set_config_value_invalid_is_structured(fake_daemon, user_config)
     assert not user_config.exists()
 
 
+def test_daemon_set_config_values_round_trip_is_atomic(fake_daemon, user_config) -> None:
+    with fake_daemon() as pool:
+        client = DaemonClient(pool.socket_path)
+        try:
+            result = client.set_config_values(
+                "gui", {"thumbnail_width": 1600, "focused_width": 2048}
+            )
+            assert pool.manager.config.gui.focused_width == 2048
+            with pytest.raises(DaemonRequestError) as excinfo:
+                client.set_config_values("gui", {"thumbnail_width": 4096, "focused_width": 1600})
+        finally:
+            client.close()
+    assert excinfo.value.code == "invalid"
+    assert result["section"] == "gui"
+    assert result["values"] == {"thumbnail_width": 1600, "focused_width": 2048}
+    data = tomllib.loads(user_config.read_text(encoding="utf-8"))
+    assert data["gui"]["thumbnail_width"] == 1600
+    # The rejected combined write left the running config and file untouched.
+    assert pool.manager.config.gui.thumbnail_width == 1600
+    assert data["gui"]["focused_width"] == 2048
+
+
 # -- CLI ---------------------------------------------------------------------
 def _cli(pool, *argv):
     return cli.main(["--socket", str(pool.socket_path), *argv])

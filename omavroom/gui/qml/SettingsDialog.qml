@@ -10,11 +10,28 @@ Dialog {
     modal: true
     title: "Settings"
     width: 680
-    height: 740
+    height: 820
     anchors.centerIn: parent
 
     property string pendingAdmission: backend.admissionOverride
-    property int pendingInterval: Math.round(backend.pollInterval)
+    property string pendingLiveMode: backend.liveMode
+    property int pendingThumbnailWidth: backend.thumbnailWidth
+    property int pendingFocusedWidth: backend.focusedWidth
+    property real pendingFocusedInterval: backend.focusedInterval
+    property real pendingWallInterval: backend.wallInterval
+
+    function applyCapture() {
+        // Submit the whole set at once: the backend validates and applies it
+        // atomically, so a valid cross-field change (e.g. raising thumbnail
+        // and focused widths together) is never rejected mid-sequence.
+        backend.applyCaptureSettings({
+            "live_mode": dialog.pendingLiveMode,
+            "thumbnail_width": dialog.pendingThumbnailWidth,
+            "focused_width": dialog.pendingFocusedWidth,
+            "focused_interval_s": dialog.pendingFocusedInterval,
+            "wall_interval_s": dialog.pendingWallInterval
+        })
+    }
 
     contentItem: ColumnLayout {
         spacing: 10
@@ -78,23 +95,94 @@ Dialog {
 
         GroupBox {
             Layout.fillWidth: true
-            title: "Screenshot polling"
-            RowLayout {
+            title: "Adaptive monitor capture"
+            ColumnLayout {
                 anchors.fill: parent
-                spacing: 10
-                Label { text: "Interval (seconds)" }
-                SpinBox {
-                    id: intervalBox
-                    from: 1
-                    to: 30
-                    value: dialog.pendingInterval
-                    onValueModified: dialog.pendingInterval = value
+                spacing: 6
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Label { text: "Live mode" }
+                    ComboBox {
+                        id: liveModeBox
+                        objectName: "liveModeBox"
+                        model: [
+                            { label: "Stills", value: "stills" },
+                            { label: "VNC (coming soon)", value: "vnc" }
+                        ]
+                        textRole: "label"
+                        valueRole: "value"
+                        currentIndex: Math.max(0, liveModeBox.indexOfValue(dialog.pendingLiveMode))
+                        onActivated: dialog.pendingLiveMode = currentValue
+                    }
+                    Label {
+                        text: backend.liveModeNotice !== "" ? backend.liveModeNotice
+                                                             : "current: " + backend.liveMode
+                        color: "#8b949e"
+                        wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
                 }
-                Label { text: "applies immediately"; color: "#8b949e" }
-                Item { Layout.fillWidth: true }
-                Button {
-                    text: "Apply"
-                    onClicked: backend.setPollInterval(dialog.pendingInterval)
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Label { text: "Wall thumbnail width" }
+                    SpinBox {
+                        id: thumbnailBox
+                        from: 64
+                        to: 4096
+                        stepSize: 32
+                        value: dialog.pendingThumbnailWidth
+                        onValueModified: dialog.pendingThumbnailWidth = value
+                    }
+                    Label { text: "Focused width" }
+                    SpinBox {
+                        id: focusedWidthBox
+                        from: 64
+                        to: 4096
+                        stepSize: 64
+                        value: dialog.pendingFocusedWidth
+                        onValueModified: dialog.pendingFocusedWidth = value
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    Label { text: "Focused interval (s)" }
+                    DoubleSpinBox {
+                        id: focusedIntervalBox
+                        from: 0.05
+                        to: 30
+                        stepSize: 0.05
+                        decimals: 2
+                        value: dialog.pendingFocusedInterval
+                        onValueModified: dialog.pendingFocusedInterval = value
+                    }
+                    Label { text: "Wall interval (s)" }
+                    DoubleSpinBox {
+                        id: wallIntervalBox
+                        from: 0.05
+                        to: 60
+                        stepSize: 0.5
+                        decimals: 2
+                        value: dialog.pendingWallInterval
+                        onValueModified: dialog.pendingWallInterval = value
+                    }
+                    Item { Layout.fillWidth: true }
+                    Button {
+                        text: "Apply"
+                        onClicked: dialog.applyCapture()
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: "The wall captures thumbnails on the slow cadence; the focused monitor gets high-res frames on the fast cadence."
+                    color: "#6e7681"
+                    wrapMode: Text.Wrap
                 }
             }
         }

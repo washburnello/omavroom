@@ -78,7 +78,7 @@ import sys
 import threading
 from pathlib import Path
 
-from omavroom.config import Config, set_config_value
+from omavroom.config import Config, set_config_value, set_config_values
 from omavroom.manager import Manager
 from omavroom.manager.execs import DEFAULT_LIST_OUTPUT_BUDGET_BYTES
 from omavroom.manager.provisioner import (
@@ -438,6 +438,7 @@ class Protocol:
             "peek_endpoint": self._peek_endpoint,
             "set_admission_override": self._set_admission_override,
             "set_config_value": self._set_config_value,
+            "set_config_values": self._set_config_values,
             "clear_prewarm_backoff": self._clear_prewarm_backoff,
             "request_seat": self._request_seat,
             "cancel_request": self._cancel_request,
@@ -624,6 +625,22 @@ class Protocol:
             "section": section,
             "key": key,
             "value": coerced,
+            "path": str(path),
+        }
+
+    def _set_config_values(self, params: dict) -> dict:
+        # Atomic multi-key sibling of ``_set_config_value``: the GUI's settings
+        # dialog submits a whole cross-field change at once so a valid combined
+        # update is validated and persisted as one unit.
+        section = _required_str(params, "section")
+        values = params.get("values")
+        if not isinstance(values, dict) or not values:
+            raise ValueError("parameter 'values' must be a non-empty object")
+        coerced, path = set_config_values(section, values)
+        self.manager.config.set_values(section, coerced)
+        return {
+            "section": section,
+            "values": coerced,
             "path": str(path),
         }
 

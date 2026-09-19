@@ -33,7 +33,8 @@ from PySide6.QtQml import QQmlApplicationEngine  # noqa: E402
 from PySide6.QtQuick import QQuickWindow  # noqa: E402
 
 from omavroom.config import Config  # noqa: E402
-from omavroom.gui.backend import WallBackend  # noqa: E402
+from omavroom.gui.backend import PollWorker, WallBackend  # noqa: E402
+from omavroom.gui.capture import CapturePlanner  # noqa: E402
 from omavroom.gui.viewmodel import ATTENTION_ACTIONS  # noqa: E402
 
 QML_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "omavroom", "gui", "qml")
@@ -338,7 +339,8 @@ def _empty_payload():
 
 def test_wall_fits_all_slots_inside_the_wall_area():
     app = _qapp()
-    backend = WallBackend(_config(desktop=1, terminal=2))
+    cfg = _config(desktop=1, terminal=2)
+    backend = WallBackend(cfg)
     backend.apply_payload(_empty_payload())
     engine = _build_engine(backend)
     try:
@@ -358,9 +360,10 @@ def test_wall_fits_all_slots_inside_the_wall_area():
             assert rect["y"] + rect["height"] <= height + 0.5
         # Everything fits AND fills the height: no empty band beneath the wall.
         assert max(r["y"] + r["height"] for r in rects) >= height - 1.0
-        # Screenshots are captured at the tile size (sharp), not a tiny 480px.
-        widest = max(r["width"] for r in rects)
-        assert backend._screenshot_request_width >= widest
+        # Capture widths are config-driven now, not the old 2x-largest-tile
+        # heuristic.
+        assert backend.thumbnailWidth == cfg.gui.thumbnail_width
+        assert backend.focusedWidth == cfg.gui.focused_width
     finally:
         engine.deleteLater()
         app.processEvents()
@@ -622,3 +625,158 @@ def test_settings_dialog_exposes_golden_profile_combo():
     finally:
         engine.deleteLater()
         app.processEvents()
+
+
+# --------------------------------------------------------------------------
+# Package A: adaptive capture (config-driven, focus-aware)
+# --------------------------------------------------------------------------
+class _FakeCaptureClient:
+    """Minimal daemon client recording screenshot widths for one desktop seat."""
+
+    def __init__(self, seats: list[dict]) -> None:
+        self.seats = seats
+        self.screenshots: list[tuple[int, int]] = []
+
+    def pool_status(self) -> dict:
+        return {"seats": self.seats, "per_type": {"desktop": {"max_seats": 1}}}
+
+    def list_execs(self, seat_id: int) -> list[dict]:
+        return []
+
+    def screenshot(self, seat_id: int, *, max_width: int | None = None):
+        self.screenshots.append((int(seat_id), int(max_width or 0)))
+        return b"PNG"
+
+    def close(self) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
+class _FakeMonotonic:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def test_settings_dialog_exposes_capture_controls():
+    app = _qapp()
+    cfg = _config()
+    backend = WallBackend(cfg)
+    engine = _build_engine(backend)
+    try:
+        root = engine.rootObjects()[0]
+        dialog = root.findChild(QObject, "settingsDialog")
+        assert dialog is not None
+        dialog.setProperty("visible", True)
+        _render(app, root)
+        assert _find(root, "liveModeBox"), "live-mode combo did not render"
+        assert backend.thumbnailWidth == cfg.gui.thumbnail_width
+        assert backend.focusedWidth == cfg.gui.focused_width
+        assert backend.wallInterval == cfg.gui.wall_interval_s
+
+        seen: list = []
+        backend.requestConfigValue.connect(
+            lambda section, key, value: seen.append((section, key, value))
+        )
+        backend.setGuiSetting("live_mode", "vnc")
+        backend.setGuiSetting("focused_width", "1600")
+        assert ("gui", "live_mode", "vnc") in seen
+        assert ("gui", "focused_width", "1600") in seen
+        assert backend.liveMode == "vnc"
+        assert "vnc is not yet active" in backend.liveModeNotice
+        assert backend.focusedWidth == 1600
+
+        # A bad value is refused and never reaches the daemon.
+        before = len(seen)
+        backend.setGuiSetting("live_mode", "hologram")
+        assert len(seen) == before
+        assert "live_mode" in backend.lastMessage
+    finally:
+        engine.deleteLater()
+        app.processEvents()
+
+
+def test_focus_triggers_high_res_capture_and_clear_returns_to_thumbnail():
+    app = _qapp()
+    cfg = _config(desktop=1, terminal=0)
+    backend = WallBackend(cfg)
+    clock = _FakeMonotonic()
+    planner = CapturePlanner(
+        thumbnail_width=cfg.gui.thumbnail_width,
+        focused_width=cfg.gui.focused_width,
+        focused_interval_s=cfg.gui.focused_interval_s,
+        wall_interval_s=cfg.gui.wall_interval_s,
+        clock=clock,
+    )
+    client = _FakeCaptureClient([_seat(5, "desktop-1", seat_type="desktop", agent="gfx")])
+    worker = PollWorker("unused", planner=planner, client=client)
+    backend.requestFocus.connect(worker.set_focus)
+
+    backend.apply_payload(
+        {
+            "ok": True,
+            "status": _status(
+                seats=[_seat(5, "desktop-1", seat_type="desktop", agent="gfx")],
+                per_type={"desktop": {"max_seats": 1}, "terminal": {"max_seats": 0}},
+            ),
+            "execs": {},
+            "screenshots": {},
+        }
+    )
+    worker.poll_once()  # first tick: full wall pass at thumbnail width
+    assert client.screenshots == [(5, 480)]
+
+    client.screenshots.clear()
+    backend.toggleFocus("desktop-0")  # emits requestFocus -> worker.set_focus
+    assert backend.focusedSlotKey == "desktop-0"
+    assert client.screenshots == [(5, 1024)]  # prompt high-res capture
+
+    backend.clearFocus()  # emits -1
+    client.screenshots.clear()
+    clock.advance(2.0)  # next wall pass
+    worker.poll_once()
+    assert client.screenshots == [(5, 480)]  # tile returns to thumbnail cadence
+    app.processEvents()
+
+
+# --------------------------------------------------------------------------
+# FIX 4: the settings dialog applies the whole capture set atomically
+# --------------------------------------------------------------------------
+def test_apply_capture_settings_combined_raise_is_atomic():
+    backend = WallBackend(_config())
+    assert (backend.thumbnailWidth, backend.focusedWidth) == (480, 1024)
+    seen: list = []
+    backend.requestConfigValues.connect(lambda section, values: seen.append((section, values)))
+
+    # Raising thumbnail+focused and focused_interval+wall together must all
+    # succeed; per-key writes would reject an intermediate pair.
+    backend.applyCaptureSettings(
+        {
+            "thumbnail_width": 1600,
+            "focused_width": 2048,
+            "focused_interval_s": 1.5,
+            "wall_interval_s": 3.0,
+        }
+    )
+    assert (backend.thumbnailWidth, backend.focusedWidth) == (1600, 2048)
+    assert backend.focusedInterval == 1.5
+    assert backend.wallInterval == 3.0
+    assert seen and seen[-1][0] == "gui"
+    assert seen[-1][1]["thumbnail_width"] == 1600
+    assert seen[-1][1]["focused_width"] == 2048
+    assert seen[-1][1]["wall_interval_s"] == 3.0
+
+
+def test_apply_capture_settings_rejects_invalid_without_partial_change():
+    backend = WallBackend(_config())
+    before = (backend.thumbnailWidth, backend.focusedWidth)
+    backend.applyCaptureSettings({"thumbnail_width": 1600, "focused_width": 100})
+    assert (backend.thumbnailWidth, backend.focusedWidth) == before
+    assert "focused_width" in backend.lastMessage

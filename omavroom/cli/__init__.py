@@ -256,14 +256,14 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument(
         "--interval",
         type=float,
-        default=DEFAULT_REFRESH_INTERVAL_S,
-        help="screenshot/status polling seconds (default: %(default)s)",
+        default=None,
+        help="override [gui].wall_interval_s (screenshot/status polling seconds)",
     )
     gui.add_argument(
         "--screenshot-width",
         type=int,
-        default=480,
-        help="downscale cap for desktop thumbnails (default: %(default)s)",
+        default=None,
+        help="override [gui].thumbnail_width (wall-scale desktop capture width)",
     )
     gui.add_argument(
         "--viewer",

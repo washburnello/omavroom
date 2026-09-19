@@ -20,9 +20,10 @@ import sys
 from pathlib import Path
 
 from omavroom.config import Config
+from omavroom.gui.capture import MAX_WIDTH, MIN_WIDTH
 
-DEFAULT_POLL_INTERVAL_S = 2.0
-DEFAULT_SCREENSHOT_WIDTH = 1024
+DEFAULT_POLL_INTERVAL_S: float | None = None
+DEFAULT_SCREENSHOT_WIDTH: int | None = None
 VIEWER_ENV_VAR = "OMAVROOM_VIEWER"
 
 
@@ -37,13 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval",
         type=float,
         default=DEFAULT_POLL_INTERVAL_S,
-        help="screenshot/status polling seconds (default: %(default)s)",
+        help="override [gui].wall_interval_s (screenshot/status polling seconds)",
     )
     parser.add_argument(
         "--screenshot-width",
         type=int,
         default=DEFAULT_SCREENSHOT_WIDTH,
-        help="downscale cap for desktop thumbnails (default: %(default)s)",
+        help="override [gui].thumbnail_width (wall-scale desktop capture width)",
     )
     parser.add_argument(
         "--viewer",
@@ -66,15 +67,44 @@ def _load_config(path: str | None) -> Config:
         raise SystemExit(2) from exc
 
 
+def effective_capture_overrides(
+    config: Config,
+    *,
+    interval: float | None,
+    screenshot_width: int | None,
+) -> tuple[float, int]:
+    """Clamp CLI capture overrides to the same floors/ceilings as the config.
+
+    Returns ``(wall_interval_s, thumbnail_width)`` for the session. The wall
+    cadence is never below the focused cadence (nor the 0.05s floor); the
+    thumbnail width is clamped to ``MIN_WIDTH..MAX_WIDTH`` and never exceeds
+    the focused width, so an override can never invert the two resolutions or
+    be displayed unclamped.
+    """
+    gui = config.gui
+    raw_width = screenshot_width if screenshot_width is not None else gui.thumbnail_width
+    width = max(MIN_WIDTH, min(MAX_WIDTH, int(raw_width)))
+    width = min(width, int(gui.focused_width))
+    raw_interval = interval if interval is not None else gui.wall_interval_s
+    wall = max(0.05, float(raw_interval))
+    wall = max(float(gui.focused_interval_s), wall)
+    return wall, width
+
+
 def run_gui(
     *,
     socket_path: str | Path | None = None,
-    interval: float = DEFAULT_POLL_INTERVAL_S,
-    screenshot_width: int = DEFAULT_SCREENSHOT_WIDTH,
+    interval: float | None = None,
+    screenshot_width: int | None = None,
     viewer: str | None = None,
     config: Config | None = None,
 ) -> int:
-    """Construct and run the Qt application; returns the process exit code."""
+    """Construct and run the Qt application; returns the process exit code.
+
+    ``interval``/``screenshot_width`` override ``[gui].wall_interval_s`` and
+    ``[gui].thumbnail_width`` for this session only; when ``None`` the config
+    defaults are used.
+    """
     try:
         from PySide6.QtCore import QMetaObject, Qt, QThread, QUrl
         from PySide6.QtGui import QGuiApplication
@@ -91,15 +121,28 @@ def run_gui(
     application.setApplicationDisplayName("omavroom Command Center")
 
     effective_config = config or Config.load()
+    gui = effective_config.gui
+    # CLI overrides are clamped to the config floors/ceilings (see the helper):
+    # the wall cadence can never beat the focused cadence, and the thumbnail
+    # can never exceed the focused capture width.
+    wall_interval, thumbnail_width = effective_capture_overrides(
+        effective_config, interval=interval, screenshot_width=screenshot_width
+    )
     backend = WallBackend(
         effective_config,
-        poll_interval_s=interval,
+        poll_interval_s=wall_interval,
+        screenshot_width=thumbnail_width,
+        focused_width=gui.focused_width,
+        focused_interval_s=gui.focused_interval_s,
         viewer_command=viewer or os.environ.get(VIEWER_ENV_VAR),
     )
     worker = PollWorker(
         socket_path,
-        poll_interval_s=interval,
-        screenshot_max_width=screenshot_width,
+        poll_interval_s=wall_interval,
+        screenshot_max_width=thumbnail_width,
+        focused_width=gui.focused_width,
+        focused_interval_s=gui.focused_interval_s,
+        live_mode=gui.live_mode,
     )
     thread = QThread()
     worker.moveToThread(thread)
@@ -110,8 +153,9 @@ def run_gui(
     backend.requestAction.connect(worker.perform_action)
     backend.requestAdmission.connect(worker.set_admission)
     backend.requestConfigValue.connect(worker.set_config_value)
-    backend.requestPollInterval.connect(worker.set_interval)
-    backend.requestScreenshotWidth.connect(worker.set_screenshot_width)
+    backend.requestConfigValues.connect(worker.set_config_values)
+    backend.requestCaptureConfig.connect(worker.set_capture_config)
+    backend.requestFocus.connect(worker.set_focus)
 
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("backend", backend)
@@ -166,6 +210,7 @@ __all__ = [
     "DEFAULT_SCREENSHOT_WIDTH",
     "VIEWER_ENV_VAR",
     "build_parser",
+    "effective_capture_overrides",
     "main",
     "run_gui",
 ]

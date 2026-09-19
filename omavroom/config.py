@@ -64,6 +64,12 @@ defaults for anything unset:
     backoff_s = 60
     [golden]
     profile = "stock"
+    [gui]
+    thumbnail_width = 480
+    focused_width = 1024
+    focused_interval_s = 0.5
+    wall_interval_s = 2.0
+    live_mode = "stills"
 
 Config discovery precedence (first that exists wins): an explicit ``path``
 argument, then ``$OMAVROOM_CONFIG``, then the per-user XDG config
@@ -72,6 +78,16 @@ built-in defaults. The ``[golden]`` section selects where golden images come
 from: ``stock`` (the default) builds from the stock Omarchy image, ``mirror``
 mirrors this machine's Omarchy. Only the setting is modelled here; the golden
 build itself lives elsewhere.
+
+``[gui]`` tunes the native Command Center's adaptive monitor capture. The wall
+captures every desktop seat as a cheap ``thumbnail_width`` still on the slow
+``wall_interval_s`` cadence, and only the focused monitor at ``focused_width``
+on the fast ``focused_interval_s`` cadence, so enlarging a monitor gets crisp,
+current frames without re-capturing the whole wall at high resolution.
+``live_mode`` is ``stills`` (default) or ``vnc``; ``vnc`` is reserved for a
+future streaming package and is accepted and validated now, but the GUI still
+renders stills and logs a notice. ``focused_width`` must be at least
+``thumbnail_width`` and ``wall_interval_s`` at least ``focused_interval_s``.
 
 ``[network]`` pins the static address the provisioner gives each seat so two
 concurrent seats can never collide on one DHCP lease (the goldens share a
@@ -121,6 +137,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import os
 import threading
 import tomllib
@@ -141,6 +158,12 @@ ADMISSION_OVERRIDES: tuple[str, ...] = ("auto", "allow", "deny")
 GOLDEN_PROFILES: tuple[str, ...] = ("stock", "mirror")
 DEFAULT_GOLDEN_PROFILE = "stock"
 
+#: GUI capture modes: ``stills`` (default) renders periodic PNG framebuffers;
+#: ``vnc`` is reserved for a future live-streaming package and is accepted but
+#: not yet active (the GUI logs a notice and keeps rendering stills).
+LIVE_MODES: tuple[str, ...] = ("stills", "vnc")
+DEFAULT_LIVE_MODE = "stills"
+
 #: Serializes writes to the per-user config file (the daemon is the only
 #: writer, but a single daemon may serve concurrent clients).
 _CONFIG_WRITE_LOCK = threading.Lock()
@@ -149,6 +172,7 @@ _INT = "int"
 _BOOL = "bool"
 _STR = "str"
 _STR_LIST = "str_list"
+_FLOAT = "float"
 
 _SECTION_SCHEMA: dict[str, dict[str, str]] = {
     "capacity": {"total_units": _INT},
@@ -183,6 +207,13 @@ _SECTION_SCHEMA: dict[str, dict[str, str]] = {
     },
     "prewarm": {"max_retries": _INT, "backoff_s": _INT},
     "golden": {"profile": _STR},
+    "gui": {
+        "thumbnail_width": _INT,
+        "focused_width": _INT,
+        "focused_interval_s": _FLOAT,
+        "wall_interval_s": _FLOAT,
+        "live_mode": _STR,
+    },
 }
 
 _SEAT_KEYS: dict[str, str] = {
@@ -216,10 +247,29 @@ def _coerce_int(field: str, value: object, where: str) -> int:
     raise ValueError(f"{field} must be an integer, got {value!r}{where}")
 
 
+def _coerce_float(field: str, value: object, where: str) -> float:
+    """Validate and coerce a config value to a finite float.
+
+    Bools are rejected (``true`` is not a duration); ints and floats are
+    accepted (an integral TOML int means the same thing as ``2.0``); NaN and
+    infinity are rejected.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a number, got {value!r}{where}")
+    if isinstance(value, (int, float)):
+        coerced = float(value)
+        if not math.isfinite(coerced):
+            raise ValueError(f"{field} must be finite, got {value!r}{where}")
+        return coerced
+    raise ValueError(f"{field} must be a number, got {value!r}{where}")
+
+
 def _coerce(kind: str, field: str, value: object, where: str) -> object:
     """Validate/coerce a single config value according to its declared type."""
     if kind == _INT:
         return _coerce_int(field, value, where)
+    if kind == _FLOAT:
+        return _coerce_float(field, value, where)
     if kind == _BOOL:
         if not isinstance(value, bool):
             raise ValueError(f"{field} must be a boolean, got {value!r}{where}")
@@ -569,6 +619,53 @@ class GoldenConfig:
             )
 
 
+@dataclass
+class GuiConfig:
+    """Adaptive monitor-capture tuning for the native wall (package A).
+
+    The wall captures every desktop seat cheaply and often only the focused
+    monitor at high resolution:
+
+    - ``thumbnail_width``: wall-scale capture width in pixels (cheap).
+    - ``focused_width``: capture width for the enlarged/focused monitor. Must
+      be at least ``thumbnail_width``; defaults *above* it so focusing reveals
+      real detail instead of upscaling a thumbnail.
+    - ``focused_interval_s``: fast cadence for the focused monitor.
+    - ``wall_interval_s``: slow cadence for the rest of the wall. Must be at
+      least ``focused_interval_s`` (the wall is the slower pass).
+    - ``live_mode``: ``stills`` (default) or ``vnc``. ``vnc`` is reserved for
+      package C and is accepted/validated now, but the GUI still renders
+      stills and logs a notice.
+    """
+
+    thumbnail_width: int = 480
+    focused_width: int = 1024
+    focused_interval_s: float = 0.5
+    wall_interval_s: float = 2.0
+    live_mode: str = DEFAULT_LIVE_MODE
+
+    def __post_init__(self) -> None:
+        for name in ("thumbnail_width", "focused_width"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 64 <= value <= 4096:
+                raise ValueError(f"{name} must be an integer in 64..4096, got {value!r}")
+        if self.focused_width < self.thumbnail_width:
+            raise ValueError("focused_width must be >= thumbnail_width")
+        for name in ("focused_interval_s", "wall_interval_s"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.05
+            ):
+                raise ValueError(f"{name} must be a number >= 0.05, got {value!r}")
+        if self.wall_interval_s < self.focused_interval_s:
+            raise ValueError("wall_interval_s must be >= focused_interval_s")
+        if self.live_mode not in LIVE_MODES:
+            raise ValueError(f"live_mode must be one of {LIVE_MODES}, got {self.live_mode!r}")
+
+
 def default_config_path() -> Path:
     """Per-user config file: ``$XDG_CONFIG_HOME/omavroom/config.toml``.
 
@@ -623,6 +720,7 @@ class Config:
     export: ExportConfig = field(default_factory=ExportConfig)
     prewarm: PrewarmConfig = field(default_factory=PrewarmConfig)
     golden: GoldenConfig = field(default_factory=GoldenConfig)
+    gui: GuiConfig = field(default_factory=GuiConfig)
 
     @classmethod
     def default(cls) -> Config:
@@ -676,11 +774,35 @@ class Config:
         Every other field of the section is preserved (the section dataclass is
         rebuilt with :func:`dataclasses.replace`).
         """
-        coerced = self.validate_value(section, key, value)
+        return self.set_values(section, {key: value})[key]
+
+    def set_values(self, section: str, values: dict[str, object]) -> dict[str, object]:
+        """Validate and apply several ``section`` keys atomically.
+
+        All keys are validated against the schema first, then the section
+        dataclass is rebuilt **once**, so cross-field rules (e.g.
+        ``focused_width >= thumbnail_width``) are checked against the combined
+        new values rather than each write in turn. On any error the config is
+        left untouched. Returns the coerced values.
+        """
+        if not isinstance(values, dict) or not values:
+            raise ValueError("set_values requires a non-empty mapping")
+        schema = _SECTION_SCHEMA.get(section)
+        if schema is None:
+            raise ValueError(f"unknown config section: {section!r}")
+        unknown = set(values) - set(schema)
+        if unknown:
+            raise ValueError(f"unknown key in [{section}]: {sorted(unknown)[0]!r}")
         current = getattr(self, section, None)
         if current is None or not is_dataclass(current):
             raise ValueError(f"unknown config section: {section!r}")
-        setattr(self, section, replace(current, **{key: coerced}))
+        coerced = {
+            key: _coerce(schema[key], f"{section}.{key}", value, "")
+            for key, value in values.items()
+        }
+        # ``replace`` runs the section's ``__post_init__`` (cross-field checks)
+        # before the attribute is reassigned, so a failure is atomic.
+        setattr(self, section, replace(current, **coerced))
         return coerced
 
     @property
@@ -787,6 +909,8 @@ class Config:
             cfg.prewarm = PrewarmConfig(**section_values["prewarm"])
         if section_values["golden"]:
             cfg.golden = GoldenConfig(**section_values["golden"])
+        if section_values["gui"]:
+            cfg.gui = GuiConfig(**section_values["gui"])
         for seat_type, overrides in seats_data.items():
             base = cfg.seats[seat_type]
             cfg.seats[seat_type] = SeatTypeConfig(
@@ -906,7 +1030,29 @@ def set_config_value(
     can never be one the loader would reject. Returns ``(coerced_value, path)``;
     raises :class:`ValueError` for an unknown section/key or a bad value.
     """
-    coerced = Config.validate_value(section, key, value)
+    coerced, target = set_config_values(section, {key: value}, path=path)
+    return coerced[key], target
+
+
+def set_config_values(
+    section: str,
+    values: dict[str, object],
+    *,
+    path: str | Path | None = None,
+) -> tuple[dict[str, object], Path]:
+    """Validate and persist several ``section`` keys in one atomic write.
+
+    The GUI applies a whole settings change at once (e.g. raising
+    ``thumbnail_width`` and ``focused_width`` together), so a valid combined
+    change is never rejected mid-sequence. Each value is schema-validated and
+    the merged document is re-parsed with :meth:`Config._from_dict` (which
+    enforces cross-field rules) before a single write. Returns
+    ``(coerced_values, path)``; raises :class:`ValueError` for an unknown
+    section/key or a bad value, leaving the file untouched.
+    """
+    if not isinstance(values, dict) or not values:
+        raise ValueError("set_config_values requires a non-empty mapping")
+    coerced = {key: Config.validate_value(section, key, value) for key, value in values.items()}
     target = Path(path) if path is not None else default_config_path()
     with _CONFIG_WRITE_LOCK:
         data: dict = {}
@@ -919,7 +1065,7 @@ def set_config_value(
             body = {}
         if not isinstance(body, dict):
             raise ValueError(f"[{section}] must be a table, got {type(body).__name__}")
-        body[key] = coerced
+        body.update(coerced)
         data[section] = body
         Config._from_dict(data, source=str(target))
         target.parent.mkdir(parents=True, exist_ok=True)

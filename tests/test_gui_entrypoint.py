@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 
+from omavroom.config import Config
 from omavroom.gui import app as gui_app
 
 
@@ -30,8 +31,9 @@ def test_gui_module_imports_without_starting_qt():
 def test_gui_parser_defaults():
     args = gui_app.build_parser().parse_args([])
     assert args.socket is None
-    assert args.interval == gui_app.DEFAULT_POLL_INTERVAL_S
-    assert args.screenshot_width == gui_app.DEFAULT_SCREENSHOT_WIDTH
+    # No override by default: the [gui] config section supplies the cadence.
+    assert args.interval is None
+    assert args.screenshot_width is None
 
 
 def test_gui_parser_overrides():
@@ -70,3 +72,25 @@ def test_cli_gui_dispatch_is_registered():
 
     assert "gui" in cli._COMMAND_HELP
     assert callable(main)
+
+
+# FIX 5: CLI overrides are clamped to the same floors as the config.
+def test_effective_capture_overrides_clamp_to_config_floors():
+    cfg = Config.default()
+    # A too-small width override is raised to the shared floor (64), and the
+    # wall cadence never falls below the focused cadence.
+    wall, width = gui_app.effective_capture_overrides(cfg, interval=None, screenshot_width=1)
+    assert width == 64
+    assert wall == cfg.gui.wall_interval_s
+
+    wall, width = gui_app.effective_capture_overrides(cfg, interval=0, screenshot_width=None)
+    assert wall == cfg.gui.focused_interval_s
+    assert width == cfg.gui.thumbnail_width
+
+
+def test_effective_capture_overrides_ceiling_and_focused_cap():
+    cfg = Config.default()
+    wall, width = gui_app.effective_capture_overrides(cfg, interval=99, screenshot_width=99999)
+    assert wall == 99
+    # The thumbnail can never exceed the focused width, nor the hard ceiling.
+    assert width == min(4096, cfg.gui.focused_width)
