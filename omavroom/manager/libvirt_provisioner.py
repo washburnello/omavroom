@@ -47,6 +47,18 @@ a per-seat ``known_hosts``. Every subsequent SSH uses
 ``StrictHostKeyChecking=no``. Because ``reset`` discards the overlay and
 re-creates it from the golden, identity is regenerated on every reset.
 
+Static addressing
+-----------------
+The goldens share a machine-id/DUID, so DHCP hands two concurrent seats
+the same lease and SSH to one lands on the other. Each seat therefore gets
+a unique address allocated from ``[network]`` at create time (stored as
+``static_ip`` in the seat metadata) and configured in-guest during the same
+agent round as identity rotation: a MAC-matched systemd-networkd unit is
+written, any leftover DHCP unit is removed, networkd is restarted, and the
+provisioner waits until the link actually holds the static address before
+SSHing to it. ``net-dhcp-leases`` is never consulted for a seat created
+this way, and the host network is not mutated.
+
 Discovery and naming
 --------------------
 Seat domains are named ``omavroom-seat-<seat-name>``. That prefix is
@@ -113,6 +125,8 @@ TERMINAL_SNAPSHOT = "term-git"
 WORKSPACE_DIR = "/home/agent/workspace"
 CPU_PERIOD_US = 100_000
 MEM_OVERHEAD_MB = 512
+STATIC_NETWORK_FILE = "10-omavroom-static.network"
+STATIC_NETWORK_DIR = "/etc/systemd/network"
 _GOLDEN_SOURCES: dict[str, tuple[str, str]] = {
     "desktop": ("base.qcow2", DESKTOP_SNAPSHOT),
     "terminal": ("term.qcow2", TERMINAL_SNAPSHOT),
@@ -336,6 +350,32 @@ def build_domain_xml(
     return "<?xml version='1.0' encoding='UTF-8'?>\n" + ET.tostring(root, encoding="unicode") + "\n"
 
 
+def build_static_network_config(
+    *,
+    mac: str,
+    ip: str,
+    prefix_len: int,
+    gateway: str,
+    dns: tuple[str, ...],
+) -> str:
+    """Render the ``systemd-networkd`` unit that pins a seat's static address.
+
+    The unit matches the seat's virtual NIC by MAC (never by interface name,
+    which varies), so it is authoritative over any DHCP unit the golden ships
+    and stays correct after interface renaming.
+    """
+    dns_lines = "".join(f"DNS={server}\n" for server in dns)
+    return (
+        "[Match]\n"
+        f"MACAddress={mac}\n"
+        "\n"
+        "[Network]\n"
+        f"Address={ip}/{prefix_len}\n"
+        f"Gateway={gateway}\n"
+        f"{dns_lines}"
+    )
+
+
 def repo_name_from(value: str) -> str:
     """Derive a stable repo name from a URL or path (basename, no ``.git``)."""
     trimmed = value.rstrip("/")
@@ -428,6 +468,7 @@ class _SeatMeta:
     identity_ready: bool = False
     identity_generation: int = 0
     last_ip: str | None = None
+    static_ip: str | None = None
     repos: dict[str, dict] = field(default_factory=dict)
 
     def to_json(self) -> str:
@@ -640,6 +681,28 @@ class LibvirtProvisioner(Provisioner):
         raw = uuid_module.uuid4().bytes
         return f"52:54:00:{raw[0]:02x}:{raw[1]:02x}:{raw[2]:02x}"
 
+    def _used_static_ips(self, *, exclude: str) -> set[str]:
+        """Every static address already recorded on a seat's metadata."""
+        used: set[str] = set()
+        if not self.seats_dir.exists():
+            return used
+        for seat_dir in self.seats_dir.iterdir():
+            if not seat_dir.is_dir() or seat_dir.name == exclude:
+                continue
+            meta = self._load_meta(seat_dir.name)
+            if meta is not None and meta.static_ip:
+                used.add(meta.static_ip)
+        return used
+
+    def _allocate_static_ip(self, vm_name: str) -> str:
+        """Reserve a unique, per-seat-deterministic address for a new seat."""
+        try:
+            return self.config.network.allocate(vm_name, self._used_static_ips(exclude=vm_name))
+        except ValueError as exc:
+            raise ProvisionerError(
+                f"cannot allocate a static seat IP for {vm_name}: {exc}"
+            ) from exc
+
     def create_from_image(
         self, vm_name: str, seat_type: str, image: str, resources: ResourceCaps
     ) -> str:
@@ -661,6 +724,7 @@ class LibvirtProvisioner(Provisioner):
         shutil.copyfile(self._nvram_template(seat_type), nvram)
 
         mac = self._random_mac()
+        static_ip = self._allocate_static_ip(vm_name)
         domain_uuid = str(uuid_module.uuid4())
         quota = resources.cpu_vcpus * CPU_PERIOD_US
         hard_kb = (resources.memory_mb + MEM_OVERHEAD_MB) * 1024
@@ -700,9 +764,10 @@ class LibvirtProvisioner(Provisioner):
             overlay=str(overlay),
             nvram=str(nvram),
             created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            static_ip=static_ip,
         )
         self._save_meta(meta)
-        log.info("created %s from %s (mac=%s)", ref, golden.name, mac)
+        log.info("created %s from %s (mac=%s static_ip=%s)", ref, golden.name, mac, static_ip)
         return ref
 
     def _assert_no_autostart(self, ref: str) -> None:
@@ -883,8 +948,16 @@ class LibvirtProvisioner(Provisioner):
         raise ProvisionerError(f"no DHCP lease for MAC {mac} within {timeout_s}s")
 
     def ip_for(self, vm_ref: str) -> str:
-        """Current guest IP for a seat (DHCP lease by MAC), refreshed."""
+        """Current guest IP for a seat, refreshed.
+
+        Seats created by this provisioner carry a static address in their
+        metadata and return it directly -- never ``net-dhcp-leases``, which
+        is exactly the shared lease the goldens collide on. Seats adopted
+        from an older layout (no ``static_ip``) fall back to DHCP-by-MAC.
+        """
         meta = self._require_meta(vm_ref)
+        if meta.static_ip:
+            return meta.static_ip
         if meta.last_ip and self._ip_for_mac(meta.mac) == meta.last_ip:
             return meta.last_ip
         ip = self._discover_ip(meta.mac, self.dhcp_timeout_s)
@@ -976,12 +1049,18 @@ class LibvirtProvisioner(Provisioner):
         return self.run(vm_ref, "true", timeout_s=10).ok
 
     def wait_ready(self, vm_ref: str, timeout_s: int) -> None:
-        """Wait for DHCP + SSH; regenerate/pin identity before first SSH."""
+        """Wait for the seat to become SSH-ready at its known address.
+
+        The guest agent (virtio-serial, independent of the network) is used to
+        rotate identity and pin the static address before any SSH, so a seat
+        is never addressed at a transient DHCP lease that another seat may
+        share.
+        """
         meta = self._require_meta(vm_ref)
         deadline = self._monotonic() + timeout_s
-        ip = self._discover_ip(meta.mac, timeout_s)
         remaining = max(1, int(deadline - self._monotonic()))
         self._ensure_identity(vm_ref, rotate=not meta.identity_ready, timeout_s=remaining)
+        ip = self.ip_for(vm_ref)
         while self._monotonic() < deadline:
             if self._guest_alive(vm_ref):
                 usage = self.check_overlay_quota(
@@ -1065,6 +1144,8 @@ class LibvirtProvisioner(Provisioner):
             if result.returncode != 0 or "IDENTITY_ROTATED" not in result.stdout:
                 detail = result.stderr.strip() or result.stdout
                 raise ProvisionerError(f"identity rotation failed on {vm_ref}: {detail}")
+        if meta.static_ip:
+            self._configure_static_network(vm_ref, meta)
         key_result = self.agent_exec(vm_ref, "cat /etc/ssh/ssh_host_ed25519_key.pub", timeout_s=30)
         key = key_result.stdout.strip()
         if not key.startswith("ssh-ed25519 "):
@@ -1079,6 +1160,55 @@ class LibvirtProvisioner(Provisioner):
             meta.identity_generation += 1
         self._save_meta(meta)
         log.info("identity pinned for %s (generation %d)", vm_ref, meta.identity_generation)
+
+    def _configure_static_network(self, vm_ref: str, meta: _SeatMeta) -> None:
+        """Pin the seat's address in-guest over the guest-agent channel.
+
+        Writes a MAC-matched systemd-networkd unit, deletes any leftover DHCP
+        unit the golden shipped, restarts networkd, and waits until the link
+        actually holds the static address. Runs as root via ``guest-exec``, so
+        it works before (and independently of) SSH. Purely in-guest: the host
+        network is never mutated.
+        """
+        static_ip = meta.static_ip
+        if not static_ip:
+            return
+        network = self.config.network
+        content = build_static_network_config(
+            mac=meta.mac,
+            ip=static_ip,
+            prefix_len=network.prefix_len,
+            gateway=network.gateway,
+            dns=tuple(network.dns),
+        )
+        unit = f"{STATIC_NETWORK_DIR}/{STATIC_NETWORK_FILE}"
+        address = f"{static_ip}/{network.prefix_len}"
+        command = (
+            "set -e; umask 022; "
+            f"mkdir -p {STATIC_NETWORK_DIR}; "
+            f"cat > {unit} <<'OMAVROOM_NET_EOF'\n"
+            f"{content}"
+            "OMAVROOM_NET_EOF\n"
+            f"find {STATIC_NETWORK_DIR} -maxdepth 1 -type f -name '*.network' "
+            f"! -name '{STATIC_NETWORK_FILE}' -delete; "
+            "systemctl enable systemd-networkd >/dev/null 2>&1 || true; "
+            "systemctl restart systemd-networkd; "
+            'IFACE=""; for d in /sys/class/net/*; do '
+            f'if [ "$(cat "$d/address" 2>/dev/null)" = {shlex.quote(meta.mac)} ]; '
+            'then IFACE=$(basename "$d"); fi; done; '
+            '[ -n "$IFACE" ] || { echo NET_NO_IFACE; exit 1; }; '
+            "i=0; while [ $i -lt 40 ]; do "
+            f'if ip -o -4 addr show dev "$IFACE" | grep -qF {shlex.quote(address)}; '
+            "then break; fi; i=$((i+1)); sleep 0.5; done; "
+            f'ip -o -4 addr show dev "$IFACE" | grep -qF {shlex.quote(address)} '
+            "|| { echo NET_STATIC_MISSING; exit 1; }; "
+            "echo NET_STATIC_OK"
+        )
+        result = self.agent_exec(vm_ref, command, timeout_s=90)
+        if result.returncode != 0 or "NET_STATIC_OK" not in result.stdout:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise ProvisionerError(f"static network configuration failed on {vm_ref}: {detail}")
+        log.info("static network applied on %s: %s", vm_ref, static_ip)
 
     # ------------------------------------------------------------------
     # reset
@@ -1738,6 +1868,7 @@ __all__ = [
     "CommandResult",
     "LibvirtProvisioner",
     "build_domain_xml",
+    "build_static_network_config",
     "is_safe_ref_token",
     "is_safe_sha",
     "load_template",

@@ -23,6 +23,7 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +36,7 @@ from omavroom.manager.libvirt_provisioner import (
     SEAT_DOMAIN_PREFIX,
     LibvirtProvisioner,
 )
-from omavroom.manager.provisioner import ExportSpec, RepoSpec
+from omavroom.manager.provisioner import ExportSpec, RepoSpec, ResourceCaps
 from omavroom.manager.scheduler import read_free_ram_mb
 
 pytestmark = pytest.mark.integration
@@ -83,6 +84,23 @@ def _host_bridge_ip() -> str:
     return match.group(1) if match else "192.168.122.1"
 
 
+def _make_traversable(path: Path) -> None:
+    """Grant o+x on ``path`` and its ancestors up to /tmp.
+
+    ``pytest``'s tmp dirs are ``0700``; the seat overlay under them is opened
+    by the ``libvirt-qemu`` user, whose dynamic-DAC relabel cannot even stat
+    the overlay without directory execute permission. Test-only and confined
+    to ``/tmp``.
+    """
+    current = path
+    while current != current.parent and current != Path("/tmp"):
+        try:
+            os.chmod(current, current.stat().st_mode | 0o011)
+        except OSError:
+            pass
+        current = current.parent
+
+
 def _assert_clean(prov: LibvirtProvisioner | None = None) -> None:
     """Post-run invariant: no seat domains, templates off, goldens 444."""
     listing = _virsh("list", "--all", "--name")
@@ -125,6 +143,7 @@ def env(tmp_path: Path):
     cfg.seats["terminal"].image = "golden-term"
     run_base = tmp_path / "omavroom-run"
     prov = LibvirtProvisioner(cfg, base_dir=run_base)
+    _make_traversable(run_base)
     try:
         yield SimpleNamespace(prov=prov, cfg=cfg, base=run_base)
     finally:
@@ -365,4 +384,74 @@ def test_desktop_smoke_if_ram(env, tmp_path: Path) -> None:
     assert width <= 800
     print(f"\n[desktop] monitors ok; screenshot {width}x{height}")
     mgr.release_seat(seat_id, export=False).result(timeout=180)
+    _assert_clean(env.prov)
+
+
+# --------------------------------------------------------------------------
+# issue #1: two terminal seats booted together must not share one DHCP IP
+# --------------------------------------------------------------------------
+def test_two_concurrent_terminal_seats_get_distinct_static_ips(env, tmp_path: Path) -> None:
+    """The exact bug: concurrent seats collided on one DHCP lease.
+
+    Two seats are created, then booted in parallel threads so they fight for
+    a DHCP lease at the same moment (the shared golden DUID). Each must come
+    up on its own static address and both must become SSH-ready; afterwards
+    neither seat domain is left behind.
+    """
+    prov = env.prov
+    resources = env.cfg.resources_for("terminal")
+    caps = ResourceCaps(
+        cpu_vcpus=resources.cpu_vcpus,
+        memory_mb=resources.memory_mb,
+        overlay_max_gb=resources.overlay_max_gb,
+    )
+    names = ("ipfix-a", "ipfix-b")
+    refs: list[str] = []
+    try:
+        # Allocate/create sequentially (the scheduler does too); boot in
+        # parallel so both guests request DHCP before either is reconfigured.
+        for name in names:
+            ref = prov.create_from_image(name, "terminal", "golden-term", caps)
+            prov.apply_resource_limits(ref, caps)
+            refs.append(ref)
+
+        errors: list[tuple[str, str]] = []
+
+        def _boot(ref: str) -> None:
+            try:
+                prov.start(ref)
+                prov.wait_ready(ref, 480)
+            except Exception as exc:  # noqa: BLE001 - collected for the assert
+                errors.append((ref, repr(exc)))
+
+        threads = [threading.Thread(target=_boot, args=(ref,)) for ref in refs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=540)
+        assert not any(t.is_alive() for t in threads), "seat provisioning timed out"
+        assert errors == [], errors
+
+        ips = [prov.ip_for(ref) for ref in refs]
+        print(f"\n[ipfix] static ips: {dict(zip(names, ips))}")
+        assert ips[0] != ips[1], f"seats collided on the same address: {ips}"
+
+        network = env.cfg.network
+        for ref, ip in zip(refs, ips):
+            assert ip.startswith(network.subnet_prefix + ".")
+            host = int(ip.rsplit(".", 1)[1])
+            assert network.host_range_start <= host <= network.host_range_end, ip
+            # both seats are SSH-ready at their own address
+            assert prov._guest_alive(ref), f"{ref} is not SSH-ready at {ip}"
+            guest_addrs = prov.run(ref, "ip -o -4 addr show", timeout_s=30, check=True).stdout
+            assert f"{ip}/" in guest_addrs, f"{ref} does not hold {ip}: {guest_addrs}"
+            known_hosts = env.base / "seats" / ref[len(SEAT_DOMAIN_PREFIX) :] / "known_hosts"
+            assert known_hosts.read_text(encoding="utf-8").startswith(f"{ip} "), ref
+            print(f"[ipfix] {ref} SSH-ready at {ip}")
+    finally:
+        for ref in refs:
+            try:
+                prov.destroy(ref)
+            except Exception:  # noqa: BLE001 - teardown must be best-effort
+                pass
     _assert_clean(env.prov)

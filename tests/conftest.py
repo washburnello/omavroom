@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import os
+
+# Hard guard: a test run must never open real windows on the user's session.
+# This runs before any Qt import (test modules import PySide6 later), so the
+# whole suite is offscreen even if a caller's environment asks for wayland.
+# A developer who really wants a visible window sets OMAVROOM_GUI_TEST_REAL=1.
+if os.environ.get("OMAVROOM_GUI_TEST_REAL") != "1":
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
 import threading
 import time
 from contextlib import contextmanager

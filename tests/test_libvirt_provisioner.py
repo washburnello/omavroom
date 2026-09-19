@@ -780,3 +780,94 @@ def test_prepare_repo_rejects_option_like_url_and_branch(tmp_path: Path) -> None
             "omavroom-seat-terminal-1",
             RepoSpec(url="https://example.com/x.git", branch="--upload-pack=/bin/echo"),
         )
+
+
+# --------------------------------------------------------------------------
+# static seat addressing (DHCP collision fix)
+# --------------------------------------------------------------------------
+def _seat_with_overlay(prov: LibvirtProvisioner, name: str = "terminal-1") -> str:
+    overlay = prov.seats_dir / name / "overlay.qcow2"
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    overlay.write_bytes(b"x")
+    _meta(prov, name, overlay)
+    return f"omavroom-seat-{name}"
+
+
+def test_ip_for_returns_static_without_touching_dhcp(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv, timeout, input_text):
+        calls.append(list(argv))
+        return CommandResult(1, "", "unexpected host command")
+
+    prov = _prov(tmp_path, host_runner=runner)
+    ref = _seat_with_overlay(prov)
+    meta = prov._load_meta(ref)
+    assert meta is not None
+    meta.static_ip = "192.168.122.205"
+    prov._save_meta(meta)
+    assert prov.ip_for(ref) == "192.168.122.205"
+    assert calls == [], "ip_for must not consult net-dhcp-leases for a static seat"
+
+
+def test_static_allocation_is_unique_across_seats(tmp_path: Path) -> None:
+    prov = _prov(tmp_path)
+    ref = _seat_with_overlay(prov, "terminal-1")
+    meta = prov._load_meta(ref)
+    assert meta is not None
+    meta.static_ip = "192.168.122.200"
+    prov._save_meta(meta)
+    allocated = prov._allocate_static_ip("terminal-2")
+    assert allocated != "192.168.122.200"
+    assert allocated.startswith("192.168.122.")
+
+
+class _StaticAgentProvisioner(LibvirtProvisioner):
+    """Scripts the guest agent to prove the static-unit flow end to end."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.agent_commands: list[str] = []
+
+    def agent_ping(self, vm_ref: str) -> bool:
+        return True
+
+    def agent_exec(self, vm_ref: str, command: str, *, timeout_s: int = 60) -> CommandResult:
+        self.agent_commands.append(command)
+        if "ssh_host_ed25519_key.pub" in command:
+            return CommandResult(0, "ssh-ed25519 AAAAC3NzaCAgZWQyNTUxOQ\n", "")
+        if "IDENTITY_ROTATED" in command:
+            return CommandResult(0, "IDENTITY_ROTATED\n", "")
+        return CommandResult(0, "NET_STATIC_OK\n", "")
+
+
+def test_configure_static_network_writes_mac_matched_unit(tmp_path: Path) -> None:
+    prov = _StaticAgentProvisioner(Config.default(), base_dir=tmp_path)
+    ref = _seat_with_overlay(prov)
+    meta = prov._load_meta(ref)
+    assert meta is not None
+    meta.static_ip = "192.168.122.207"
+    prov._save_meta(meta)
+    prov._configure_static_network(ref, meta)
+    assert len(prov.agent_commands) == 1
+    command = prov.agent_commands[0]
+    assert f"MACAddress={meta.mac}" in command
+    assert "Address=192.168.122.207/24" in command
+    assert "Gateway=192.168.122.1" in command
+    assert "DNS=192.168.122.1" in command
+    # leftover DHCP units are removed; the static unit is not
+    assert "! -name '10-omavroom-static.network' -delete" in command
+    assert "systemctl restart systemd-networkd" in command
+
+
+def test_ensure_identity_pins_known_hosts_at_static_ip(tmp_path: Path) -> None:
+    prov = _StaticAgentProvisioner(Config.default(), base_dir=tmp_path)
+    ref = _seat_with_overlay(prov)
+    meta = prov._load_meta(ref)
+    assert meta is not None
+    meta.static_ip = "192.168.122.209"
+    prov._save_meta(meta)
+    prov._ensure_identity(ref, rotate=True, timeout_s=60)
+    known_hosts = (prov.seats_dir / "terminal-1" / "known_hosts").read_text(encoding="utf-8")
+    assert known_hosts.startswith("192.168.122.209 ssh-ed25519 ")
+    assert any("Address=192.168.122.209/24" in cmd for cmd in prov.agent_commands)

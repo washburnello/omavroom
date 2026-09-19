@@ -34,6 +34,12 @@ defaults for anything unset:
     overlay_max_gb = 10
     [host]
     headroom_floor_mb = 2048
+    [network]
+    subnet_prefix = "192.168.122"
+    gateway = "192.168.122.1"
+    dns = ["192.168.122.1"]
+    host_range_start = 200
+    host_range_end = 250
     [admission]
     dynamic = true
     override = "auto"
@@ -65,6 +71,15 @@ built-in defaults. The ``[golden]`` section selects where golden images come
 from: ``stock`` (the default) builds from the stock Omarchy image, ``mirror``
 mirrors this machine's Omarchy. Only the setting is modelled here; the golden
 build itself lives elsewhere.
+
+``[network]`` pins the static address the provisioner gives each seat so two
+concurrent seats can never collide on one DHCP lease (the goldens share a
+machine-id/DUID, so dnsmasq would hand out a single lease). ``subnet_prefix``
+is the first three octets of the libvirt NAT subnet, ``gateway``/``dns`` are
+the resolvers, and ``host_range_start``/``host_range_end`` bound the pool of
+guest addresses (the last octet). :meth:`NetworkConfig.allocate` hands out a
+unique, per-seat-deterministic address from that range; the provisioner writes
+it into the guest over the qemu-guest-agent channel and SSHes to it directly.
 
 Phase 4 scheduler policy is deliberately *per seat type* (a locked PLAN.md
 decision: the operator, not the scheduler, decides how capacity splits
@@ -103,6 +118,8 @@ sections, and wrongly typed values are all rejected with ValueError
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import os
 import threading
 import tomllib
@@ -147,6 +164,13 @@ _SECTION_SCHEMA: dict[str, dict[str, str]] = {
         "max_concurrent_total": _INT,
     },
     "admission": {"dynamic": _BOOL, "override": _STR},
+    "network": {
+        "subnet_prefix": _STR,
+        "gateway": _STR,
+        "dns": _STR_LIST,
+        "host_range_start": _INT,
+        "host_range_end": _INT,
+    },
     "export": {
         "max_files_changed": _INT,
         "max_insertions": _INT,
@@ -293,6 +317,106 @@ class HostConfig:
     def __post_init__(self) -> None:
         if self.headroom_floor_mb < 0:
             raise ValueError("headroom_floor_mb must be >= 0")
+
+
+def _parse_ipv4(value: object, field: str) -> str:
+    """Validate a dotted-quad IPv4 literal (leading zeros rejected)."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a dotted-quad IPv4 address, got {value!r}")
+    try:
+        return str(ipaddress.IPv4Address(value.strip()))
+    except (ipaddress.AddressValueError, ValueError) as exc:
+        raise ValueError(f"{field} must be a dotted-quad IPv4 address, got {value!r}") from exc
+
+
+def _parse_subnet_prefix(value: object, field: str) -> str:
+    """Validate the first three octets of a /24 (e.g. ``192.168.122``)."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a /24 prefix like '192.168.122', got {value!r}")
+    parts = value.strip().split(".")
+    if len(parts) != 3 or not all(
+        part.isdigit() and str(int(part)) == part and 0 <= int(part) <= 255 for part in parts
+    ):
+        raise ValueError(f"{field} must be a /24 prefix like '192.168.122', got {value!r}")
+    return value.strip()
+
+
+@dataclass
+class NetworkConfig:
+    """Static per-seat addressing for the libvirt NAT network.
+
+    The goldens share a machine-id/DUID, so a DHCP-only boot lets two seats
+    colocate on one lease. Each seat is instead handed a unique address from
+    this host range and configured in-guest (systemd-networkd) before SSH.
+    ``subnet_prefix`` is the /24 network (the libvirt ``default`` NAT subnet);
+    ``host_range_start``/``host_range_end`` are the last-octet bounds.
+    """
+
+    subnet_prefix: str = "192.168.122"
+    gateway: str | None = None
+    dns: tuple[str, ...] | None = None
+    host_range_start: int = 200
+    host_range_end: int = 250
+
+    def __post_init__(self) -> None:
+        self.subnet_prefix = _parse_subnet_prefix(self.subnet_prefix, "network.subnet_prefix")
+        # Gateway and DNS default to the subnet's ``.1`` when unset, so a
+        # single-key change to ``subnet_prefix`` stays self-consistent.
+        if self.gateway is None:
+            self.gateway = f"{self.subnet_prefix}.1"
+        self.gateway = _parse_ipv4(self.gateway, "network.gateway")
+        if not self.gateway.startswith(self.subnet_prefix + "."):
+            raise ValueError("network.gateway must be inside network.subnet_prefix")
+        if self.dns is None:
+            self.dns = (self.gateway,)
+        if not isinstance(self.dns, (list, tuple)) or not self.dns:
+            raise ValueError("network.dns must list at least one resolver")
+        self.dns = tuple(_parse_ipv4(server, "network.dns") for server in self.dns)
+        for name in ("host_range_start", "host_range_end"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 254:
+                raise ValueError(f"network.{name} must be in 1..254, got {value!r}")
+        if self.host_range_start > self.host_range_end:
+            raise ValueError("network.host_range_start must be <= host_range_end")
+
+    @property
+    def prefix_len(self) -> int:
+        """The CIDR prefix length implied by ``subnet_prefix`` (always /24)."""
+        return 24
+
+    def ip_for_host(self, host: int) -> str:
+        """Render a ``subnet_prefix`` address for a last-octet ``host``."""
+        if not self.host_range_start <= host <= self.host_range_end:
+            raise ValueError(
+                f"host {host} outside configured range "
+                f"{self.host_range_start}..{self.host_range_end}"
+            )
+        return f"{self.subnet_prefix}.{host}"
+
+    def host_ips(self) -> list[str]:
+        """Every address in the configured pool, in ascending order."""
+        return [self.ip_for_host(h) for h in range(self.host_range_start, self.host_range_end + 1)]
+
+    def allocate(self, seat_name: str, used: set[str]) -> str:
+        """Return a unique address from the pool for ``seat_name``.
+
+        The starting offset is a stable hash of the seat name, so a given
+        seat deterministically prefers the same address across resets and
+        re-creation (``where possible``); linear probing then guarantees
+        uniqueness against every address already handed out. Raises
+        :class:`ValueError` when the pool is exhausted.
+        """
+        candidates = self.host_ips()
+        digest = hashlib.sha256(seat_name.encode()).hexdigest()
+        start = int(digest, 16) % len(candidates)
+        for offset in range(len(candidates)):
+            candidate = candidates[(start + offset) % len(candidates)]
+            if candidate not in used:
+                return candidate
+        raise ValueError(
+            f"no free address in network range {self.host_range_start}.."
+            f"{self.host_range_end} for {seat_name!r}"
+        )
 
 
 @dataclass
@@ -482,6 +606,7 @@ class Config:
     resources: dict[str, ResourceConfig] = field(default_factory=_default_resources)
     images: dict[str, ImageConfig] = field(default_factory=_default_images)
     host: HostConfig = field(default_factory=HostConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
     admission: AdmissionConfig = field(default_factory=AdmissionConfig)
     leases: LeaseConfig = field(default_factory=LeaseConfig)
     exec: ExecConfig = field(default_factory=ExecConfig)
@@ -638,6 +763,8 @@ class Config:
             cfg.capacity = CapacityConfig(**section_values["capacity"])
         if section_values["host"]:
             cfg.host = HostConfig(**section_values["host"])
+        if section_values["network"]:
+            cfg.network = NetworkConfig(**section_values["network"])
         if section_values["leases"]:
             cfg.leases = LeaseConfig(**section_values["leases"])
         if section_values["exec"]:
