@@ -45,8 +45,12 @@ else or unset enables it).
 
 ## opencode config
 
-The manager/user wires this into opencode; this repo does **not** edit the
-real config. Add to `~/.config/opencode/opencode.json` (or `opencode.jsonc`):
+Configure the MCP **globally** (`~/.config/opencode/opencode.json`), so every
+opencode session — in every project — gets the omavroom tools. The command is
+the client binary only; it is not tied to the agent's working directory.
+
+Install the entry points where opencode can find them (a symlink from
+`~/.local/bin` to the venv entry point is enough), then:
 
 ```jsonc
 {
@@ -54,13 +58,7 @@ real config. Add to `~/.config/opencode/opencode.json` (or `opencode.jsonc`):
   "mcp": {
     "omavroom": {
       "type": "local",
-      "command": [
-        "uv",
-        "run",
-        "--directory",
-        "/home/washburnello/Work/omavroom",
-        "omavroom-mcp"
-      ],
+      "command": ["omavroom-mcp"],
       "enabled": true,
       "environment": {
         "OMAVROOM_PROVISIONER": "libvirt",
@@ -71,20 +69,18 @@ real config. Add to `~/.config/opencode/opencode.json` (or `opencode.jsonc`):
 }
 ```
 
-Equivalent using the venv binary directly:
+If `omavroom-mcp` is not on the `PATH` of whatever launches opencode, point at
+the entry point directly instead:
 
 ```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "omavroom": {
-      "type": "local",
-      "command": ["/home/washburnello/Work/omavroom/.venv/bin/omavroom-mcp"],
-      "enabled": true
-    }
-  }
-}
+"command": ["/home/<you>/Work/omavroom/.venv/bin/omavroom-mcp"]
 ```
+
+One shared daemon owns the pool — run it as a systemd **user** service
+(`omavroom-daemon.service`) so it is always available; the MCP reuses a live
+daemon and only starts one if none is running. Because there is a single
+daemon, every project shares the same seats and the Command Center sees them
+all.
 
 MCP tools are registered with the server name as a prefix, so this server's
 tools appear as `omavroom_pool_status`, `omavroom_exec_run`, etc. Disable all
