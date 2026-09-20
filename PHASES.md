@@ -210,6 +210,17 @@ grown toolchain):
   plus an MCP `guide` tool/resource as a fallback for agents without the skill.
   Split because the triggers differ and the golden-prep procedure would
   otherwise bloat everyday seat use.
+- **`omavroom init`** scaffolds a project for isolated work: detects the
+  toolchain from its files (`Cargo.toml` -> rust, `package.json` -> node,
+  `pyproject` -> python, `go.mod` -> go, `Dockerfile` -> docker, `*.tex` ->
+  tex; always git + build), writes `.omavroom/image.toml`, and appends a short
+  isolated-work section to the project's `AGENTS.md` (never clobbering).
+  `image_plan`/`image_ensure` read an existing recipe when no tools are given,
+  so the loop is `omavroom init` -> `image_ensure` with no arguments.
+- **Global instruction** (`~/.config/opencode/AGENTS.md`, wired via opencode's
+  `instructions`) nudges every session: never launch a GUI on the host; use a
+  seat; for toolchains use the project-image flow rather than hand-installing.
+  Together with the skill this makes new projects zero-prompt.
 
 ## Phase 5 — MCP server + opencode wiring
 
