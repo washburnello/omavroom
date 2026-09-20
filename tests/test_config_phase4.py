@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from omavroom.config import (
-    DEFAULT_IMAGE,
     AdmissionConfig,
     Config,
     ExportConfig,

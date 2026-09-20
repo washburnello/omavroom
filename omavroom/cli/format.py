@@ -190,6 +190,10 @@ def settings_dict(config: Config) -> dict:
             "backoff_s": config.prewarm.backoff_s,
         },
         "golden": {"profile": config.golden.profile},
+        "images": {
+            "build_policy": config.image_build.policy,
+            "allowlist": list(config.image_build.allowlist),
+        },
         "projects": {
             name: {"image": project.image} for name, project in sorted(config.projects.items())
         },
@@ -268,6 +272,10 @@ def settings_report(config: Config) -> str:
             f"prewarm: max_retries={snapshot['prewarm']['max_retries']}"
             f" backoff_s={snapshot['prewarm']['backoff_s']}",
             f"golden: profile={golden['profile']}",
+            (
+                f"images: build_policy={snapshot['images']['build_policy']}"
+                f" allowlist={','.join(snapshot['images']['allowlist']) or '-'}"
+            ),
             (
                 "projects: "
                 + (

@@ -24,8 +24,10 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclasses_replace
 
 
 class ProvisionerError(RuntimeError):
@@ -41,6 +43,108 @@ class ImageBuildNotApproved(RuntimeError):
     """
 
     code = "build_not_approved"
+
+
+def short_log_tail(text: str, *, limit: int = 200) -> str:
+    """Return the last line of a build log, truncated to ``limit`` characters."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = lines[-1].strip()
+    if len(tail) <= limit:
+        return tail
+    return "..." + tail[-(limit - 3) :]
+
+
+@dataclass
+class BuildStatus:
+    """Live visibility for one project-image build (:meth:`BuildTracker`).
+
+    The manager starts a record when a build is dispatched and updates it as
+    the provisioner streams log lines; ``pool_status.builds`` and
+    ``image_status`` surface it, and ``image_logs`` returns the tail.
+    """
+
+    name: str
+    state: str  # pending | running | done | error
+    started_at: str
+    finished_at: str | None = None
+    error: str | None = None
+    log: str = field(repr=False, default="")
+
+
+class BuildTracker:
+    """Thread-safe, bounded record of project-image builds.
+
+    The manager owns one tracker. A build is registered when it is dispatched
+    (``pending``), moves to ``running`` on the first log line, and finishes
+    ``done``/``error`` with a timestamp. Log text is bounded on append so a
+    long pacman run cannot grow memory without limit; the most recent
+    ``max_log_bytes`` are always retained for ``image_logs``.
+    """
+
+    def __init__(self, *, max_records: int = 32, max_log_bytes: int = 64 * 1024) -> None:
+        if max_records < 1:
+            raise ValueError("max_records must be >= 1")
+        if max_log_bytes < 1:
+            raise ValueError("max_log_bytes must be >= 1")
+        self.max_records = max_records
+        self.max_log_bytes = max_log_bytes
+        self._records: dict[str, BuildStatus] = {}
+        self._order: deque[str] = deque()
+        self._lock = threading.Lock()
+
+    def start(self, name: str, *, started_at: str) -> BuildStatus:
+        with self._lock:
+            record = BuildStatus(name=name, state="pending", started_at=started_at)
+            self._records[name] = record
+            self._order.append(name)
+            self._prune_locked()
+            return record
+
+    def _prune_locked(self) -> None:
+        while len(self._records) > self.max_records:
+            oldest = self._order.popleft() if self._order else None
+            if oldest is None:
+                break
+            self._records.pop(oldest, None)
+
+    def append_log(self, name: str, text: str) -> None:
+        with self._lock:
+            record = self._records.get(name)
+            if record is None:
+                return
+            if record.state == "pending":
+                record.state = "running"
+            record.log = (record.log + text)[-self.max_log_bytes :]
+
+    def finish(self, name: str, *, finished_at: str, error: str | None = None) -> None:
+        with self._lock:
+            record = self._records.get(name)
+            if record is None:
+                return
+            record.state = "error" if error else "done"
+            record.finished_at = finished_at
+            if error:
+                record.error = error
+
+    def info(self, name: str) -> BuildStatus | None:
+        with self._lock:
+            record = self._records.get(name)
+            if record is None:
+                return None
+            # Return a copy so a reader can never mutate the live record.
+            return dataclasses_replace(record)
+
+    def view(self) -> list[BuildStatus]:
+        """Every tracked build, most recently started last (copies)."""
+        with self._lock:
+            return [dataclasses_replace(self._records[name]) for name in self._order]
+
+    def log_text(self, name: str) -> str | None:
+        with self._lock:
+            record = self._records.get(name)
+            return record.log if record is not None else None
 
 
 @dataclass(frozen=True)

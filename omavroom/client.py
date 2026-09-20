@@ -563,6 +563,57 @@ class DaemonClient:
         """Registered golden/project images and their bindings."""
         return self.call("image_list")
 
+    def image_plan(
+        self,
+        project: str,
+        *,
+        tools: list[str] | None = None,
+        packages: list[str] | None = None,
+        base: str | None = None,
+    ) -> dict:
+        """Read-only plan: recipe, target image, missing packages, satisfied.
+
+        Resolves high-level ``tools`` (``rust``, ``node``, ...) to packages,
+        merges them with the project image's recorded set, and reports what a
+        build would add. No side effects.
+        """
+        return self.call("image_plan", project=project, tools=tools, packages=packages, base=base)
+
+    def image_ensure(
+        self,
+        project: str,
+        *,
+        tools: list[str] | None = None,
+        packages: list[str] | None = None,
+        base: str | None = None,
+        project_root: str | None = None,
+        approved: bool = False,
+    ) -> dict:
+        """Idempotently make the project image satisfy ``tools``/``packages``.
+
+        Returns ``{"status": "satisfied"}``, ``{"status": "needs_approval",
+        "recipe": ...}``, or ``{"status": "building", "job_id": ...}`` (poll
+        the job for the final ``built`` result). ``project_root`` versions the
+        recipe at ``.omavroom/image.toml``; ``approved=True`` forces a build.
+        """
+        return self.call(
+            "image_ensure",
+            project=project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+            approved=approved,
+        )
+
+    def image_status(self, name: str) -> dict:
+        """Live state for one image build (pending/running/done/error)."""
+        return self.call("image_status", name=name)
+
+    def image_logs(self, name: str, *, tail: int = 50) -> dict:
+        """The last ``tail`` lines of an image build's log."""
+        return self.call("image_logs", name=name, tail=tail)
+
     def image_build(
         self,
         name: str,

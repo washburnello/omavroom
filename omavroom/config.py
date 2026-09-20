@@ -15,17 +15,18 @@ defaults for anything unset:
     min_seats = 0
     max_seats = 2
     image = "omavroom-base"
+    [images]
+    build_policy = "allowlist"
+    allowlist = ["base-devel", "rustup", "nodejs", "npm", "python", "python-pip", "go", "git"]
     [images.golden-omarchy]
     golden = "~/.local/share/omavroom/images/golden-omarchy.qcow2"
     seat_type = "desktop"
-    [images.golden-desktop]
-    golden = "~/.local/share/omavroom/images/golden-desktop.qcow2"
+    [images.my-project-image]
+    golden = "~/.local/share/omavroom/images/my-project-image.qcow2"
     seat_type = "desktop"
-    [images.golden-term]
-    golden = "~/.local/share/omavroom/images/golden-term.qcow2"
-    seat_type = "terminal"
-    [projects.my-project]
-    image = "my-project-image"
+    base = "golden-omarchy"
+    packages = ["rustup", "base-devel"]
+    recipe_hash = "..."
     [resources.desktop]
     cpu_vcpus = 2
     memory_mb = 4096
@@ -125,6 +126,14 @@ between lanes):
   recipe flow that builds these project images lives in
   :func:`parse_recipe` / :class:`ImageRecipe` and
   ``Provisioner.build_image``.
+- ``[images] build_policy`` (``ask`` / ``allowlist`` / ``auto``) and
+  ``allowlist`` gate :meth:`Manager.ensure_image`'s automatic builds:
+  ``ask`` never auto-builds, ``allowlist`` (the default) auto-builds only when
+  every resolved package is listed, ``auto`` always builds. Explicit
+  ``approved=True`` bypasses the policy. ``[images.<name>]`` also records the
+  recipe metadata (``base`` / ``packages`` / ``post`` / ``recipe_hash``) used
+  for idempotency and the missing-package diff; see :class:`ImageBuildConfig`
+  and :func:`recipe_hash`.
 - ``admission`` controls the dynamic live-RAM check: ``dynamic`` enables
   it, ``override`` is a manual escape hatch (``auto`` = normal,
   ``allow`` = skip the live-RAM gate but still honour static bounds,
@@ -166,6 +175,37 @@ ADMISSION_OVERRIDES: tuple[str, ...] = ("auto", "allow", "deny")
 #: Golden-image source profiles: ``stock`` (default) or ``mirror``.
 GOLDEN_PROFILES: tuple[str, ...] = ("stock", "mirror")
 DEFAULT_GOLDEN_PROFILE = "stock"
+
+#: Auto-build policies for ``[images] build_policy``:
+#: ``ask`` never auto-builds, ``allowlist`` (default) auto-builds only when
+#: every resolved package is in ``[images] allowlist``, ``auto`` always builds.
+IMAGE_BUILD_POLICIES: tuple[str, ...] = ("ask", "allowlist", "auto")
+DEFAULT_IMAGE_BUILD_POLICY = "allowlist"
+#: Packages that may be installed automatically under the ``allowlist`` policy.
+#: Deliberately excludes heavier/riskier tools (``docker``, ``jdk-openjdk``,
+#: ``texlive``): those still build, but only with explicit approval.
+DEFAULT_IMAGE_ALLOWLIST: tuple[str, ...] = (
+    "base-devel",
+    "rustup",
+    "nodejs",
+    "npm",
+    "python",
+    "python-pip",
+    "go",
+    "git",
+    "jq",
+    "ripgrep",
+    "fd",
+    "wl-clipboard",
+    "curl",
+    "wget",
+    "unzip",
+    "zip",
+    "openssh",
+    "make",
+    "cmake",
+    "pkgconf",
+)
 
 #: GUI capture modes: ``stills`` (default) renders periodic PNG framebuffers;
 #: ``vnc`` streams the focused desktop monitor in real time, falling back to
@@ -240,6 +280,21 @@ _RESOURCE_KEYS: dict[str, str] = {
 
 _PROJECT_KEYS: dict[str, str] = {"image": _STR}
 
+#: Scalar keys accepted directly under ``[images]`` alongside the
+#: ``[images.<name>]`` tables (the auto-build policy + its allowlist).
+_IMAGE_BUILD_KEYS: dict[str, str] = {"build_policy": _STR, "allowlist": _STR_LIST}
+#: Keys accepted inside one ``[images.<name>]`` image table. ``base`` /
+#: ``packages`` / ``post`` / ``recipe_hash`` are the recorded recipe metadata
+#: used for idempotency and the missing-package diff.
+_IMAGE_KEYS: tuple[str, ...] = (
+    "golden",
+    "seat_type",
+    "base",
+    "packages",
+    "post",
+    "recipe_hash",
+)
+
 #: Recipe file, relative to a project repo root.
 RECIPE_RELATIVE_PATH = Path(".omavroom") / "image.toml"
 #: Recipe keys accepted at the top level.
@@ -264,6 +319,25 @@ def is_safe_package(name: object) -> bool:
     if not isinstance(name, str) or ".." in name:
         return False
     return bool(_PACKAGE_RE.fullmatch(name))
+
+
+def recipe_hash(base: str | None, packages, post) -> str:
+    """Stable content hash of a recipe (``base`` + sorted packages + ``post``).
+
+    Package *order* is irrelevant (sorted) so reordering a recipe does not
+    force a rebuild; ``post`` order is preserved because commands run in
+    sequence. This is the idempotency key: a project image is current only
+    while its recorded hash matches the would-be recipe.
+    """
+    payload = "\n".join(
+        [
+            base or "",
+            *sorted(str(package) for package in packages),
+            "--post--",
+            *(str(command) for command in post),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _coerce_int(field: str, value: object, where: str) -> int:
@@ -368,21 +442,81 @@ class ImageConfig:
 
     ``seat_type`` is optional but, when set, a seat of another type may not
     be provisioned from it (the provisioner enforces the match).
+
+    ``base`` / ``packages`` / ``post`` / ``recipe_hash`` are the *recorded
+    recipe metadata* for a project image: what it was built from, the
+    cumulative package set it contains, its ordered post commands, and the
+    stable :func:`recipe_hash` of that recipe. They make ``image_ensure``
+    idempotent (compare hashes) and let an "add this tool" request diff to the
+    *newly missing* packages. Hand-registered goldens may leave them empty; a
+    request against such an image then reports every package as missing.
     """
 
     golden: str = ""
     seat_type: str | None = None
+    base: str | None = None
+    packages: tuple[str, ...] = ()
+    post: tuple[str, ...] = ()
+    recipe_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.golden, str) or not self.golden.strip():
             raise ValueError("golden must be a non-empty string")
         if self.seat_type is not None and self.seat_type not in SEAT_TYPES:
             raise ValueError(f"seat_type must be one of {SEAT_TYPES}, got {self.seat_type!r}")
+        if self.base is not None:
+            if not isinstance(self.base, str) or not self.base.strip():
+                raise ValueError("image base must be a non-empty string")
+            if not is_safe_image_name(self.base):
+                raise ValueError(f"image base is not a valid image name: {self.base!r}")
+        packages = tuple(self.packages)
+        for package in packages:
+            if not is_safe_package(package):
+                raise ValueError(f"image package is not a valid package name: {package!r}")
+        post = tuple(self.post)
+        for command in post:
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("image post commands must be non-empty strings")
+        if self.recipe_hash is not None and (
+            not isinstance(self.recipe_hash, str) or not self.recipe_hash.strip()
+        ):
+            raise ValueError("image recipe_hash must be a non-empty string or None")
+        object.__setattr__(self, "packages", packages)
+        object.__setattr__(self, "post", post)
 
     @property
     def path(self) -> Path:
         """The golden qcow2 path with ``~`` expanded."""
         return Path(self.golden).expanduser()
+
+
+@dataclass
+class ImageBuildConfig:
+    """Auto-build policy for :meth:`Manager.ensure_image` (``[images]`` table).
+
+    - ``policy = "ask"``: never auto-build; every change returns
+      ``needs_approval``.
+    - ``policy = "allowlist"`` (default): auto-build only when **every**
+      resolved package is in ``allowlist``; otherwise ``needs_approval``.
+    - ``policy = "auto"``: always auto-build.
+
+    Explicit ``image_build(..., approved=True)`` and
+    ``image_ensure(..., approved=True)`` ignore the policy and build.
+    """
+
+    policy: str = DEFAULT_IMAGE_BUILD_POLICY
+    allowlist: tuple[str, ...] = DEFAULT_IMAGE_ALLOWLIST
+
+    def __post_init__(self) -> None:
+        if self.policy not in IMAGE_BUILD_POLICIES:
+            raise ValueError(
+                f"images.build_policy must be one of {IMAGE_BUILD_POLICIES}, got {self.policy!r}"
+            )
+        allowlist = tuple(self.allowlist)
+        for package in allowlist:
+            if not is_safe_package(package):
+                raise ValueError(f"images.allowlist entry is not a valid package: {package!r}")
+        object.__setattr__(self, "allowlist", allowlist)
 
 
 @dataclass
@@ -494,6 +628,36 @@ def default_recipe_path(root: str | Path | None = None) -> Path:
     """The recipe path for a project root (defaults to the current directory)."""
     base = Path(root) if root is not None else Path.cwd()
     return base / RECIPE_RELATIVE_PATH
+
+
+def dump_recipe(recipe: ImageRecipe) -> str:
+    """Serialize an :class:`ImageRecipe` to TOML text (round-trippable).
+
+    Only the three recipe keys are emitted; ``packages`` is always present
+    (even when empty) so the file is explicit, ``base`` and ``post`` are
+    omitted when unset/empty.
+    """
+    lines: list[str] = []
+    if recipe.base is not None:
+        lines.append(f"base = {_toml_value(recipe.base)}")
+    lines.append(f"packages = {_toml_value(list(recipe.packages))}")
+    if recipe.post:
+        lines.append(f"post = {_toml_value(list(recipe.post))}")
+    return "\n".join(lines) + "\n"
+
+
+def write_recipe(path: str | Path, recipe: ImageRecipe) -> Path:
+    """Write ``recipe`` to ``path`` (creating parents); validate first.
+
+    The text is re-parsed before it is written, so a produced recipe file can
+    never be one :func:`load_recipe` would reject.
+    """
+    target = Path(path)
+    text = dump_recipe(recipe)
+    parse_recipe(tomllib.loads(text), where=f" for {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
 
 
 @dataclass
@@ -882,6 +1046,7 @@ class Config:
     seats: dict[str, SeatTypeConfig] = field(default_factory=_default_seats)
     resources: dict[str, ResourceConfig] = field(default_factory=_default_resources)
     images: dict[str, ImageConfig] = field(default_factory=_default_images)
+    image_build: ImageBuildConfig = field(default_factory=ImageBuildConfig)
     projects: dict[str, ProjectConfig] = field(default_factory=dict)
     host: HostConfig = field(default_factory=HostConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
@@ -932,6 +1097,10 @@ class Config:
         same error style. Unknown sections/keys and wrongly typed values all
         raise :class:`ValueError`.
         """
+        if section == "images":
+            if key not in _IMAGE_BUILD_KEYS:
+                raise ValueError(f"unknown key in [images]: {key!r}")
+            return _coerce(_IMAGE_BUILD_KEYS[key], f"images.{key}", value, "")
         schema = _SECTION_SCHEMA.get(section)
         if schema is None:
             raise ValueError(f"unknown config section: {section!r}")
@@ -943,7 +1112,9 @@ class Config:
         """Validate ``section.key = value`` and apply it in place; return the value.
 
         Every other field of the section is preserved (the section dataclass is
-        rebuilt with :func:`dataclasses.replace`).
+        rebuilt with :func:`dataclasses.replace`). The ``[images]`` build
+        policy lives on :attr:`image_build` (not the per-image ``images``
+        mapping), so it is routed there.
         """
         return self.set_values(section, {key: value})[key]
 
@@ -958,6 +1129,20 @@ class Config:
         """
         if not isinstance(values, dict) or not values:
             raise ValueError("set_values requires a non-empty mapping")
+        if section == "images":
+            unknown = set(values) - set(_IMAGE_BUILD_KEYS)
+            if unknown:
+                raise ValueError(f"unknown key in [images]: {sorted(unknown)[0]!r}")
+            coerced = {
+                key: _coerce(_IMAGE_BUILD_KEYS[key], f"images.{key}", value, "")
+                for key, value in values.items()
+            }
+            mapped = {
+                ("policy" if key == "build_policy" else "allowlist"): value
+                for key, value in coerced.items()
+            }
+            setattr(self, "image_build", replace(self.image_build, **mapped))
+            return coerced
         schema = _SECTION_SCHEMA.get(section)
         if schema is None:
             raise ValueError(f"unknown config section: {section!r}")
@@ -1077,13 +1262,35 @@ class Config:
         images_data = data.get("images", {})
         if not isinstance(images_data, dict):
             raise ValueError(f"[images] must be a table, got {type(images_data).__name__}{where}")
-        for name, overrides in images_data.items():
+        # ``[images]`` also carries the build policy/allowlist scalars, which
+        # sit alongside the ``[images.<name>]`` tables; pull them out first.
+        build_values: dict[str, object] = {}
+        if "build_policy" in images_data:
+            build_values["policy"] = _coerce(
+                _IMAGE_BUILD_KEYS["build_policy"],
+                "images.build_policy",
+                images_data["build_policy"],
+                where,
+            )
+        if "allowlist" in images_data:
+            build_values["allowlist"] = _coerce(
+                _IMAGE_BUILD_KEYS["allowlist"],
+                "images.allowlist",
+                images_data["allowlist"],
+                where,
+            )
+        image_entries = {
+            name: overrides
+            for name, overrides in images_data.items()
+            if name not in _IMAGE_BUILD_KEYS
+        }
+        for name, overrides in image_entries.items():
             dotted = f"images.{name}"
             if not isinstance(overrides, dict):
                 raise ValueError(
                     f"[{dotted}] must be a table, got {type(overrides).__name__}{where}"
                 )
-            unknown = set(overrides) - {"golden", "seat_type"}
+            unknown = set(overrides) - set(_IMAGE_KEYS)
             if unknown:
                 raise ValueError(f"unknown keys in [{dotted}]: {sorted(unknown)}{where}")
             golden = overrides.get("golden")
@@ -1092,6 +1299,38 @@ class Config:
             seat_type = overrides.get("seat_type")
             if seat_type is not None and seat_type not in SEAT_TYPES:
                 raise ValueError(f"{dotted}.seat_type must be one of {SEAT_TYPES}{where}")
+            base_image = overrides.get("base")
+            if base_image is not None:
+                if not isinstance(base_image, str) or not base_image.strip():
+                    raise ValueError(f"{dotted}.base must be a non-empty string{where}")
+                if not is_safe_image_name(base_image):
+                    raise ValueError(
+                        f"{dotted}.base is not a valid image name: {base_image!r}{where}"
+                    )
+            packages = overrides.get("packages")
+            if packages is not None:
+                if not isinstance(packages, list) or not all(
+                    isinstance(item, str) and item.strip() for item in packages
+                ):
+                    raise ValueError(
+                        f"{dotted}.packages must be a list of non-empty strings{where}"
+                    )
+                for package in packages:
+                    if not is_safe_package(package):
+                        raise ValueError(
+                            f"{dotted}.packages entry is not a valid package: {package!r}{where}"
+                        )
+            post = overrides.get("post")
+            if post is not None and (
+                not isinstance(post, list)
+                or not all(isinstance(item, str) and item.strip() for item in post)
+            ):
+                raise ValueError(f"{dotted}.post must be a list of non-empty strings{where}")
+            hash_value = overrides.get("recipe_hash")
+            if hash_value is not None and (
+                not isinstance(hash_value, str) or not hash_value.strip()
+            ):
+                raise ValueError(f"{dotted}.recipe_hash must be a non-empty string{where}")
         projects_data = data.get("projects", {})
         if not isinstance(projects_data, dict):
             raise ValueError(
@@ -1134,6 +1373,8 @@ class Config:
             cfg.golden = GoldenConfig(**section_values["golden"])
         if section_values["gui"]:
             cfg.gui = GuiConfig(**section_values["gui"])
+        if build_values:
+            cfg.image_build = ImageBuildConfig(**build_values)
         for seat_type, overrides in seats_data.items():
             base = cfg.seats[seat_type]
             cfg.seats[seat_type] = SeatTypeConfig(
@@ -1149,11 +1390,19 @@ class Config:
                 memory_mb=overrides.get("memory_mb", base.memory_mb),
                 overlay_max_gb=overrides.get("overlay_max_gb", base.overlay_max_gb),
             )
-        for name, overrides in images_data.items():
+        for name, overrides in image_entries.items():
             base = cfg.images.get(name)
             cfg.images[name] = ImageConfig(
                 golden=overrides.get("golden", base.golden if base is not None else ""),
                 seat_type=overrides.get("seat_type", base.seat_type if base is not None else None),
+                base=overrides.get("base", base.base if base is not None else None),
+                packages=tuple(
+                    overrides.get("packages", base.packages if base is not None else ())
+                ),
+                post=tuple(overrides.get("post", base.post if base is not None else ())),
+                recipe_hash=overrides.get(
+                    "recipe_hash", base.recipe_hash if base is not None else None
+                ),
             )
         for name, overrides in projects_data.items():
             cfg.projects[name] = ProjectConfig(image=overrides["image"])
@@ -1326,8 +1575,18 @@ def register_image(
     seat_type: str | None = None,
     *,
     path: str | Path | None = None,
+    base: str | None = None,
+    packages=None,
+    post=None,
+    recipe_hash: str | None = None,
 ) -> Path:
-    """Register (or update) ``[images.<name>]`` in the user config."""
+    """Register (or update) ``[images.<name>]`` in the user config.
+
+    ``base``/``packages``/``post``/``recipe_hash`` optionally record the
+    recipe a project image was built from, so :meth:`Manager.plan_image` can
+    diff a request and :meth:`Manager.ensure_image` can detect a current
+    recipe without rebuilding. Keys are only written when present.
+    """
     if not is_safe_image_name(name):
         raise ValueError(f"invalid image name: {name!r}")
     if not isinstance(golden, str) or not golden.strip():
@@ -1337,6 +1596,26 @@ def register_image(
     entry: dict[str, object] = {"golden": golden}
     if seat_type is not None:
         entry["seat_type"] = seat_type
+    if base is not None:
+        if not is_safe_image_name(base):
+            raise ValueError(f"invalid image base: {base!r}")
+        entry["base"] = base
+    if packages:
+        packages = list(packages)
+        for package in packages:
+            if not is_safe_package(package):
+                raise ValueError(f"invalid package in image recipe: {package!r}")
+        entry["packages"] = packages
+    if post:
+        post = list(post)
+        for command in post:
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("image post commands must be non-empty strings")
+        entry["post"] = post
+    if recipe_hash is not None:
+        if not isinstance(recipe_hash, str) or not recipe_hash.strip():
+            raise ValueError("image recipe_hash must be a non-empty string")
+        entry["recipe_hash"] = recipe_hash
 
     def mutate(data: dict) -> None:
         images = data.get("images")

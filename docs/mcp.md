@@ -126,8 +126,13 @@ of them with `"tools": { "omavroom*": false }`.
 | `force_discard` | `force_discard(seat_id, reason="force_discard")` | `dict` — `job_id` (long op) |
 | `reconcile` | `reconcile()` | `dict` — `job_id` (long op) |
 | `image_list` | `image_list()` | `list[dict]` — registered images, golden paths, project bindings |
+| `image_plan` | `image_plan(project, tools=None, packages=None, base=None)` | `dict` — would-be recipe, target image, `missing_packages`, `satisfied` (read-only) |
+| `image_ensure` | `image_ensure(project, tools=None, packages=None, base=None, project_root=None, approved=False)` | `dict` — `satisfied` / `needs_approval` (with `recipe`) / `building` (with `job_id`) |
+| `image_status` | `image_status(name)` | `dict` — build `state` (`pending`/`running`/`done`/`error`) + registry metadata |
+| `image_logs` | `image_logs(name, tail=50)` | `dict` — last `tail` build-log lines |
 | `image_build` | `image_build(name, recipe=None, base=None, packages=None, post=None, approved=False)` | `dict` — `job_id` (long op); **refuses unless `approved=True`** — never auto-builds |
 | `image_rm` | `image_rm(name)` | `dict` — unregisters (and deletes a store image) |
+| `guide` | `guide()` | `str` — short built-in "prepare and use a project golden image" flow (also the `omavroom://guide` resource) |
 | `job_poll` | `job_poll(job_id)` | `dict` — `state` (`pending`/`done`/`error`) |
 | `job_wait` | `job_wait(job_id, timeout_s=600)` | `dict` — last view (bounded) |
 
@@ -150,17 +155,83 @@ the manager config as `[images.<name>]` and bound to a project by
 project's image; an explicit `image=` argument still wins, and the resolved
 image is shown in `pool_status`/`seat_status`.
 
+### Agent-presented needs (`image_plan` / `image_ensure`)
+
+An agent should declare *what it needs* ("Rust", "Node"), not which packages
+to install. `image_plan` and `image_ensure` map a curated table of high-level
+tools to Arch packages:
+
+| Tool | Packages |
+| --- | --- |
+| `rust` | `rustup`, `base-devel` |
+| `node` | `nodejs`, `npm` |
+| `python` | `python`, `python-pip` |
+| `go` | `go` |
+| `java` | `jdk-openjdk` |
+| `docker` | `docker` |
+| `tex` | `texlive` |
+| `git` | `git` |
+| `build` | `base-devel` |
+| `jq` / `ripgrep` / `fd` | the same package |
+
+Unknown-but-safe tokens pass through as literal packages; option-like or
+unsafe tokens are rejected.
+
+```
+plan = image_plan("my-project", tools=["rust", "node"])
+# -> {image, recipe{base,packages,post}, missing_packages, satisfied, ...}
+
+result = image_ensure("my-project", tools=["rust", "node"], project_root=".")
+# status "satisfied"       -> already current, no build
+# status "needs_approval"  -> show result["recipe"] to the operator, then
+#                             re-call with approved=True
+# status "building"        -> job_id; job_wait(job_id) -> result status "built"
+```
+
+`image_ensure` is **idempotent**: it resolves the request, merges it with the
+project image's recorded package set, and computes a stable recipe hash
+(`base` + sorted packages + `post`). If the current image already has every
+package and its hash matches, it returns `satisfied` and builds nothing.
+Otherwise, when `project_root` is given, the merged recipe is written to
+`<project_root>/.omavroom/image.toml` (versioned in the repo) before the
+build decision. On success the project is bound to the image, so
+`request_seat(..., project="my-project")` resolves it.
+
+### Build policy (`[images]`)
+
+Auto-builds are gated by the manager config:
+
+```toml
+[images]
+build_policy = "allowlist"          # "ask" | "allowlist" | "auto"
+allowlist = ["base-devel", "rustup", "nodejs", "npm", "python",
+             "python-pip", "go", "git", "jq", "ripgrep", "fd", ...]
+```
+
+- `ask` — never auto-builds; every change returns `needs_approval`.
+- `allowlist` (default) — auto-builds only when **every** resolved package is
+  in `allowlist`; otherwise `needs_approval`. Heavy tools (`docker`,
+  `jdk-openjdk`, `texlive`) are deliberately *not* allowlisted by default.
+- `auto` — always auto-builds.
+
+An explicit `approved=True` (on `image_ensure` or `image_build`) always
+builds, regardless of policy. `image_build` remains the explicit,
+approval-only path and never auto-builds.
+
+### Builds and delta reuse
+
+Builds are visible live: `pool_status.builds` lists
+`{name, state, started_at, log_tail}`, `image_status(name)` returns the state
+(`pending`/`running`/`done`/`error`), and `image_logs(name, tail=N)` tails the
+log. Each build also records `image_build_start` / `image_build_done` /
+`image_build_error` events.
+
 Build with:
 
 ```
 image_build("my-project", recipe=".omavroom/image.toml", approved=True)
 job_wait(job_id)
 ```
-
-`image_build` **never auto-builds**: it refuses unless `approved=True`, which
-the agent must obtain from the operator after showing the packages that will
-be installed. (The CLI does this interactively: it prints the recipe and asks
-before proceeding; `--yes` skips the prompt.)
 
 A build is ephemeral and delta-aware:
 

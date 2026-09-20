@@ -419,6 +419,17 @@ def _optional_str(params: dict, key: str) -> str | None:
     return value
 
 
+def _optional_str_list(params: dict, key: str) -> list[str] | None:
+    value = params.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"parameter {key!r} must be a list of non-empty strings or null")
+    return list(value)
+
+
 class Protocol:
     """The wire method table over a Manager (plus the job registry)."""
 
@@ -458,6 +469,10 @@ class Protocol:
             "peek_endpoint": self._peek_endpoint,
             "set_admission_override": self._set_admission_override,
             "image_list": self._image_list,
+            "image_plan": self._image_plan,
+            "image_ensure": self._image_ensure,
+            "image_status": self._image_status,
+            "image_logs": self._image_logs,
             "image_build": self._image_build,
             "image_rm": self._image_rm,
             "set_config_value": self._set_config_value,
@@ -782,6 +797,62 @@ class Protocol:
     def _image_list(self, params: dict) -> list:
         """Registered images with project bindings and on-disk existence."""
         return self.manager.list_images()
+
+    def _image_plan(self, params: dict) -> dict:
+        """Read-only plan for a project image given tools/packages (no side effects)."""
+        return self.manager.plan_image(
+            _required_str(params, "project"),
+            tools=_optional_str_list(params, "tools"),
+            packages=_optional_str_list(params, "packages"),
+            base=_optional_str(params, "base"),
+        )
+
+    def _image_ensure(self, params: dict) -> dict:
+        """Make a project image satisfy tools/packages (idempotent).
+
+        Returns immediately with ``status="satisfied"`` or
+        ``status="needs_approval"``; a policy-approved build is submitted to
+        the job worker and returns ``status="building"`` plus a ``job_id``.
+        """
+        project = _required_str(params, "project")
+        tools = _optional_str_list(params, "tools")
+        packages = _optional_str_list(params, "packages")
+        base = _optional_str(params, "base")
+        project_root = _optional_str(params, "project_root")
+        approved = _optional_bool(params, "approved", False)
+        result = self.manager.plan_ensure(
+            project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+            approved=approved,
+        )
+        if result["status"] != "build":
+            return result
+        job_id = self.jobs.submit(
+            "image_ensure",
+            lambda: self.manager.ensure_image(
+                project,
+                tools=tools,
+                packages=packages,
+                base=base,
+                project_root=project_root,
+                approved=approved,
+            ),
+        )
+        return {**result, "status": "building", "job_id": job_id}
+
+    def _image_status(self, params: dict) -> dict:
+        """Live state for one image build (pending/running/done/error)."""
+        return self.manager.image_status(_required_str(params, "name"))
+
+    def _image_logs(self, params: dict) -> dict:
+        """The tail of an image build's log (``tail`` defaults to 50 lines)."""
+        tail = _optional_int(params, "tail", 50)
+        if tail is None or tail < 1:
+            raise ValueError("parameter 'tail' must be an integer >= 1")
+        return self.manager.image_logs(_required_str(params, "name"), tail=tail)
 
     def _image_build(self, params: dict) -> dict:
         """Build a project image (long op -> job_id); refuses without approval.

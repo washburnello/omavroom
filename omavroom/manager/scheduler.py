@@ -199,6 +199,9 @@ class PoolStatus:
     #: (currently ``auto_heartbeat``): a client that has not been restarted
     #: since upgrading omavroom. Populated by the manager, not the scheduler.
     stale_clients: list[dict] = field(default_factory=list)
+    #: Live project-image builds (name/state/started_at/short log_tail).
+    #: Populated by the manager from its :class:`BuildTracker`.
+    builds: list[dict] = field(default_factory=list)
 
 
 @dataclass

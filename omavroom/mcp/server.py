@@ -130,6 +130,30 @@ DEFAULT_INSTRUCTIONS = (
     "to poll; exec_start returns an exec_id to poll."
 )
 
+#: Short built-in how-to for project golden images. Returned by the ``guide``
+#: tool (and the ``omavroom://guide`` resource) as a fallback for agents that
+#: did not load the omavroom skill.
+IMAGE_GUIDE = """\
+Project golden images (agent flow)
+1. Declare needs, do not guess packages: image_plan(project, tools=[...])
+   maps high-level tools (rust, node, python, go, java, docker, tex, git,
+   build, jq, ripgrep, fd) to Arch packages and shows the target image, the
+   newly missing packages, and whether the current image already satisfies it.
+2. Make it so: image_ensure(project, tools=[...], project_root=".")
+   - status "satisfied" -> nothing to do.
+   - status "needs_approval" -> show the recipe to the operator, then re-call
+     with approved=True (or the operator enables [images] build_policy/allowlist).
+   - status "building" -> poll job_poll/job_wait; the job result is "built".
+   Passing project_root writes/updates .omavroom/image.toml so the recipe is
+   versioned in the repo. The project is bound to the image on success.
+3. Use it: request_seat(agent_label, seat_type, project=...).
+4. Add a dependency later: call image_ensure again with the extra tool; only
+   the new packages are applied to the existing image (delta build).
+Inspect with image_list/image_status; image_logs(name) tails a build log.
+`packages=[...]` installs literal packages; unknown safe tool names pass
+through as packages. Auto-build policy lives in [images] (ask|allowlist|auto).
+"""
+
 #: Every tool registered on the FastMCP server, in a stable order.
 MCP_TOOL_NAMES: tuple[str, ...] = (
     "pool_status",
@@ -169,8 +193,13 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "force_discard",
     "reconcile",
     "image_list",
+    "image_plan",
+    "image_ensure",
+    "image_status",
+    "image_logs",
     "image_build",
     "image_rm",
+    "guide",
     "job_poll",
     "job_wait",
 )
@@ -849,6 +878,62 @@ class OmavroomTools:
         """Registered images: name, golden path, seat type, project bindings."""
         return self.client.image_list()
 
+    def image_plan(
+        self,
+        project: str,
+        tools: list[str] | None = None,
+        packages: list[str] | None = None,
+        base: str | None = None,
+    ) -> dict:
+        """Read-only plan for a project image: recipe, missing packages, satisfied.
+
+        Resolves high-level ``tools`` (``rust``, ``node``, ``python``, ``go``,
+        ``java``, ``docker``, ``tex``, ``git``, ``build``, ``jq``, ``ripgrep``,
+        ``fd``) to Arch packages, merges them with the project image's recorded
+        package set, and reports the target image name, the newly missing
+        packages, and whether the current image already satisfies the request.
+        Never builds or writes anything.
+        """
+        return self.client.image_plan(project, tools=tools, packages=packages, base=base)
+
+    def image_ensure(
+        self,
+        project: str,
+        tools: list[str] | None = None,
+        packages: list[str] | None = None,
+        base: str | None = None,
+        project_root: str | None = None,
+        approved: bool = False,
+    ) -> dict:
+        """Idempotently make a project image satisfy tools/packages.
+
+        Returns ``status="satisfied"`` (already current), ``status=
+        "needs_approval"`` with the recipe to confirm, or ``status="building"``
+        with a ``job_id``. ``project_root`` versions the recipe into
+        ``.omavroom/image.toml``; ``approved=True`` forces a build after the
+        operator approves.
+        """
+        return self.client.image_ensure(
+            project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+            approved=approved,
+        )
+
+    def image_status(self, name: str) -> dict:
+        """Live state for one image build (``pending``/``running``/``done``/``error``)."""
+        return self.client.image_status(name)
+
+    def image_logs(self, name: str, tail: int = 50) -> dict:
+        """The last ``tail`` lines of an image build's log."""
+        return self.client.image_logs(name, tail=tail)
+
+    def guide(self) -> str:
+        """How to prepare and use a project golden image (short built-in flow)."""
+        return IMAGE_GUIDE
+
     def image_build(
         self,
         name: str,
@@ -926,6 +1011,16 @@ def build_server(
     mcp = FastMCP(name, instructions=instructions or DEFAULT_INSTRUCTIONS)
     for tool_name in MCP_TOOL_NAMES:
         mcp.add_tool(getattr(tools, tool_name))
+
+    @mcp.resource(
+        "omavroom://guide",
+        name="omavroom guide",
+        description="How to prepare and use a project golden image.",
+        mime_type="text/plain",
+    )
+    def _guide_resource() -> str:
+        return IMAGE_GUIDE
+
     return mcp
 
 
@@ -1009,6 +1104,7 @@ __all__ = [
     "DEFAULT_HEARTBEAT_INTERVAL_S",
     "DEFAULT_HEARTBEAT_TIMEOUT_S",
     "DEFAULT_INSTRUCTIONS",
+    "IMAGE_GUIDE",
     "MCP_CLIENT_CAPABILITIES",
     "MCP_CLIENT_NAME",
     "MCP_CLIENT_VERSION",

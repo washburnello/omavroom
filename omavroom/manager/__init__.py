@@ -107,13 +107,19 @@ from omavroom.config import (
     Config,
     ImageConfig,
     ImageRecipe,
+    ProjectConfig,
     default_images_dir,
     default_recipe_path,
     is_safe_image_name,
+    is_safe_package,
     load_recipe,
+    recipe_hash,
     register_image,
     remove_image,
+    set_project_image,
+    write_recipe,
 )
+from omavroom.images import resolve_tools
 from omavroom.manager.exec_engine import ExecEngine
 from omavroom.manager.execs import (
     DEFAULT_LIST_OUTPUT_BUDGET_BYTES,
@@ -122,11 +128,13 @@ from omavroom.manager.execs import (
 )
 from omavroom.manager.locks import LockManager, LockTimeout
 from omavroom.manager.provisioner import (
+    BuildTracker,
     FakeProvisioner,
     ImageBuildNotApproved,
     InputEvent,
     Provisioner,
     RepoSpec,
+    short_log_tail,
 )
 from omavroom.manager.scheduler import (
     ExportGate,
@@ -258,6 +266,8 @@ class Manager:
         self.tick_s = tick_s
         self.last_pump_error: BaseException | None = None
         self.last_reconcile_report: ReconcileReport | None = None
+        #: Live visibility for project-image builds (``pool_status.builds``).
+        self.builds = BuildTracker()
         self._pending: deque[tuple[Handle, object]] = deque()
         self._tick_lock = threading.Lock()
         self._running = False
@@ -387,8 +397,27 @@ class Manager:
 
     def pool_status(self) -> PoolStatus:
         # The scheduler owns the pool snapshot; the manager layers on the MCP
-        # client handshake so ``status`` can flag a stale (un-restarted) client.
-        return dataclasses.replace(self.scheduler.pool_status(), stale_clients=self.stale_clients())
+        # client handshake so ``status`` can flag a stale (un-restarted) client
+        # plus the live project-image build list.
+        return dataclasses.replace(
+            self.scheduler.pool_status(),
+            stale_clients=self.stale_clients(),
+            builds=self.build_views(),
+        )
+
+    def build_views(self) -> list[dict]:
+        """Compact build records for ``pool_status`` (short ``log_tail``)."""
+        return [
+            {
+                "name": record.name,
+                "state": record.state,
+                "started_at": record.started_at,
+                "finished_at": record.finished_at,
+                "error": record.error,
+                "log_tail": short_log_tail(record.log),
+            }
+            for record in self.builds.view()
+        ]
 
     # ------------------------------------------------------------------
     # MCP client handshake (version + capabilities)
@@ -423,6 +452,15 @@ class Manager:
 
     def list_events(self, *, limit: int = 200):
         return self.scheduler.list_events(limit=limit)
+
+    def _log_event(self, event_type: str, detail: str) -> None:
+        """Best-effort audit event (a logging failure must never break a build)."""
+        try:
+            now = st.fmt_time(st.utcnow())
+            with self.store.transaction() as conn:
+                st.log_event(conn, event_type=event_type, now=now, detail=detail)
+        except Exception:  # noqa: BLE001 - audit is advisory, never fatal
+            log.warning("could not record event %s: %s", event_type, detail, exc_info=True)
 
     # ------------------------------------------------------------------
     # requests / admission
@@ -496,6 +534,9 @@ class Manager:
                 "seat_type": image.seat_type,
                 "golden": str(image.path),
                 "exists": image.path.exists(),
+                "base": image.base,
+                "packages": list(image.packages),
+                "recipe_hash": image.recipe_hash,
                 "projects": sorted(
                     project
                     for project, project_cfg in self.config.projects.items()
@@ -523,7 +564,12 @@ class Manager:
         (``recipe_path``, defaulting to ``.omavroom/image.toml``) or explicit
         ``packages``/``post`` describe the delta; ``base`` overrides the
         recipe's base. The resolved image is registered in ``[images.<name>]``
-        so seats can be provisioned from it.
+        (with its recipe metadata) so seats can be provisioned from it.
+
+        A build is tracked in :attr:`builds` (``pool_status.builds`` /
+        ``image_status`` / ``image_logs``) and recorded as
+        ``image_build_start`` / ``image_build_done`` / ``image_build_error``
+        events.
         """
         if not is_safe_image_name(name):
             raise ValueError(f"invalid image name: {name!r}")
@@ -540,25 +586,61 @@ class Manager:
                 post=tuple(post or ()),
             )
         effective_base = base or recipe.base or self.config.image_for("desktop")
+        digest = recipe_hash(effective_base, recipe.packages, recipe.post)
         # A registered target means a previous build exists: the provisioner
         # reuses it and applies only the delta.
         delta = name in self.config.images
-        path = self.provisioner.build_image(
-            effective_base,
-            name=name,
-            packages=recipe.packages,
-            post=recipe.post,
-            on_log=on_log,
+        self.builds.start(name, started_at=st.fmt_time(st.utcnow()))
+        self._log_event(
+            "image_build_start",
+            f"{name}: base={effective_base} packages={list(recipe.packages)}",
         )
+
+        def _track(line: str) -> None:
+            self.builds.append_log(name, line if line.endswith("\n") else line + "\n")
+            if on_log is not None:
+                on_log(line)
+
+        try:
+            path = self.provisioner.build_image(
+                effective_base,
+                name=name,
+                packages=recipe.packages,
+                post=recipe.post,
+                on_log=_track,
+            )
+        except BaseException as exc:
+            self.builds.finish(
+                name, finished_at=st.fmt_time(st.utcnow()), error=f"{type(exc).__name__}: {exc}"
+            )
+            self._log_event("image_build_error", f"{name}: {exc}")
+            raise
+        self.builds.finish(name, finished_at=st.fmt_time(st.utcnow()))
         base_entry = self.config.images.get(effective_base)
         seat_type = (
             base_entry.seat_type if base_entry is not None and base_entry.seat_type else "desktop"
         )
         try:
-            register_image(name, path, seat_type)
+            register_image(
+                name,
+                path,
+                seat_type,
+                base=effective_base,
+                packages=recipe.packages,
+                post=recipe.post,
+                recipe_hash=digest,
+            )
         except (OSError, ValueError) as exc:  # pragma: no cover - disk/permission
             log.warning("could not persist image registration for %s: %s", name, exc)
-        self.config.images[name] = ImageConfig(golden=path, seat_type=seat_type)
+        self.config.images[name] = ImageConfig(
+            golden=path,
+            seat_type=seat_type,
+            base=effective_base,
+            packages=recipe.packages,
+            post=recipe.post,
+            recipe_hash=digest,
+        )
+        self._log_event("image_build_done", f"{name}: path={path} delta={delta}")
         return {
             "name": name,
             "base": effective_base,
@@ -567,6 +649,279 @@ class Manager:
             "packages": list(recipe.packages),
             "post": list(recipe.post),
             "delta": delta,
+            "recipe_hash": digest,
+        }
+
+    # ------------------------------------------------------------------
+    # agent-presented image needs (plan / ensure)
+    # ------------------------------------------------------------------
+    def _target_image(self, project: str) -> str:
+        """The image a project's ``image_ensure`` acts on.
+
+        A configured ``[projects.<name>] image`` wins; otherwise a stable
+        ``<project>-image`` name is derived (and the project is bound to it on
+        a successful build).
+        """
+        configured = self.config.project_image(project)
+        if configured:
+            return configured
+        candidate = f"{project}-image"
+        if not is_safe_image_name(candidate):
+            raise ValueError(f"cannot derive an image name from project {project!r}")
+        return candidate
+
+    def _bind_project(self, project: str, image: str) -> None:
+        """Persist ``project -> image`` (idempotent; never rebinds a project)."""
+        if self.config.project_image(project) == image:
+            return
+        try:
+            set_project_image(project, image)
+        except (OSError, ValueError) as exc:  # pragma: no cover - disk/permission
+            log.warning("could not persist project binding %s -> %s: %s", project, image, exc)
+        self.config.projects[project] = ProjectConfig(image=image)
+
+    def plan_image(
+        self,
+        project: str,
+        *,
+        tools: list[str] | tuple[str, ...] | None = None,
+        packages: list[str] | tuple[str, ...] | None = None,
+        base: str | None = None,
+    ) -> dict:
+        """Read-only plan: what image the project needs for ``tools``/``packages``.
+
+        Resolves high-level tools to packages (unknown-safe tokens pass
+        through), merges them with the project image's *recorded* package set,
+        and reports the would-be recipe, the target image name, the newly
+        missing packages, and whether the current image already satisfies the
+        request. No build, no writes.
+        """
+        if not isinstance(project, str) or not project.strip():
+            raise ValueError("project must be a non-empty string")
+        resolved = resolve_tools(tools or [])
+        for package in packages or []:
+            if not is_safe_package(package):
+                raise ValueError(f"invalid package: {package!r}")
+            if package not in resolved:
+                resolved.append(package)
+        target = self._target_image(project)
+        existing = self.config.images.get(target)
+        current_packages = list(existing.packages) if existing is not None else []
+        merged = list(current_packages)
+        for package in resolved:
+            if package not in merged:
+                merged.append(package)
+        effective_base = (
+            base
+            or (existing.base if existing is not None else None)
+            or self.config.image_for("desktop")
+        )
+        post = list(existing.post) if existing is not None else []
+        digest = recipe_hash(effective_base, merged, post)
+        missing = [package for package in resolved if package not in current_packages]
+        if existing is None or missing:
+            satisfied = False
+        elif not resolved:
+            satisfied = True
+        else:
+            satisfied = existing.recipe_hash == digest
+        return {
+            "project": project,
+            "image": target,
+            "base": effective_base,
+            "resolved_packages": resolved,
+            "missing_packages": missing,
+            "recipe": {"base": effective_base, "packages": merged, "post": post},
+            "recipe_hash": digest,
+            "current_recipe_hash": existing.recipe_hash if existing is not None else None,
+            "current_packages": current_packages,
+            "exists": bool(existing is not None and existing.path.exists()),
+            "satisfied": satisfied,
+        }
+
+    def image_build_decision(self, plan: dict, *, approved: bool = False) -> str:
+        """Apply ``[images] build_policy`` to a plan: satisfied/needs_approval/build."""
+        if plan["satisfied"]:
+            return "satisfied"
+        if approved:
+            return "build"
+        policy = self.config.image_build
+        if policy.policy == "ask":
+            return "needs_approval"
+        if policy.policy == "auto":
+            return "build"
+        allowlist = set(policy.allowlist)
+        if all(package in allowlist for package in plan["resolved_packages"]):
+            return "build"
+        return "needs_approval"
+
+    def _prepare_ensure(
+        self,
+        project: str,
+        *,
+        tools,
+        packages,
+        base: str | None,
+        project_root: str | Path | None,
+    ) -> dict:
+        """Plan an ensure and, when not satisfied, version the recipe on disk."""
+        plan = self.plan_image(project, tools=tools, packages=packages, base=base)
+        recipe_path = None
+        if project_root is not None and not plan["satisfied"]:
+            recipe = ImageRecipe(
+                base=plan["recipe"]["base"],
+                packages=tuple(plan["recipe"]["packages"]),
+                post=tuple(plan["recipe"]["post"]),
+            )
+            recipe_path = str(write_recipe(default_recipe_path(project_root), recipe))
+        plan["recipe_path"] = recipe_path
+        return plan
+
+    @staticmethod
+    def _ensure_view(plan: dict, status: str) -> dict:
+        return {
+            "status": status,
+            "project": plan["project"],
+            "image": plan["image"],
+            "recipe": plan["recipe"],
+            "resolved_packages": plan["resolved_packages"],
+            "missing_packages": plan["missing_packages"],
+            "satisfied": plan["satisfied"],
+            "recipe_hash": plan["recipe_hash"],
+            "recipe_path": plan.get("recipe_path"),
+        }
+
+    def plan_ensure(
+        self,
+        project: str,
+        *,
+        tools: list[str] | tuple[str, ...] | None = None,
+        packages: list[str] | tuple[str, ...] | None = None,
+        base: str | None = None,
+        project_root: str | Path | None = None,
+        approved: bool = False,
+    ) -> dict:
+        """Decide what ``ensure_image`` would do, without building.
+
+        Returns ``status="satisfied"`` (nothing to do), ``"needs_approval"``
+        (the policy/approval gate refused an automatic build), or ``"build"``
+        (the caller should build; the recipe is already versioned when
+        ``project_root`` was given).
+        """
+        plan = self._prepare_ensure(
+            project, tools=tools, packages=packages, base=base, project_root=project_root
+        )
+        decision = self.image_build_decision(plan, approved=approved)
+        if decision == "satisfied":
+            self._bind_project(project, plan["image"])
+            return self._ensure_view(plan, "satisfied")
+        if decision == "needs_approval":
+            return self._ensure_view(plan, "needs_approval")
+        return self._ensure_view(plan, "build")
+
+    def ensure_image(
+        self,
+        project: str,
+        *,
+        tools: list[str] | tuple[str, ...] | None = None,
+        packages: list[str] | tuple[str, ...] | None = None,
+        base: str | None = None,
+        project_root: str | Path | None = None,
+        approved: bool = False,
+    ) -> dict:
+        """Idempotently make the project image satisfy ``tools``/``packages``.
+
+        - Already satisfied (current recipe hash + every package present) ->
+          ``status="satisfied"`` and no build.
+        - Otherwise the recipe is written to ``<project_root>/.omavroom/image.toml``
+          (when a root is given) and the build policy decides:
+          ``"ask"`` -> ``needs_approval``; ``"allowlist"`` -> build only when
+          every resolved package is allowlisted, else ``needs_approval``;
+          ``"auto"`` (or an explicit ``approved=True``) -> build now.
+        - A build is a synchronous delta build against the existing image, and
+          the project is bound to the image so ``request_seat(project=...)``
+          resolves it. Re-calling after a build is idempotent.
+        """
+        result = self.plan_ensure(
+            project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+            approved=approved,
+        )
+        if result["status"] != "build":
+            return result
+        built = self.build_image(
+            result["image"],
+            base=result["recipe"]["base"],
+            packages=result["recipe"]["packages"],
+            post=result["recipe"]["post"],
+            approved=True,
+        )
+        self._bind_project(project, result["image"])
+        result["status"] = "built"
+        result["path"] = built["path"]
+        result["delta"] = built["delta"]
+        result["seat_type"] = built["seat_type"]
+        return result
+
+    def image_status(self, name: str) -> dict:
+        """Live/known state for one image (build state + registry metadata)."""
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("image name must be a non-empty string")
+        record = self.builds.info(name)
+        entry = self.config.images.get(name)
+        if record is None and entry is None:
+            raise KeyError(f"no such image: {name!r}")
+        exists = bool(entry is not None and entry.path.exists())
+        result = {
+            "name": name,
+            "image": name,
+            "registered": entry is not None,
+            "golden": str(entry.path) if entry is not None else None,
+            "exists": exists,
+            "packages": list(entry.packages) if entry is not None else [],
+            "recipe_hash": entry.recipe_hash if entry is not None else None,
+            "state": "done" if exists else "unknown",
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "log_tail": "",
+        }
+        if record is not None:
+            result.update(
+                {
+                    "state": record.state,
+                    "started_at": record.started_at,
+                    "finished_at": record.finished_at,
+                    "error": record.error,
+                    "log_tail": short_log_tail(record.log),
+                }
+            )
+        return result
+
+    def image_logs(self, name: str, *, tail: int = 50) -> dict:
+        """The last ``tail`` log lines for an image build (and its state)."""
+        if isinstance(tail, bool) or not isinstance(tail, int) or tail < 1:
+            raise ValueError("tail must be an integer >= 1")
+        record = self.builds.info(name)
+        entry = self.config.images.get(name)
+        if record is None and entry is None:
+            raise KeyError(f"no such image: {name!r}")
+        lines: list[str] = []
+        if record is not None and record.log:
+            lines = record.log.splitlines()[-tail:]
+        state = (
+            record.state
+            if record is not None
+            else ("done" if entry is not None and entry.path.exists() else "unknown")
+        )
+        return {
+            "name": name,
+            "state": state,
+            "lines": lines,
+            "log_tail": "\n".join(lines),
         }
 
     def remove_image(self, name: str) -> dict:
