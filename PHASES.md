@@ -269,6 +269,12 @@ this is the single backlog of record.
 - [ ] Cadence: skip unchanged frames, adaptive throttle
 
 ### Phase 10 — Docs + release (M)
+- [ ] Packager/installer that makes omavroom app-wide and standalone:
+      symlink the CLI/TUI/MCP/GUI entry points into `~/.local/bin`, install the
+      `.desktop` launcher for the Command Center (Terminal=false), and
+      `systemctl --user enable --now omavroom-daemon.service`. Document that
+      the MCP is configured globally (every project gets it) and that the
+      daemon is app-wide (one pool, all seats).
 - [ ] Install guide, capacity-tuning guide, example agent workflows,
       Herder-binding guide, contributor notes
 - [ ] Versioned GitHub release
