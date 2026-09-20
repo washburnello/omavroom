@@ -457,6 +457,9 @@ class Protocol:
             "clipboard_set": self._clipboard_set,
             "peek_endpoint": self._peek_endpoint,
             "set_admission_override": self._set_admission_override,
+            "image_list": self._image_list,
+            "image_build": self._image_build,
+            "image_rm": self._image_rm,
             "set_config_value": self._set_config_value,
             "set_config_values": self._set_config_values,
             "clear_prewarm_backoff": self._clear_prewarm_backoff,
@@ -774,6 +777,45 @@ class Protocol:
         seat_type = _optional_str(params, "seat_type")
         self.manager.clear_prewarm_backoff(seat_type)
         return {"seat_type": seat_type}
+
+    # -- project images --------------------------------------------------
+    def _image_list(self, params: dict) -> list:
+        """Registered images with project bindings and on-disk existence."""
+        return self.manager.list_images()
+
+    def _image_build(self, params: dict) -> dict:
+        """Build a project image (long op -> job_id); refuses without approval.
+
+        ``approved`` defaults to false, so a client that forgets the
+        confirmation flag gets the structured ``build_not_approved`` error
+        rather than a silent install.
+        """
+        name = _required_str(params, "name")
+        recipe = _optional_str(params, "recipe")
+        base = _optional_str(params, "base")
+        packages = params.get("packages")
+        if packages is not None and not isinstance(packages, list):
+            raise ValueError("parameter 'packages' must be a list or null")
+        post = params.get("post")
+        if post is not None and not isinstance(post, list):
+            raise ValueError("parameter 'post' must be a list or null")
+        approved = _optional_bool(params, "approved", False)
+        job_id = self.jobs.submit(
+            "image_build",
+            lambda: self.manager.build_image(
+                name,
+                recipe_path=recipe,
+                base=base,
+                packages=packages,
+                post=post,
+                approved=approved,
+            ),
+        )
+        return {"job_id": job_id}
+
+    def _image_rm(self, params: dict) -> dict:
+        """Unregister (and delete a store image) synchronously."""
+        return self.manager.remove_image(_required_str(params, "name"))
 
     # -- config ----------------------------------------------------------
     def _set_config_value(self, params: dict) -> dict:

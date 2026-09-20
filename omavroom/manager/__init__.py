@@ -103,7 +103,17 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from omavroom import state as st
-from omavroom.config import Config
+from omavroom.config import (
+    Config,
+    ImageConfig,
+    ImageRecipe,
+    default_images_dir,
+    default_recipe_path,
+    is_safe_image_name,
+    load_recipe,
+    register_image,
+    remove_image,
+)
 from omavroom.manager.exec_engine import ExecEngine
 from omavroom.manager.execs import (
     DEFAULT_LIST_OUTPUT_BUDGET_BYTES,
@@ -113,6 +123,7 @@ from omavroom.manager.execs import (
 from omavroom.manager.locks import LockManager, LockTimeout
 from omavroom.manager.provisioner import (
     FakeProvisioner,
+    ImageBuildNotApproved,
     InputEvent,
     Provisioner,
     RepoSpec,
@@ -475,6 +486,149 @@ class Manager:
         self.scheduler.clear_prewarm_backoff(seat_type)
 
     # ------------------------------------------------------------------
+    # project images (recipe build + registry)
+    # ------------------------------------------------------------------
+    def list_images(self) -> list[dict]:
+        """Registered images with project bindings and on-disk existence."""
+        return [
+            {
+                "name": name,
+                "seat_type": image.seat_type,
+                "golden": str(image.path),
+                "exists": image.path.exists(),
+                "projects": sorted(
+                    project
+                    for project, project_cfg in self.config.projects.items()
+                    if project_cfg.image == name
+                ),
+            }
+            for name, image in sorted(self.config.images.items())
+        ]
+
+    def build_image(
+        self,
+        name: str,
+        *,
+        recipe_path: str | Path | None = None,
+        base: str | None = None,
+        packages: list[str] | tuple[str, ...] | None = None,
+        post: list[str] | tuple[str, ...] | None = None,
+        approved: bool = False,
+        on_log=None,
+    ) -> dict:
+        """Build (or delta-upgrade) a project image and register it.
+
+        Refuses unless ``approved`` is true: a build installs packages in a
+        guest VM and must never happen silently. Either a recipe file
+        (``recipe_path``, defaulting to ``.omavroom/image.toml``) or explicit
+        ``packages``/``post`` describe the delta; ``base`` overrides the
+        recipe's base. The resolved image is registered in ``[images.<name>]``
+        so seats can be provisioned from it.
+        """
+        if not is_safe_image_name(name):
+            raise ValueError(f"invalid image name: {name!r}")
+        if not approved:
+            raise ImageBuildNotApproved(
+                f"image build {name!r} requires explicit approval (approved=True)"
+            )
+        if packages is None and post is None:
+            recipe = self._load_build_recipe(recipe_path, base)
+        else:
+            recipe = ImageRecipe(
+                base=base,
+                packages=tuple(packages or ()),
+                post=tuple(post or ()),
+            )
+        effective_base = base or recipe.base or self.config.image_for("desktop")
+        # A registered target means a previous build exists: the provisioner
+        # reuses it and applies only the delta.
+        delta = name in self.config.images
+        path = self.provisioner.build_image(
+            effective_base,
+            name=name,
+            packages=recipe.packages,
+            post=recipe.post,
+            on_log=on_log,
+        )
+        base_entry = self.config.images.get(effective_base)
+        seat_type = (
+            base_entry.seat_type if base_entry is not None and base_entry.seat_type else "desktop"
+        )
+        try:
+            register_image(name, path, seat_type)
+        except (OSError, ValueError) as exc:  # pragma: no cover - disk/permission
+            log.warning("could not persist image registration for %s: %s", name, exc)
+        self.config.images[name] = ImageConfig(golden=path, seat_type=seat_type)
+        return {
+            "name": name,
+            "base": effective_base,
+            "path": path,
+            "seat_type": seat_type,
+            "packages": list(recipe.packages),
+            "post": list(recipe.post),
+            "delta": delta,
+        }
+
+    def remove_image(self, name: str) -> dict:
+        """Unregister an image and delete its file when it is in the store.
+
+        Refuses while the image is a seat type default, is bound to a project,
+        or backs a live seat. A custom golden outside the default images
+        directory is unregistered but left on disk.
+        """
+        if not is_safe_image_name(name):
+            raise ValueError(f"invalid image name: {name!r}")
+        entry = self.config.images.get(name)
+        if entry is None:
+            raise KeyError(f"no such image: {name!r}")
+        for seat_type, seat_cfg in self.config.seats.items():
+            if seat_cfg.image == name:
+                raise ValueError(
+                    f"image {name!r} is the configured image for seat type {seat_type!r}"
+                )
+        bound = sorted(
+            project for project, cfg in self.config.projects.items() if cfg.image == name
+        )
+        if bound:
+            raise ValueError(f"image {name!r} is still bound to projects: {bound}")
+        live = [seat.name for seat in self.scheduler.list_seats() if seat.image == name]
+        if live:
+            raise ValueError(f"image {name!r} is in use by live seats: {live}")
+        try:
+            remove_image(name)
+        except (OSError, ValueError) as exc:  # pragma: no cover - disk/permission
+            log.warning("could not persist image removal for %s: %s", name, exc)
+        path = entry.path
+        deleted = False
+        if path.is_file() and path.parent == default_images_dir():
+            path.unlink(missing_ok=True)
+            deleted = True
+        self.config.images.pop(name, None)
+        return {"name": name, "path": str(path), "deleted": deleted}
+
+    def _load_build_recipe(self, recipe_path: str | Path | None, base: str | None) -> ImageRecipe:
+        """Resolve the recipe for a build (explicit path must exist)."""
+        explicit = recipe_path is not None
+        path = Path(recipe_path) if recipe_path is not None else default_recipe_path()
+        if path.exists():
+            recipe = load_recipe(path)
+            if base and base != recipe.base:
+                recipe = ImageRecipe(
+                    base=base,
+                    packages=recipe.packages,
+                    post=recipe.post,
+                    source=recipe.source,
+                )
+            return recipe
+        if explicit:
+            raise ValueError(f"recipe not found: {path}")
+        if base:
+            return ImageRecipe(base=base)
+        raise ValueError(
+            f"no recipe at {path}: pass --recipe PATH or --base IMAGE, or add .omavroom/image.toml"
+        )
+
+    # ------------------------------------------------------------------
     # lease / work
     # ------------------------------------------------------------------
     def heartbeat(
@@ -698,6 +852,7 @@ __all__ = [
     "ExecTracker",
     "ExportGate",
     "Handle",
+    "ImageBuildNotApproved",
     "InputEvent",
     "LeaseNotFound",
     "LeaseView",

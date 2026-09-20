@@ -190,6 +190,9 @@ def settings_dict(config: Config) -> dict:
             "backoff_s": config.prewarm.backoff_s,
         },
         "golden": {"profile": config.golden.profile},
+        "projects": {
+            name: {"image": project.image} for name, project in sorted(config.projects.items())
+        },
         "gui": {
             "thumbnail_width": config.gui.thumbnail_width,
             "focused_width": config.gui.focused_width,
@@ -265,6 +268,15 @@ def settings_report(config: Config) -> str:
             f"prewarm: max_retries={snapshot['prewarm']['max_retries']}"
             f" backoff_s={snapshot['prewarm']['backoff_s']}",
             f"golden: profile={golden['profile']}",
+            (
+                "projects: "
+                + (
+                    ", ".join(
+                        f"{name}={info['image']}" for name, info in snapshot["projects"].items()
+                    )
+                    or "-"
+                )
+            ),
             (
                 f"gui: thumbnail_width={gui['thumbnail_width']}"
                 f" focused_width={gui['focused_width']}"

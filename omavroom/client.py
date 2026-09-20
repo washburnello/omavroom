@@ -558,6 +558,41 @@ class DaemonClient:
     def clear_prewarm_backoff(self, seat_type: str | None = None) -> dict:
         return self.call("clear_prewarm_backoff", seat_type=seat_type)
 
+    # -- project images --------------------------------------------------
+    def image_list(self) -> list:
+        """Registered golden/project images and their bindings."""
+        return self.call("image_list")
+
+    def image_build(
+        self,
+        name: str,
+        *,
+        recipe: str | None = None,
+        base: str | None = None,
+        packages: list[str] | None = None,
+        post: list[str] | None = None,
+        approved: bool = False,
+    ) -> JobHandle:
+        """Build a project image (long op -> job_id).
+
+        ``approved`` must be true; without it the daemon refuses with
+        ``build_not_approved`` and nothing is installed.
+        """
+        result = self.call(
+            "image_build",
+            name=name,
+            recipe=recipe,
+            base=base,
+            packages=packages,
+            post=post,
+            approved=approved,
+        )
+        return JobHandle(self, result["job_id"], "image_build")
+
+    def image_rm(self, name: str) -> dict:
+        """Unregister an image (and delete it when it lives in the store)."""
+        return self.call("image_rm", name=name)
+
     def set_config_value(self, section: str, key: str, value: object) -> dict:
         """Validate and persist one ``section.key = value`` via the daemon.
 

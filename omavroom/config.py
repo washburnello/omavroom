@@ -24,6 +24,8 @@ defaults for anything unset:
     [images.golden-term]
     golden = "~/.local/share/omavroom/images/golden-term.qcow2"
     seat_type = "terminal"
+    [projects.my-project]
+    image = "my-project-image"
     [resources.desktop]
     cpu_vcpus = 2
     memory_mb = 4096
@@ -117,6 +119,12 @@ between lanes):
   to ``golden-omarchy`` (the Omarchy 4.0.4 golden); ``golden-desktop``
   stays registered as the fallback, so switching back is the single
   ``seats.desktop.image`` line above.
+- ``[projects.<name>]`` maps a project label to the image its seats should
+  use (``image = "<name>"``). A seat requested with ``project=<name>``
+  resolves to that image; an explicit ``image=`` argument still wins. The
+  recipe flow that builds these project images lives in
+  :func:`parse_recipe` / :class:`ImageRecipe` and
+  ``Provisioner.build_image``.
 - ``admission`` controls the dynamic live-RAM check: ``dynamic`` enables
   it, ``override`` is a manual escape hatch (``auto`` = normal,
   ``allow`` = skip the live-RAM gate but still honour static bounds,
@@ -139,6 +147,7 @@ import hashlib
 import ipaddress
 import math
 import os
+import re
 import threading
 import tomllib
 from dataclasses import dataclass, field, is_dataclass, replace
@@ -228,6 +237,33 @@ _RESOURCE_KEYS: dict[str, str] = {
     "memory_mb": _INT,
     "overlay_max_gb": _INT,
 }
+
+_PROJECT_KEYS: dict[str, str] = {"image": _STR}
+
+#: Recipe file, relative to a project repo root.
+RECIPE_RELATIVE_PATH = Path(".omavroom") / "image.toml"
+#: Recipe keys accepted at the top level.
+_RECIPE_KEYS = ("base", "packages", "post")
+#: Image names become qcow2 basenames and scratch-domain tokens.
+_IMAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: Arch package tokens (``repo/name`` allowed; no leading dash/whitespace).
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+:/-]*$")
+
+
+def is_safe_image_name(name: object) -> bool:
+    """True when ``name`` is a safe image/domain token (no traversal/options)."""
+    if not isinstance(name, str):
+        return False
+    if name in (".", "..") or ".." in name:
+        return False
+    return bool(_IMAGE_NAME_RE.fullmatch(name))
+
+
+def is_safe_package(name: object) -> bool:
+    """True when ``name`` is a plain Arch package token safe for ``pacman``."""
+    if not isinstance(name, str) or ".." in name:
+        return False
+    return bool(_PACKAGE_RE.fullmatch(name))
 
 
 def _coerce_int(field: str, value: object, where: str) -> int:
@@ -347,6 +383,117 @@ class ImageConfig:
     def path(self) -> Path:
         """The golden qcow2 path with ``~`` expanded."""
         return Path(self.golden).expanduser()
+
+
+@dataclass
+class ProjectConfig:
+    """One project binding: the image its seats are provisioned from.
+
+    A seat requested with ``project=<name>`` resolves through this mapping
+    (:meth:`Config.resolve_image`); an explicit ``image=`` argument still
+    wins. The referenced image must be registered in ``[images.<name>]`` to
+    be usable.
+    """
+
+    image: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, str) or not self.image.strip():
+            raise ValueError("project image must be a non-empty string")
+        if not is_safe_image_name(self.image):
+            raise ValueError(f"project image is not a valid image name: {self.image!r}")
+
+
+@dataclass(frozen=True)
+class ImageRecipe:
+    """A project's ``.omavroom/image.toml`` recipe (Dockerfile-like).
+
+    ``base`` is the image to build on (``None`` means "the configured
+    desktop image"); ``packages`` are pacman packages installed during the
+    build; ``post`` commands run in the guest shell after the install (and
+    before the image is cleaned and flattened).
+    """
+
+    base: str | None = None
+    packages: tuple[str, ...] = ()
+    post: tuple[str, ...] = ()
+    source: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.base is not None:
+            if not isinstance(self.base, str) or not self.base.strip():
+                raise ValueError("recipe base must be a non-empty string")
+            if not is_safe_image_name(self.base):
+                raise ValueError(f"recipe base is not a valid image name: {self.base!r}")
+        packages = tuple(self.packages)
+        for package in packages:
+            if not is_safe_package(package):
+                raise ValueError(f"recipe package is not a valid package name: {package!r}")
+        post = tuple(self.post)
+        for command in post:
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("recipe post commands must be non-empty strings")
+        object.__setattr__(self, "packages", packages)
+        object.__setattr__(self, "post", post)
+
+    @property
+    def installs_anything(self) -> bool:
+        """True when the recipe has packages or post commands to apply."""
+        return bool(self.packages or self.post)
+
+
+def parse_recipe(data: object, *, where: str = "") -> ImageRecipe:
+    """Validate a parsed recipe document; clear errors for every mistake."""
+    if not isinstance(data, dict):
+        raise ValueError(f"recipe must be a table at the top level{where}")
+    unknown = set(data) - set(_RECIPE_KEYS)
+    if unknown:
+        raise ValueError(f"unknown recipe keys: {sorted(unknown)}{where}")
+    base = data.get("base")
+    if base is not None:
+        if not isinstance(base, str) or not base.strip():
+            raise ValueError(f"recipe base must be a non-empty string{where}")
+        if not is_safe_image_name(base):
+            raise ValueError(f"recipe base is not a valid image name: {base!r}{where}")
+    packages = data.get("packages", [])
+    if not isinstance(packages, list) or not all(
+        isinstance(item, str) and item.strip() for item in packages
+    ):
+        raise ValueError(f"recipe packages must be a list of non-empty strings{where}")
+    for package in packages:
+        if not is_safe_package(package):
+            raise ValueError(f"recipe package is not a valid package name: {package!r}{where}")
+    post = data.get("post", [])
+    if not isinstance(post, list) or not all(
+        isinstance(item, str) and item.strip() for item in post
+    ):
+        raise ValueError(f"recipe post must be a list of non-empty strings{where}")
+    return ImageRecipe(
+        base=base,
+        packages=tuple(packages),
+        post=tuple(post),
+        source=where.strip() or None,
+    )
+
+
+def load_recipe(path: str | Path) -> ImageRecipe:
+    """Load and strictly validate a ``.omavroom/image.toml`` recipe file."""
+    recipe_path = Path(path)
+    try:
+        text = recipe_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read recipe {recipe_path}: {exc}") from exc
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid recipe TOML in {recipe_path}: {exc}") from exc
+    return parse_recipe(data, where=f" in {recipe_path}")
+
+
+def default_recipe_path(root: str | Path | None = None) -> Path:
+    """The recipe path for a project root (defaults to the current directory)."""
+    base = Path(root) if root is not None else Path.cwd()
+    return base / RECIPE_RELATIVE_PATH
 
 
 @dataclass
@@ -727,6 +874,7 @@ class Config:
     seats: dict[str, SeatTypeConfig] = field(default_factory=_default_seats)
     resources: dict[str, ResourceConfig] = field(default_factory=_default_resources)
     images: dict[str, ImageConfig] = field(default_factory=_default_images)
+    projects: dict[str, ProjectConfig] = field(default_factory=dict)
     host: HostConfig = field(default_factory=HostConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     admission: AdmissionConfig = field(default_factory=AdmissionConfig)
@@ -829,6 +977,32 @@ class Config:
         """Default golden image for a seat type."""
         return self.seats[seat_type].image
 
+    def project_image(self, project: str | None) -> str | None:
+        """The image a project binds to, or ``None`` when unconfigured."""
+        if not project:
+            return None
+        entry = self.projects.get(project)
+        return entry.image if entry is not None else None
+
+    def resolve_image(
+        self,
+        seat_type: str,
+        *,
+        image: str | None = None,
+        project: str | None = None,
+    ) -> str:
+        """Resolve the image a seat request should use.
+
+        Precedence: an explicit ``image`` wins, then the project's configured
+        image, then the seat type's default image.
+        """
+        if image:
+            return image
+        project_image = self.project_image(project)
+        if project_image:
+            return project_image
+        return self.image_for(seat_type)
+
     def resources_for(self, seat_type: str) -> ResourceConfig:
         """Mandatory resource caps for a seat type."""
         return self.resources[seat_type]
@@ -865,7 +1039,12 @@ class Config:
     @classmethod
     def _from_dict(cls, data: dict, source: str | None = None) -> Config:
         where = f" in {source}" if source is not None else ""
-        allowed_sections = set(_SECTION_SCHEMA) | {"seats", "resources", "images"}
+        allowed_sections = set(_SECTION_SCHEMA) | {
+            "seats",
+            "resources",
+            "images",
+            "projects",
+        }
         unknown_sections = set(data) - allowed_sections
         if unknown_sections:
             raise ValueError(f"unknown config sections: {sorted(unknown_sections)}")
@@ -905,6 +1084,27 @@ class Config:
             seat_type = overrides.get("seat_type")
             if seat_type is not None and seat_type not in SEAT_TYPES:
                 raise ValueError(f"{dotted}.seat_type must be one of {SEAT_TYPES}{where}")
+        projects_data = data.get("projects", {})
+        if not isinstance(projects_data, dict):
+            raise ValueError(
+                f"[projects] must be a table, got {type(projects_data).__name__}{where}"
+            )
+        for name, overrides in projects_data.items():
+            dotted = f"projects.{name}"
+            if not isinstance(overrides, dict):
+                raise ValueError(
+                    f"[{dotted}] must be a table, got {type(overrides).__name__}{where}"
+                )
+            unknown = set(overrides) - set(_PROJECT_KEYS)
+            if unknown:
+                raise ValueError(f"unknown keys in [{dotted}]: {sorted(unknown)}{where}")
+            image = overrides.get("image")
+            if image is None:
+                raise ValueError(f"{dotted}.image is required{where}")
+            if not isinstance(image, str) or not image.strip():
+                raise ValueError(f"{dotted}.image must be a non-empty string{where}")
+            if not is_safe_image_name(image):
+                raise ValueError(f"{dotted}.image is not a valid image name: {image!r}{where}")
         cfg = cls.default()
         if section_values["capacity"]:
             cfg.capacity = CapacityConfig(**section_values["capacity"])
@@ -947,6 +1147,8 @@ class Config:
                 golden=overrides.get("golden", base.golden if base is not None else ""),
                 seat_type=overrides.get("seat_type", base.seat_type if base is not None else None),
             )
+        for name, overrides in projects_data.items():
+            cfg.projects[name] = ProjectConfig(image=overrides["image"])
         return cfg
 
     @classmethod
@@ -1068,13 +1270,8 @@ def set_config_values(
     if not isinstance(values, dict) or not values:
         raise ValueError("set_config_values requires a non-empty mapping")
     coerced = {key: Config.validate_value(section, key, value) for key, value in values.items()}
-    target = Path(path) if path is not None else default_config_path()
-    with _CONFIG_WRITE_LOCK:
-        data: dict = {}
-        if target.exists():
-            data = tomllib.loads(target.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("config TOML must be a table at the top level")
+
+    def mutate(data: dict) -> None:
         body = data.get(section)
         if body is None:
             body = {}
@@ -1082,7 +1279,111 @@ def set_config_values(
             raise ValueError(f"[{section}] must be a table, got {type(body).__name__}")
         body.update(coerced)
         data[section] = body
+
+    target = update_config(mutate, path=path)
+    return coerced, target
+
+
+def _read_config_data(target: Path) -> dict:
+    """Read the raw config document (empty dict when the file is absent)."""
+    if not target.exists():
+        return {}
+    data = tomllib.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("config TOML must be a table at the top level")
+    return data
+
+
+def update_config(mutator, *, path: str | Path | None = None) -> Path:
+    """Atomically mutate the raw config document and persist it.
+
+    ``mutator(data)`` edits the parsed document in place; the merged document
+    is re-parsed with :meth:`Config._from_dict` before a single write, so a
+    persisted file can never be one the loader would reject. Raises
+    :class:`ValueError`/``KeyError`` without writing on any validation error.
+    """
+    target = Path(path) if path is not None else default_config_path()
+    with _CONFIG_WRITE_LOCK:
+        data = _read_config_data(target)
+        mutator(data)
         Config._from_dict(data, source=str(target))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(_dump_toml(data), encoding="utf-8")
-    return coerced, target
+    return target
+
+
+def register_image(
+    name: str,
+    golden: str,
+    seat_type: str | None = None,
+    *,
+    path: str | Path | None = None,
+) -> Path:
+    """Register (or update) ``[images.<name>]`` in the user config."""
+    if not is_safe_image_name(name):
+        raise ValueError(f"invalid image name: {name!r}")
+    if not isinstance(golden, str) or not golden.strip():
+        raise ValueError("image golden path must be a non-empty string")
+    if seat_type is not None and seat_type not in SEAT_TYPES:
+        raise ValueError(f"seat_type must be one of {SEAT_TYPES}, got {seat_type!r}")
+    entry: dict[str, object] = {"golden": golden}
+    if seat_type is not None:
+        entry["seat_type"] = seat_type
+
+    def mutate(data: dict) -> None:
+        images = data.get("images")
+        if images is None:
+            images = {}
+            data["images"] = images
+        if not isinstance(images, dict):
+            raise ValueError(f"[images] must be a table, got {type(images).__name__}")
+        images[name] = entry
+
+    return update_config(mutate, path=path)
+
+
+def remove_image(name: str, *, path: str | Path | None = None) -> Path:
+    """Remove ``[images.<name>]`` from the user config (KeyError if absent)."""
+
+    def mutate(data: dict) -> None:
+        images = data.get("images")
+        if not isinstance(images, dict) or name not in images:
+            raise KeyError(f"no such image: {name!r}")
+        del images[name]
+        if not images:
+            data.pop("images", None)
+
+    return update_config(mutate, path=path)
+
+
+def set_project_image(project: str, image: str, *, path: str | Path | None = None) -> Path:
+    """Bind (or update) a project to an image in the user config."""
+    if not isinstance(project, str) or not project.strip():
+        raise ValueError("project name must be a non-empty string")
+    if not is_safe_image_name(image):
+        raise ValueError(f"invalid project image: {image!r}")
+
+    def mutate(data: dict) -> None:
+        projects = data.get("projects")
+        if projects is None:
+            projects = {}
+            data["projects"] = projects
+        if not isinstance(projects, dict):
+            raise ValueError(f"[projects] must be a table, got {type(projects).__name__}")
+        projects[project] = {"image": image}
+
+    return update_config(mutate, path=path)
+
+
+def remove_project(project: str, *, path: str | Path | None = None) -> Path:
+    """Remove a ``[projects.<name>]`` binding (KeyError if absent)."""
+
+    def mutate(data: dict) -> None:
+        projects = data.get("projects")
+        if not isinstance(projects, dict) or project not in projects:
+            raise KeyError(f"no such project: {project!r}")
+        del projects[project]
+        if not projects:
+            data.pop("projects", None)
+
+    return update_config(mutate, path=path)

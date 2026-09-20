@@ -32,6 +32,17 @@ class ProvisionerError(RuntimeError):
     """Raised by a provisioner when a seat operation fails."""
 
 
+class ImageBuildNotApproved(RuntimeError):
+    """A project image build was refused because it was not approved.
+
+    The build installs host-visible guest packages, so it must never happen
+    silently: callers gate it behind an explicit confirmation and pass that
+    approval through. Carries the structured wire code ``build_not_approved``.
+    """
+
+    code = "build_not_approved"
+
+
 @dataclass(frozen=True)
 class CommandResult:
     """Result of one guest command run through a provisioner.
@@ -204,6 +215,26 @@ class Provisioner(ABC):
         self, vm_name: str, seat_type: str, image: str, resources: ResourceCaps
     ) -> str:
         """Create a seat VM (overlay on the golden image); return a VM ref."""
+
+    @abstractmethod
+    def build_image(
+        self,
+        base_image: str,
+        *,
+        name: str,
+        packages: tuple[str, ...] | list[str] = (),
+        post: tuple[str, ...] | list[str] = (),
+        on_log: Callable[[str], None] | None = None,
+    ) -> str:
+        """Build a project image from ``base_image`` plus packages/post.
+
+        Creates a scratch overlay on ``base_image`` -- or, when the target
+        image already exists, on that existing image so only the delta is
+        applied -- boots it, installs ``packages`` with pacman, runs the
+        ``post`` shell commands, cleans the package cache, shuts the scratch
+        VM down, flattens the overlay to a standalone ``<name>.qcow2`` and
+        removes the scratch VM. Returns the produced image path.
+        """
 
     @abstractmethod
     def apply_resource_limits(self, vm_ref: str, resources: ResourceCaps) -> None:
@@ -456,6 +487,7 @@ class FakeProvisioner(Provisioner):
         self.calls: list[tuple[str, tuple, dict]] = []
         self.vms: dict[str, dict] = {}
         self.created: list[str] = []
+        self.built_images: list[dict] = []
         self.destroyed: list[str] = []
         self.resets: list[str] = []
         self.applied_limits: dict[str, ResourceCaps] = {}
@@ -577,6 +609,39 @@ class FakeProvisioner(Provisioner):
             }
             self.created.append(vm_ref)
         return vm_ref
+
+    def build_image(
+        self,
+        base_image: str,
+        *,
+        name: str,
+        packages: tuple[str, ...] | list[str] = (),
+        post: tuple[str, ...] | list[str] = (),
+        on_log: Callable[[str], None] | None = None,
+    ) -> str:
+        """Record a project-image build and return a fake image path.
+
+        Delta reuse is mirrored: when this fake built ``name`` before, the
+        recorded ``base`` is the existing image rather than ``base_image``.
+        """
+        self._record("build_image", base_image, name, tuple(packages), tuple(post))
+        self._maybe_fail("build_image")
+        existing = next((b for b in self.built_images if b["name"] == name), None)
+        delta = existing is not None
+        base = name if delta else base_image
+        if on_log is not None:
+            on_log(f"build {name} from {base}")
+        record = {
+            "base": base,
+            "requested_base": base_image,
+            "name": name,
+            "packages": list(packages),
+            "post": list(post),
+            "delta": delta,
+        }
+        with self._lock:
+            self.built_images.append(record)
+        return f"fake://images/{name}.qcow2"
 
     def apply_resource_limits(self, vm_ref: str, resources: ResourceCaps) -> None:
         self._record("apply_resource_limits", vm_ref, resources)

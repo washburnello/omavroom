@@ -95,7 +95,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
-from omavroom.config import Config
+from omavroom.config import Config, is_safe_image_name
 from omavroom.manager.provisioner import (
     CommandResult,
     ExportSpec,
@@ -132,6 +132,21 @@ _GOLDEN_SOURCES: dict[str, tuple[str, str]] = {
     "terminal": ("term.qcow2", TERMINAL_SNAPSHOT),
 }
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+#: Scratch-domain prefix for project-image builds. Deliberately outside the
+#: ``omavroom-seat-`` namespace so builds never appear as adoptable seats.
+BUILD_DOMAIN_PREFIX = "omavroom-build-"
+#: The pacman cache-cleaner run at the end of every build (keeps images lean).
+PACMAN_CLEAN_COMMAND = "pacman -Sc --noconfirm"
+#: Only one build VM may run at a time (bounded host RAM). A process-wide
+#: lock serializes builds across managers/threads in this process.
+_BUILD_LOCK = threading.Lock()
+
+
+def build_pacman_install_command(packages: tuple[str, ...] | list[str]) -> str:
+    """Render the exact ``pacman -S`` install command for a package list."""
+    args = " ".join(shlex.quote(package) for package in packages)
+    return f"pacman -S --needed --noconfirm {args}".strip()
 
 
 def _subprocess_runner(argv: list[str], timeout: int, input_text: str | None) -> CommandResult:
@@ -508,6 +523,8 @@ class LibvirtProvisioner(Provisioner):
         stop_timeout_s: int = 45,
         reset_ready_timeout_s: int = 300,
         golden_convert_timeout_s: int = 900,
+        build_ready_timeout_s: int = 300,
+        build_command_timeout_s: int = 1800,
         fsck_timeout_s: int = 300,
         host_runner: Callable[[list[str], int, str | None], CommandResult] | None = None,
         stream_runner: (
@@ -547,6 +564,8 @@ class LibvirtProvisioner(Provisioner):
         self.stop_timeout_s = stop_timeout_s
         self.reset_ready_timeout_s = reset_ready_timeout_s
         self.golden_convert_timeout_s = golden_convert_timeout_s
+        self.build_ready_timeout_s = build_ready_timeout_s
+        self.build_command_timeout_s = build_command_timeout_s
         self.fsck_timeout_s = fsck_timeout_s
         self._runner = host_runner or _subprocess_runner
         self._stream_runner = stream_runner or _subprocess_stream_runner
@@ -671,6 +690,162 @@ class LibvirtProvisioner(Provisioner):
             os.chmod(destination, 0o444)
             built[seat_type] = destination
         return built
+
+    # ------------------------------------------------------------------
+    # project image builds (recipe -> project image)
+    # ------------------------------------------------------------------
+    def build_image(
+        self,
+        base_image: str,
+        *,
+        name: str,
+        packages: tuple[str, ...] | list[str] = (),
+        post: tuple[str, ...] | list[str] = (),
+        on_log: Callable[[str], None] | None = None,
+    ) -> str:
+        """Build a standalone ``<name>.qcow2`` from a base golden + delta.
+
+        A scratch overlay is created on ``base_image`` -- or, when the target
+        image is already built, on that existing image so only the delta is
+        applied -- then booted. The package list is installed with
+        ``pacman -S --needed --noconfirm``, each ``post`` command runs in the
+        guest shell, and ``pacman -Sc --noconfirm`` trims the cache. The
+        scratch VM is shut down, the overlay flattened to a standalone
+        ``<name>.qcow2`` with mode ``444``, and the scratch VM/overlay
+        removed. Builds are serialized (one build VM at a time). ``on_log``
+        receives human-readable progress messages.
+        """
+        if not is_safe_image_name(name):
+            raise ProvisionerError(f"invalid image name: {name!r}")
+        package_list = tuple(str(package) for package in packages)
+        post_list = tuple(str(command) for command in post)
+        with _BUILD_LOCK:
+            return self._build_image_locked(
+                base_image,
+                name=name,
+                packages=package_list,
+                post=post_list,
+                on_log=on_log,
+            )
+
+    def _build_image_locked(
+        self,
+        base_image: str,
+        *,
+        name: str,
+        packages: tuple[str, ...],
+        post: tuple[str, ...],
+        on_log: Callable[[str], None] | None,
+    ) -> str:
+        scratch_ref = f"{BUILD_DOMAIN_PREFIX}{name}"
+        if self._virsh("dominfo", scratch_ref, timeout=30).ok:
+            raise ProvisionerError(f"build domain already exists: {scratch_ref}")
+        base_entry = self.config.images.get(base_image)
+        seat_type = (
+            base_entry.seat_type if base_entry is not None and base_entry.seat_type else "desktop"
+        )
+        existing = self.config.images.get(name)
+        target = existing.path if existing is not None else self.images_dir / f"{name}.qcow2"
+        delta = target.is_file()
+        overlay_base = target if delta else self._golden_for(seat_type, base_image)
+        self._build_log(
+            on_log,
+            f"{'reusing' if delta else 'building'} {name} from {overlay_base}",
+        )
+        build_dir = self.base_dir / "builds" / name
+        shutil.rmtree(build_dir, ignore_errors=True)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        overlay = build_dir / "overlay.qcow2"
+        nvram = build_dir / f"{scratch_ref}_VARS.fd"
+        try:
+            self._qemu_img(
+                "create", "-f", "qcow2", "-b", str(overlay_base), "-F", "qcow2", str(overlay)
+            )
+            shutil.copyfile(self._nvram_template(seat_type), nvram)
+            resources = self.config.resources_for(seat_type)
+            xml = build_domain_xml(
+                seat_type=seat_type,
+                name=scratch_ref,
+                uuid=str(uuid_module.uuid4()),
+                memory_mb=resources.memory_mb,
+                vcpus=resources.cpu_vcpus,
+                nvram_path=str(nvram),
+                disk_path=str(overlay),
+                mac=self._random_mac(),
+                cpu_quota=resources.cpu_vcpus * CPU_PERIOD_US,
+                mem_hard_limit_kb=(resources.memory_mb + MEM_OVERHEAD_MB) * 1024,
+                mem_soft_limit_kb=resources.memory_mb * 1024,
+            )
+            xml_path = build_dir / "domain.xml"
+            xml_path.write_text(xml, encoding="utf-8")
+            result = self._virsh("define", str(xml_path), timeout=60)
+            if not result.ok:
+                raise ProvisionerError(
+                    f"virsh define failed for {scratch_ref}: {result.stderr.strip()}"
+                )
+            self._virsh("autostart", scratch_ref, "--disable", timeout=30)
+            self._assert_no_autostart(scratch_ref)
+            start = self._virsh("start", scratch_ref, timeout=120)
+            if not start.ok:
+                raise ProvisionerError(
+                    f"virsh start failed for {scratch_ref}: {start.stderr.strip()}"
+                )
+            self._wait_build_agent(scratch_ref)
+            if packages:
+                self._build_log(on_log, f"installing: {' '.join(packages)}")
+                self._run_build_command(
+                    scratch_ref, build_pacman_install_command(packages), "package install"
+                )
+            for command in post:
+                self._build_log(on_log, f"post: {command}")
+                self._run_build_command(scratch_ref, command, "post command")
+            self._build_log(on_log, "cleaning package cache")
+            self._run_build_command(scratch_ref, PACMAN_CLEAN_COMMAND, "package cache clean")
+            self.stop(scratch_ref)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._qemu_img(
+                "convert",
+                "-O",
+                "qcow2",
+                str(overlay),
+                str(target),
+                timeout=self.golden_convert_timeout_s,
+            )
+            os.chmod(target, 0o444)
+            self._build_log(on_log, f"wrote {target}")
+            return str(target)
+        finally:
+            self._remove_build(scratch_ref, build_dir)
+
+    @staticmethod
+    def _build_log(on_log: Callable[[str], None] | None, message: str) -> None:
+        if on_log is not None:
+            on_log(message)
+
+    def _wait_build_agent(self, ref: str) -> None:
+        """Wait for the scratch VM's qemu-guest-agent (no SSH identity here)."""
+        deadline = self._monotonic() + self.build_ready_timeout_s
+        while not self.agent_ping(ref):
+            if self._monotonic() >= deadline:
+                raise ProvisionerError(f"qemu-guest-agent not responding on build VM {ref}")
+            self._sleep(1)
+
+    def _run_build_command(self, ref: str, command: str, what: str) -> None:
+        result = self.agent_exec(ref, command, timeout_s=self.build_command_timeout_s)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise ProvisionerError(f"{what} failed on build VM {ref}: {detail}")
+
+    def _remove_build(self, ref: str, build_dir: Path) -> None:
+        """Destroy/undefine the scratch VM and delete its build directory."""
+        try:
+            if self._exists(ref):
+                if self._domstate(ref) in ("running", "paused"):
+                    self._virsh("destroy", ref, timeout=60)
+                if not self._virsh("undefine", ref, "--nvram", timeout=60).ok:
+                    self._virsh("undefine", ref, timeout=60)
+        finally:
+            shutil.rmtree(build_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # seat creation
@@ -2330,9 +2505,12 @@ class LibvirtProvisioner(Provisioner):
 
 
 __all__ = [
+    "BUILD_DOMAIN_PREFIX",
+    "PACMAN_CLEAN_COMMAND",
     "CommandResult",
     "LibvirtProvisioner",
     "build_domain_xml",
+    "build_pacman_install_command",
     "build_static_network_config",
     "is_safe_ref_token",
     "is_safe_sha",

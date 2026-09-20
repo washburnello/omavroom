@@ -125,8 +125,60 @@ of them with `"tools": { "omavroom*": false }`.
 | `retry_release` | `retry_release(seat_id)` | `dict` — `job_id` (long op) |
 | `force_discard` | `force_discard(seat_id, reason="force_discard")` | `dict` — `job_id` (long op) |
 | `reconcile` | `reconcile()` | `dict` — `job_id` (long op) |
+| `image_list` | `image_list()` | `list[dict]` — registered images, golden paths, project bindings |
+| `image_build` | `image_build(name, recipe=None, base=None, packages=None, post=None, approved=False)` | `dict` — `job_id` (long op); **refuses unless `approved=True`** — never auto-builds |
+| `image_rm` | `image_rm(name)` | `dict` — unregisters (and deletes a store image) |
 | `job_poll` | `job_poll(job_id)` | `dict` — `state` (`pending`/`done`/`error`) |
 | `job_wait` | `job_wait(job_id, timeout_s=600)` | `dict` — last view (bounded) |
+
+## Project images
+
+A project declares the tools it needs in its own repo, in
+`.omavroom/image.toml`:
+
+```toml
+base = "golden-omarchy"                 # an image name (registered [images.<name>])
+packages = ["wl-clipboard", "base-devel", "python-pip"]
+# optional, run in the guest shell after the install:
+post = ["systemctl enable --now some-service"]
+```
+
+`base` defaults to the configured desktop image. The name is registered in
+the manager config as `[images.<name>]` and bound to a project by
+`[projects.<name>] image = "<name>"`. When a seat is requested with
+`request_seat(..., project="my-project")`, the scheduler resolves that
+project's image; an explicit `image=` argument still wins, and the resolved
+image is shown in `pool_status`/`seat_status`.
+
+Build with:
+
+```
+image_build("my-project", recipe=".omavroom/image.toml", approved=True)
+job_wait(job_id)
+```
+
+`image_build` **never auto-builds**: it refuses unless `approved=True`, which
+the agent must obtain from the operator after showing the packages that will
+be installed. (The CLI does this interactively: it prints the recipe and asks
+before proceeding; `--yes` skips the prompt.)
+
+A build is ephemeral and delta-aware:
+
+1. a scratch overlay is created on the base golden and booted (one build VM
+   at a time, to bound host RAM);
+2. `pacman -S --needed --noconfirm <packages>` plus any `post` commands run;
+3. `pacman -Sc --noconfirm` trims the package cache;
+4. the VM shuts down, the overlay is flattened to a standalone
+   `<name>.qcow2` with mode `444`, and the scratch VM/overlay are removed.
+
+**Delta reuse.** If `<name>.qcow2` already exists, the build starts *from
+it* and applies only the new packages/commands instead of rebuilding from
+`base`. When a recipe's `base` is itself a project image, that image is the
+starting point. A project image is therefore just a golden plus your
+packages — not a rebuild of the world.
+
+Images are managed with `omavroom image list`, `omavroom image build <name>
+[--recipe PATH] [--base IMAGE] [--yes]`, and `omavroom image rm <name>`.
 
 ## Usage guidance
 

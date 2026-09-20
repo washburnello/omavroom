@@ -168,6 +168,9 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "retry_release",
     "force_discard",
     "reconcile",
+    "image_list",
+    "image_build",
+    "image_rm",
     "job_poll",
     "job_wait",
 )
@@ -514,7 +517,11 @@ class OmavroomTools:
         """Request a seat (queues fairly if full); returns a request_id.
 
         ``seat_type`` is ``"desktop"`` (graphical) or ``"terminal"``
-        (headless). Follow with ``seat_status`` or the bounded ``wait_for_seat``.
+        (headless). A ``project`` label binds the request to that project's
+        configured image (``[projects.<name>] image=...``) when one is set;
+        an explicit ``image`` always wins. The resolved image appears in the
+        returned seat view. Follow with ``seat_status`` or the bounded
+        ``wait_for_seat``.
         """
         pending = self.client.request_seat(agent_label, seat_type, image=image, project=project)
         view = pending.status()
@@ -836,6 +843,40 @@ class OmavroomTools:
         """Adopt/reap provisioner VMs against durable state (long op -> job_id)."""
         handle = self.client.reconcile()
         return {"job_id": handle.job_id}
+
+    # -- project images --------------------------------------------------
+    def image_list(self) -> list:
+        """Registered images: name, golden path, seat type, project bindings."""
+        return self.client.image_list()
+
+    def image_build(
+        self,
+        name: str,
+        recipe: str | None = None,
+        base: str | None = None,
+        packages: list[str] | None = None,
+        post: list[str] | None = None,
+        approved: bool = False,
+    ) -> dict:
+        """Build (or delta-upgrade) a project image (long op -> job_id).
+
+        Never auto-builds: ``approved=True`` must be passed explicitly, which
+        the agent should obtain from the operator after showing the packages
+        that will be installed. Without it this raises and nothing is built.
+        """
+        if approved is not True:
+            raise ValueError(
+                "image_build requires approved=True: confirm the package "
+                "install with the operator before building"
+            )
+        handle = self.client.image_build(
+            name, recipe=recipe, base=base, packages=packages, post=post, approved=True
+        )
+        return {"job_id": handle.job_id}
+
+    def image_rm(self, name: str) -> dict:
+        """Unregister an image (and delete it when it lives in the store)."""
+        return self.client.image_rm(name)
 
     # -- generic job polling ---------------------------------------------
     def job_poll(self, job_id: str) -> dict:

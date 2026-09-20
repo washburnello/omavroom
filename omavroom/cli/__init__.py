@@ -78,7 +78,7 @@ _COMMAND_HELP: dict[str, str] = {
     "peek": "print a seat's on-demand viewer endpoint (never auto-opens)",
     "events": "show the daemon's recent event log",
     "admission": "show or set the runtime admission override",
-    "image": "inspect locally configured golden images",
+    "image": "list, build (from a project recipe) or remove golden images",
     "settings": ("show the effective configuration, or 'settings set <section>.<key> <value>'"),
     "config": "configuration helpers (alias of 'settings')",
     "tui": "open the metadata-only Textual monitor wall (over SSH friendly)",
@@ -224,6 +224,29 @@ def build_parser() -> argparse.ArgumentParser:
     image_sub = image.add_subparsers(dest="image_command", metavar="<action>")
     image_list = image_sub.add_parser("list", help="list configured golden images")
     _add_json(image_list)
+    image_build = image_sub.add_parser(
+        "build", help="build a project image from .omavroom/image.toml (asks first)"
+    )
+    image_build.add_argument("name", help="name to register the built image under")
+    image_build.add_argument(
+        "--recipe",
+        default=None,
+        help="recipe path (default: .omavroom/image.toml in the current directory)",
+    )
+    image_build.add_argument("--base", default=None, help="override the recipe's base image")
+    image_build.add_argument(
+        "--yes", "-y", action="store_true", help="skip the install confirmation prompt"
+    )
+    image_build.add_argument(
+        "--timeout", type=float, default=DEFAULT_JOB_TIMEOUT_S, help="job timeout in seconds"
+    )
+    _add_json(image_build)
+    image_rm = image_sub.add_parser("rm", help="unregister (and delete) a configured image")
+    image_rm.add_argument("name")
+    image_rm.add_argument(
+        "--yes", "-y", action="store_true", help="skip the removal confirmation prompt"
+    )
+    _add_json(image_rm)
 
     settings = subparsers.add_parser("settings", help=_COMMAND_HELP["settings"])
     settings_sub = settings.add_subparsers(dest="settings_command", metavar="<action>")
@@ -645,6 +668,7 @@ def _admission(args: argparse.Namespace) -> int:
 
 
 def _image_list(args: argparse.Namespace) -> int:
+    from omavroom.cli.format import render_table
     from omavroom.config import Config
 
     try:
@@ -657,24 +681,117 @@ def _image_list(args: argparse.Namespace) -> int:
             "seat_type": image.seat_type,
             "golden": str(image.path),
             "exists": image.path.exists(),
+            "projects": sorted(
+                project for project, cfg in config.projects.items() if cfg.image == name
+            ),
         }
         for name, image in config.images.items()
     ]
     if args.json:
         _dump(entries)
-    else:
-        from omavroom.cli.format import render_table
-
-        rows = [
-            [
-                entry["name"],
-                entry["seat_type"] or "-",
-                entry["golden"],
-                "yes" if entry["exists"] else "no",
-            ]
-            for entry in entries
+        return EXIT_OK
+    rows = [
+        [
+            entry["name"],
+            entry["seat_type"] or "-",
+            entry["golden"],
+            "yes" if entry["exists"] else "no",
+            ",".join(entry["projects"]) or "-",
         ]
-        print(render_table(["NAME", "SEAT_TYPE", "GOLDEN", "EXISTS"], rows))
+        for entry in entries
+    ]
+    print(render_table(["NAME", "SEAT_TYPE", "GOLDEN", "EXISTS", "PROJECTS"], rows))
+    if config.projects:
+        project_rows = [[project, cfg.image] for project, cfg in sorted(config.projects.items())]
+        print()
+        print(render_table(["PROJECT", "IMAGE"], project_rows))
+    return EXIT_OK
+
+
+def _resolve_image_build(args: argparse.Namespace):
+    """Resolve the recipe locally so the CLI can show and confirm the build.
+
+    Returns ``(base, packages, post)`` or raises :class:`CliError`. Doing this
+    client-side means the daemon's working directory never decides which
+    recipe applies.
+    """
+    from omavroom.config import Config, ImageRecipe, default_recipe_path, load_recipe
+
+    try:
+        path = Path(args.recipe) if args.recipe else default_recipe_path()
+        if path.exists():
+            recipe = load_recipe(path)
+        elif args.recipe:
+            raise CliError(f"recipe not found: {path}")
+        elif args.base:
+            recipe = ImageRecipe(base=args.base)
+        else:
+            raise CliError(
+                f"no recipe at {path}: pass --recipe PATH or --base IMAGE, "
+                "or add .omavroom/image.toml"
+            )
+        config = Config.load()
+    except (OSError, ValueError) as exc:
+        raise CliError(str(exc)) from exc
+    base = args.base or recipe.base or config.image_for("desktop")
+    return base, list(recipe.packages), list(recipe.post)
+
+
+def _image_build(args: argparse.Namespace) -> int:
+    from omavroom.client import DaemonClientError
+
+    try:
+        base, packages, post = _resolve_image_build(args)
+    except CliError as exc:
+        return _fail("image build", exc)
+    if not args.yes:
+        print(f"image build {args.name!r}: base={base}")
+        print(f"  packages: {', '.join(packages) if packages else '(none)'}")
+        if post:
+            print(f"  post: {'; '.join(post)}")
+        answer = input("Install these into a scratch VM and build the image? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return EXIT_OK
+    client = _client(args)
+    try:
+        job = client.image_build(args.name, base=base, packages=packages, post=post, approved=True)
+        result, code = _run_job("image build", job, timeout=args.timeout)
+    except DaemonClientError as exc:
+        return _fail("image build", exc)
+    finally:
+        client.close()
+    if result is None:
+        return code
+    if args.json:
+        _dump(result)
+    else:
+        print(
+            f"image {result.get('name')}: base={result.get('base')}"
+            f" delta={str(result.get('delta')).lower()} path={result.get('path')}"
+        )
+    return EXIT_OK
+
+
+def _image_rm(args: argparse.Namespace) -> int:
+    from omavroom.client import DaemonClientError
+
+    if not args.yes:
+        answer = input(f"Remove image {args.name!r}? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return EXIT_OK
+    client = _client(args)
+    try:
+        result = client.image_rm(args.name)
+    except DaemonClientError as exc:
+        return _fail("image rm", exc)
+    finally:
+        client.close()
+    if args.json:
+        _dump(result)
+    else:
+        print(f"removed image {result.get('name')} (deleted={result.get('deleted')})")
     return EXIT_OK
 
 
@@ -808,8 +925,13 @@ def main(argv: list[str] | None = None) -> int:
         "gui": _gui,
     }
     if args.command == "image":
-        if getattr(args, "image_command", None) == "list":
+        action = getattr(args, "image_command", None)
+        if action == "list":
             return _image_list(args)
+        if action == "build":
+            return _image_build(args)
+        if action == "rm":
+            return _image_rm(args)
         print("omavroom image: choose an action (try 'omavroom image list')", file=sys.stderr)
         return EXIT_USAGE
     if args.command == "config":

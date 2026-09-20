@@ -348,8 +348,11 @@ class Scheduler:
         cfg = self.config.resources_for(seat_type)
         return ResourceCaps(cfg.cpu_vcpus, cfg.memory_mb, cfg.overlay_max_gb)
 
-    def _effective_image(self, seat_type: str, image: str | None) -> str:
-        return image or self.config.image_for(seat_type)
+    def _effective_image(
+        self, seat_type: str, image: str | None, project: str | None = None
+    ) -> str:
+        """Resolve a request's image: explicit image, then project, then type default."""
+        return self.config.resolve_image(seat_type, image=image, project=project)
 
     def _get_seat(self, seat_id: int) -> st.Seat:
         seat = self.store.read(lambda c: st.seat_by_id(c, seat_id))
@@ -882,7 +885,7 @@ class Scheduler:
                 request = st.next_waiting(conn, seat_type)
                 if request is None:
                     continue
-                wanted = self._effective_image(seat_type, request.image)
+                wanted = self._effective_image(seat_type, request.image, request.project)
                 idle = [
                     s
                     for s in st.list_seats(conn, seat_type)
@@ -925,7 +928,7 @@ class Scheduler:
                     request = st.next_waiting(conn, seat_type)
                     if request is None:
                         break
-                    image = self._effective_image(seat_type, request.image)
+                    image = self._effective_image(seat_type, request.image, request.project)
                     seat = self._find_idle_seat(conn, seat_type, image)
                 if seat is None:
                     break
@@ -994,7 +997,7 @@ class Scheduler:
                     request = st.next_waiting(conn, seat_type)
                     if request is None:
                         break
-                    image = self._effective_image(seat_type, request.image)
+                    image = self._effective_image(seat_type, request.image, request.project)
                     seat_name = self._new_seat_name(conn, seat_type)
                     seat_id = st.insert_seat(
                         conn,
@@ -2168,7 +2171,7 @@ class Scheduler:
             agent_label=request.agent_label,
             seat_type=request.seat_type,
             project=request.project,
-            image=self._effective_image(request.seat_type, request.image),
+            image=self._effective_image(request.seat_type, request.image, request.project),
             status=request.status,
             position=request.position,
             seat_id=request.seat_id,
