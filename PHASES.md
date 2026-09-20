@@ -150,6 +150,41 @@ destroyed the VM under it. Decisions:
 - Export intent is a host repo path; a `prepare_repo` clone URL is never an
   export target.
 
+## Seat model refinements (post-omatype planning)
+
+Driven by the omatype project (Rust TUI, needs a real Omarchy terminal + a
+grown toolchain):
+
+- **Leases live on heartbeats.** The hard wall-clock ceiling is gone
+  (`leases.lease_timeout_s` default `0` = no cap). Reclaim only on heartbeat
+  lapse, and it goes to stasis (VM preserved). Agents never rebuild a VM to
+  outrun a timer.
+- **Exec has no dumb timer.** `exec.max_runtime_s` default `0` = no cap;
+  the host is protected by the output ring and the libvirt CPU/RAM caps.
+- **Agent seat helpers** (provisioner → protocol v1 → client → MCP):
+  native-resolution and region screenshots; per-character typing
+  (`{"kind":"type","delay_ms":N}`) alongside bulk `text` and `key` combos;
+  `copy_in`/`copy_out` (host side confined to a transfer root); desktop
+  control — `launch_app` (`omarchy-launch-tui`), `list/focus/resize/move/
+  float` windows (Hyprland's Lua `dispatch` syntax), `set_theme`, clipboard
+  get/set.
+- **Omarchy for every seat.** One Omarchy base with two boot modes:
+  `golden-omarchy` (desktop) and `golden-omarchy-term` (same system, no
+  compositor, boots to a shell; `wl-clipboard`/`base-devel`/`pip`). Terminal
+  seats now use the Omarchy terminal golden — the Phase-1 Arch base is
+  retired. `ensure_golden_images` builds only the STOCK goldens from the
+  template snapshots and can never clobber the hand-built Omarchy ones.
+- **Per-project images (Dockerfile-like).** A project ships
+  `.omavroom/image.toml` (`base`, `packages`, `post`); `omavroom image
+  build <name>` boots a scratch VM, installs, flattens, and registers the
+  project image; seats requested with `project=<name>` bind to it (explicit
+  `image=` wins). Builds reuse the existing project image as the base
+  (delta), run one at a time, and never happen without approval (`--yes` /
+  MCP `approved=True`). This is the "borrow Docker's design principles, not
+  its isolation model" decision: recipes-as-code, ephemeral builds, CoW
+  overlays, destroy-on-release — but a hypervisor boundary and a real
+  systemd Omarchy session, which containers can't give.
+
 ## Phase 5 — MCP server + opencode wiring
 
 Spec: FastMCP server exposing the async toolset (`pool_status`,
