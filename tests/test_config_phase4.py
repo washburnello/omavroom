@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omavroom.config import (
@@ -35,18 +37,38 @@ def test_exec_max_runtime_accepts_zero() -> None:
 def test_seat_default_image_is_set() -> None:
     cfg = Config.default()
     assert cfg.seats["desktop"].image == "golden-omarchy"
-    assert cfg.seats["terminal"].image == "golden-omarchy-term"
+    # One image serves both seat types; the boot mode is chosen by seat_type.
+    assert cfg.seats["terminal"].image == "golden-omarchy"
     assert cfg.image_for("desktop") == "golden-omarchy"
 
 
-def test_golden_omarchy_registered_with_desktop_fallback() -> None:
+def test_golden_omarchy_registered_shared_with_fallbacks() -> None:
     cfg = Config.default()
-    assert cfg.images["golden-omarchy"].seat_type == "desktop"
+    # No seat_type -> shared: both seat types resolve to it.
+    assert cfg.images["golden-omarchy"].seat_type is None
     assert cfg.golden_for("desktop").name == "golden-omarchy.qcow2"
+    assert cfg.golden_for("terminal").name == "golden-omarchy.qcow2"
     # the stock goldens stay registered so switching back is one line
     assert cfg.images["golden-desktop"].seat_type == "desktop"
     assert cfg.golden_for("desktop", "golden-desktop").name == "golden-desktop.qcow2"
     assert cfg.golden_for("desktop", "omavroom-base").name == "golden-desktop.qcow2"
+    # the hand-built terminal golden stays an (optional) per-type alternative
+    assert cfg.images["golden-omarchy-term"].seat_type == "terminal"
+    assert cfg.golden_for("terminal", "golden-omarchy-term").name == "golden-omarchy-term.qcow2"
+
+
+def test_shared_image_accepts_both_seat_types(tmp_path) -> None:
+    cfg_file = tmp_path / "omavroom.toml"
+    cfg_file.write_text(
+        '[seats.desktop]\nimage = "shared"\n'
+        '[seats.terminal]\nimage = "shared"\n'
+        '[images.shared]\ngolden = "/tmp/shared.qcow2"\n',
+        encoding="utf-8",
+    )
+    cfg = Config.from_toml(cfg_file)
+    assert cfg.images["shared"].seat_type is None
+    assert cfg.golden_for("desktop", "shared") == Path("/tmp/shared.qcow2")
+    assert cfg.golden_for("terminal", "shared") == Path("/tmp/shared.qcow2")
 
 
 def test_admission_defaults() -> None:
@@ -71,7 +93,7 @@ def test_toml_overrides_image_resources_and_admission(tmp_path) -> None:
     cfg = Config.from_toml(cfg_file)
     assert cfg.seats["desktop"].image == "custom-desktop"
     assert cfg.seats["desktop"].max_seats == 3
-    assert cfg.seats["terminal"].image == "golden-omarchy-term"
+    assert cfg.seats["terminal"].image == "golden-omarchy"
     assert cfg.resources["terminal"].memory_mb == 1024
     assert cfg.resources["terminal"].cpu_vcpus == 2
     assert cfg.admission.dynamic is False

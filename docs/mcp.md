@@ -155,6 +155,28 @@ the manager config as `[images.<name>]` and bound to a project by
 project's image; an explicit `image=` argument still wins, and the resolved
 image is shown in `pool_status`/`seat_status`.
 
+### One image, two boot modes
+
+A single image serves **both** seat types. `golden-omarchy` is registered
+without a `seat_type` (shared) and both `seats.desktop.image` and
+`seats.terminal.image` default to it; an image with `seat_type = None` is
+accepted for either type. At provision time the provisioner applies the seat
+type's boot mode inside the guest over the qemu-guest-agent channel:
+
+- `desktop` → `graphical.target`, the tty1 autologin drop-in, and a
+  `~/.bash_profile` that execs `uwsm start hyprland-uwsm.desktop`; the seat is
+  then verified to have Hyprland + quickshell running.
+- `terminal` → `multi-user.target`, no tty1 autologin drop-in, and no Hyprland
+  exec in `~/.bash_profile`.
+
+The transform is idempotent (it checks before changing) and reboots only when
+the mode actually changes. The applied mode is recorded on the seat so
+reset/reconcile keep it. Project images built by `image_build` are likewise
+single shared images, usable for either seat type.
+
+`golden-omarchy-term` remains registered (seat type `terminal`) as an
+alternative, but it is **no longer the terminal default**.
+
 ### Agent-presented needs (`image_plan` / `image_ensure`)
 
 An agent should declare *what it needs* ("Rust", "Node"), not which packages

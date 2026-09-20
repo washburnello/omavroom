@@ -122,12 +122,14 @@ def test_build_domain_xml_unknown_seat_type(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------
 def test_golden_for_falls_back_by_seat_type() -> None:
     cfg = Config.default()
-    # Desktop defaults to the Omarchy golden; the stock name stays a fallback.
+    # Both seat types share the Omarchy golden; the stock name stays a fallback.
     assert cfg.golden_for("desktop").name == "golden-omarchy.qcow2"
+    assert cfg.golden_for("terminal").name == "golden-omarchy.qcow2"
     assert cfg.golden_for("desktop", "omavroom-base").name == "golden-desktop.qcow2"
-    assert cfg.golden_for("terminal").name == "golden-omarchy-term.qcow2"
+    assert cfg.golden_for("terminal", "omavroom-base").name == "golden-term.qcow2"
     # an explicit registered name wins
     assert cfg.golden_for("desktop", "golden-desktop").name == "golden-desktop.qcow2"
+    assert cfg.golden_for("terminal", "golden-omarchy-term").name == "golden-omarchy-term.qcow2"
 
 
 def test_golden_for_rejects_seat_type_mismatch() -> None:
@@ -372,6 +374,8 @@ def test_ensure_golden_images_builds_missing(tmp_path: Path) -> None:
     assert (built["desktop"].stat().st_mode & 0o777) == 0o444
     assert any("convert" in call for call in calls)
     assert any("-l" in call and "hyprland-proof" in call for call in calls)
+    # The hand-built shared Omarchy golden is never a convert target.
+    assert all(not any("golden-omarchy" in str(part) for part in call) for call in calls)
     # a second call is a no-op
     before = len(calls)
     prov.ensure_golden_images()

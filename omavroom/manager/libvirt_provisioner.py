@@ -142,6 +142,28 @@ PACMAN_CLEAN_COMMAND = "pacman -Sc --noconfirm"
 #: lock serializes builds across managers/threads in this process.
 _BUILD_LOCK = threading.Lock()
 
+#: One boot mode per seat type. A shared image (``seat_type = None``) has no
+#: baked mode; the provisioner applies the seat type's mode in-guest.
+BOOT_MODES: tuple[str, ...] = ("desktop", "terminal")
+#: systemd default target per boot mode.
+DEFAULT_TARGET_BY_BOOT_MODE: dict[str, str] = {
+    "desktop": "graphical.target",
+    "terminal": "multi-user.target",
+}
+#: tty1 autologin drop-in the desktop mode ensures and the terminal mode removes.
+AUTOLOGIN_DROPIN = "/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+#: The Omarchy launch the desktop ``~/.bash_profile`` execs on tty1.
+HYPRLAND_LAUNCH = "uwsm start hyprland-uwsm.desktop"
+#: Sentinel comment identifying the managed desktop exec block.
+HYPRLAND_PROFILE_MARKER = "# omavroom: boot to Hyprland on tty1"
+#: Default agent (seat user) home carrying the desktop exec profile.
+AGENT_HOME = "/home/agent"
+#: Markers the boot-mode transform prints back to the host.
+BOOT_MODE_OK = "BOOT_MODE_OK"
+BOOT_MODE_CHANGED = "BOOT_MODE_CHANGED"
+#: Marker the desktop session verification prints when Hyprland + quickshell run.
+DESKTOP_SESSION_OK = "DESKTOP_SESSION_OK"
+
 
 def build_pacman_install_command(packages: tuple[str, ...] | list[str]) -> str:
     """Render the exact ``pacman -S`` install command for a package list."""
@@ -391,6 +413,83 @@ def build_static_network_config(
     )
 
 
+def build_autologin_conf(user: str = DEFAULT_SSH_USER) -> str:
+    """The tty1 autologin drop-in that logs the seat user into the desktop."""
+    return (
+        f"[Service]\nExecStart=\nExecStart=-/usr/bin/agetty --autologin {user} --noclear %I $TERM\n"
+    )
+
+
+def build_boot_mode_script(
+    seat_type: str,
+    *,
+    home: str = AGENT_HOME,
+    user: str = DEFAULT_SSH_USER,
+) -> str:
+    """Render the idempotent in-guest transform that applies a seat boot mode.
+
+    The script inspects the guest before changing anything and prints exactly
+    one verdict: :data:`BOOT_MODE_OK` (already in the wanted mode) or
+    :data:`BOOT_MODE_CHANGED` (something changed, so the caller must reboot).
+    It runs as root over the qemu-guest-agent channel, so it is independent of
+    SSH identity. ``desktop`` ensures ``graphical.target``, the tty1 autologin
+    drop-in and the ``~/.bash_profile`` Hyprland exec; ``terminal`` ensures
+    ``multi-user.target``, removes the drop-in and strips any Hyprland exec.
+    """
+    if seat_type not in BOOT_MODES:
+        raise ValueError(f"unknown seat type for boot mode: {seat_type!r}")
+    target = DEFAULT_TARGET_BY_BOOT_MODE[seat_type]
+    profile = f"{home}/.bash_profile"
+    lines = [
+        "set -u",
+        f"PROFILE={_quote(profile)}",
+        f"DROPIN={_quote(AUTOLOGIN_DROPIN)}",
+        f"TARGET={_quote(target)}",
+        "changed=0",
+        "current=$(systemctl get-default 2>/dev/null || true)",
+        'if [ "$current" != "$TARGET" ]; then '
+        'systemctl set-default "$TARGET" >/dev/null 2>&1; changed=1; fi',
+    ]
+    if seat_type == "desktop":
+        lines += [
+            'mkdir -p "$(dirname "$DROPIN")"',
+            f'if ! grep -q -- {_quote("--autologin " + user)} "$DROPIN" 2>/dev/null; then',
+            "cat > \"$DROPIN\" <<'OMAVROOM_AUTOLOGIN_EOF'\n"
+            f"{build_autologin_conf(user)}OMAVROOM_AUTOLOGIN_EOF",
+            "changed=1",
+            "fi",
+            'touch "$PROFILE"',
+            f'if ! grep -qF {_quote(HYPRLAND_LAUNCH)} "$PROFILE" 2>/dev/null; then',
+            "cat >> \"$PROFILE\" <<'OMAVROOM_PROFILE_EOF'\n"
+            "\n"
+            f"{HYPRLAND_PROFILE_MARKER}\n"
+            'if [ -z "${WAYLAND_DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then\n'
+            f"  exec {HYPRLAND_LAUNCH}\n"
+            "fi\n"
+            "OMAVROOM_PROFILE_EOF",
+            "changed=1",
+            "fi",
+            f'chown {_quote(user + ":" + user)} "$PROFILE" "$DROPIN" 2>/dev/null || true',
+        ]
+    else:
+        lines += [
+            'if [ -e "$DROPIN" ]; then '
+            'rm -f "$DROPIN"; rmdir "$(dirname "$DROPIN")" 2>/dev/null || true; changed=1; fi',
+            'if [ -f "$PROFILE" ] && grep -Eq '
+            f'{_quote("uwsm[[:space:]]+start|hyprland|Hyprland")} "$PROFILE"; then',
+            f'grep -Ev {_quote("uwsm[[:space:]]+start|hyprland|Hyprland")} "$PROFILE" '
+            '> "$PROFILE.omavroom.tmp"',
+            'mv "$PROFILE.omavroom.tmp" "$PROFILE"',
+            f'chown {_quote(user + ":" + user)} "$PROFILE" 2>/dev/null || true',
+            "changed=1",
+            "fi",
+        ]
+    lines.append(
+        f'if [ "$changed" = "1" ]; then echo {BOOT_MODE_CHANGED}; else echo {BOOT_MODE_OK}; fi'
+    )
+    return "\n".join(lines) + "\n"
+
+
 def repo_name_from(value: str) -> str:
     """Derive a stable repo name from a URL or path (basename, no ``.git``)."""
     trimmed = value.rstrip("/")
@@ -489,6 +588,7 @@ class _SeatMeta:
     identity_generation: int = 0
     last_ip: str | None = None
     static_ip: str | None = None
+    boot_mode: str | None = None
     repos: dict[str, dict] = field(default_factory=dict)
 
     def to_json(self) -> str:
@@ -961,6 +1061,7 @@ class LibvirtProvisioner(Provisioner):
             nvram=str(nvram),
             created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             static_ip=static_ip,
+            boot_mode=seat_type,
         )
         self._save_meta(meta)
         log.info("created %s from %s (mac=%s static_ip=%s)", ref, golden.name, mac, static_ip)
@@ -1265,12 +1366,17 @@ class LibvirtProvisioner(Provisioner):
         deadline = self._monotonic() + timeout_s
         remaining = max(1, int(deadline - self._monotonic()))
         self._ensure_identity(vm_ref, rotate=not meta.identity_ready, timeout_s=remaining)
+        # A shared image has no baked boot mode: apply the seat type's mode
+        # in-guest (rebooting if it changed) before we wait for SSH.
+        self._apply_boot_mode(vm_ref, meta, timeout_s=max(1, int(deadline - self._monotonic())))
         ip = self.ip_for(vm_ref)
         while self._monotonic() < deadline:
             if self._guest_alive(vm_ref):
                 usage = self.check_overlay_quota(
                     vm_ref, self.config.resources_for(meta.seat_type).overlay_max_gb
                 )
+                if meta.seat_type == "desktop":
+                    self._verify_desktop_session(vm_ref, deadline)
                 log.info("%s ready at %s (overlay %.2f GiB)", vm_ref, ip, usage)
                 return
             self._sleep(1)
@@ -1414,6 +1520,59 @@ class LibvirtProvisioner(Provisioner):
             detail = result.stderr.strip() or result.stdout.strip() or "no output"
             raise ProvisionerError(f"static network configuration failed on {vm_ref}: {detail}")
         log.info("static network applied on %s: %s", vm_ref, static_ip)
+
+    # ------------------------------------------------------------------
+    # boot mode (one image, two boot modes)
+    # ------------------------------------------------------------------
+    def _wait_agent(self, vm_ref: str, *, timeout_s: int) -> None:
+        """Block until the qemu-guest-agent answers again (e.g. after reboot)."""
+        deadline = self._monotonic() + max(30, timeout_s)
+        while not self.agent_ping(vm_ref):
+            if self._monotonic() >= deadline:
+                raise ProvisionerError(f"qemu-guest-agent not responding on {vm_ref} after reboot")
+            self._sleep(1)
+
+    def _apply_boot_mode(self, vm_ref: str, meta: _SeatMeta, *, timeout_s: int) -> None:
+        """Apply ``meta.seat_type``'s boot mode in-guest; reboot when it changes.
+
+        Idempotent: the transform checks the current target, drop-in and
+        profile before touching anything, so a seat already in the right mode
+        performs no writes and no reboot. The applied mode is recorded on the
+        seat metadata (``boot_mode``) so reset/reconcile keep the right mode.
+        """
+        script = build_boot_mode_script(meta.seat_type, user=self.ssh_user)
+        result = self.agent_exec(vm_ref, script, timeout_s=min(120, max(30, timeout_s)))
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise ProvisionerError(
+                f"boot-mode transform ({meta.seat_type}) failed on {vm_ref}: {detail}"
+            )
+        if BOOT_MODE_CHANGED in result.stdout:
+            log.info("rebooting %s to apply %s boot mode", vm_ref, meta.seat_type)
+            self.stop(vm_ref)
+            self.start(vm_ref)
+            self._wait_agent(vm_ref, timeout_s=timeout_s)
+        elif BOOT_MODE_OK not in result.stdout:
+            raise ProvisionerError(
+                f"boot-mode transform ({meta.seat_type}) gave no verdict on {vm_ref}: "
+                f"{result.stdout.strip()!r}"
+            )
+        meta.boot_mode = meta.seat_type
+        self._save_meta(meta)
+
+    def _verify_desktop_session(self, vm_ref: str, deadline: float) -> None:
+        """Wait until Hyprland and quickshell actually run (desktop seats)."""
+        command = (
+            "pgrep -x Hyprland >/dev/null 2>&1 && "
+            "pgrep -x quickshell >/dev/null 2>&1 && "
+            f"echo {DESKTOP_SESSION_OK}"
+        )
+        while self._monotonic() < deadline:
+            result = self.run(vm_ref, command, timeout_s=10)
+            if result.ok and DESKTOP_SESSION_OK in result.stdout:
+                return
+            self._sleep(1)
+        raise ProvisionerError(f"desktop session (Hyprland + quickshell) not running on {vm_ref}")
 
     # ------------------------------------------------------------------
     # reset

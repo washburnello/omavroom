@@ -616,10 +616,10 @@ class Manager:
             self._log_event("image_build_error", f"{name}: {exc}")
             raise
         self.builds.finish(name, finished_at=st.fmt_time(st.utcnow()))
-        base_entry = self.config.images.get(effective_base)
-        seat_type = (
-            base_entry.seat_type if base_entry is not None and base_entry.seat_type else "desktop"
-        )
+        # A project image is a single image usable for either seat type: it is
+        # registered shared (``seat_type = None``) and the provisioner applies
+        # the seat type's boot mode per seat. It is never split per type.
+        seat_type = None
         try:
             register_image(
                 name,

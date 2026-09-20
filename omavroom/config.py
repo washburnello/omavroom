@@ -14,16 +14,15 @@ defaults for anything unset:
     cost_units = 1
     min_seats = 0
     max_seats = 2
-    image = "omavroom-base"
+    image = "golden-omarchy"
     [images]
     build_policy = "allowlist"
     allowlist = ["base-devel", "rustup", "nodejs", "npm", "python", "python-pip", "go", "git"]
     [images.golden-omarchy]
     golden = "~/.local/share/omavroom/images/golden-omarchy.qcow2"
-    seat_type = "desktop"
+    # no ``seat_type``: one image serves both seat types
     [images.my-project-image]
     golden = "~/.local/share/omavroom/images/my-project-image.qcow2"
-    seat_type = "desktop"
     base = "golden-omarchy"
     packages = ["rustup", "base-devel"]
     recipe_hash = "..."
@@ -113,13 +112,16 @@ between lanes):
   (CPU/RAM) plus the overlay disk quota.
 - ``seats.<type>.image`` names the image a seat is provisioned from, and
   ``[images.<name>]`` maps that name to a read-only golden qcow2
-  (``golden``) and the seat type it may serve (``seat_type``). The
-  provisioner resolves the name with :meth:`Config.golden_for`; an
-  unregistered name (including the stock default ``omavroom-base``) falls
-  back to the seat type's ``golden-<type>`` entry. Desktop seats default
-  to ``golden-omarchy`` (the Omarchy 4.0.4 golden); ``golden-desktop``
-  stays registered as the fallback, so switching back is the single
-  ``seats.desktop.image`` line above.
+  (``golden``) and, optionally, the *only* seat type it may serve
+  (``seat_type``). A ``seat_type`` of ``None`` makes the image **shared**:
+  both seat types may be provisioned from it and the provisioner applies
+  the seat type's boot mode inside the guest. The provisioner resolves the
+  name with :meth:`Config.golden_for`; an unregistered name (including the
+  stock default ``omavroom-base``) falls back to the seat type's
+  ``golden-<type>`` entry. Both seat types default to ``golden-omarchy``
+  (the Omarchy 4.0.4 golden, one image serving desktop and terminal);
+  ``golden-desktop``/``golden-omarchy-term`` stay registered as fallbacks,
+  so switching back is the single ``seats.<type>.image`` line above.
 - ``[projects.<name>]`` maps a project label to the image its seats should
   use (``image = "<name>"``). A seat requested with ``project=<name>``
   resolves to that image; an explicit ``image=`` argument still wins. The
@@ -440,8 +442,10 @@ def default_images_dir() -> Path:
 class ImageConfig:
     """One named golden image: where it lives and which seat type it serves.
 
-    ``seat_type`` is optional but, when set, a seat of another type may not
-    be provisioned from it (the provisioner enforces the match).
+    ``seat_type`` is optional. ``None`` makes the image **shared**: it may
+    serve both seat types and the provisioner applies the boot mode implied by
+    the requested seat type inside the guest. When set, a seat of another type
+    may not be provisioned from it (the provisioner enforces the match).
 
     ``base`` / ``packages`` / ``post`` / ``recipe_hash`` are the *recorded
     recipe metadata* for a project image: what it was built from, the
@@ -1003,15 +1007,14 @@ def default_config_path() -> Path:
 
 
 def _default_seats() -> dict[str, SeatTypeConfig]:
-    # Both seat types boot Omarchy: a desktop golden (Hyprland + quickshell)
-    # and a terminal golden (the same system, no compositor, booting to a
-    # shell) with the shared dev tooling baked in. To revert, point these at
-    # ``golden-desktop`` / ``golden-term`` (or set ``[seats.<type>]`` TOML).
+    # Both seat types boot the SAME shared Omarchy golden; the provisioner
+    # applies the boot mode implied by ``seat_type`` inside the guest (a
+    # graphical session for desktop, a bare multi-user shell for terminal).
+    # To revert, point a type at ``golden-desktop`` / ``golden-omarchy-term``
+    # (or set ``[seats.<type>]`` in TOML).
     return {
         "desktop": SeatTypeConfig(cost_units=4, min_seats=0, max_seats=1, image="golden-omarchy"),
-        "terminal": SeatTypeConfig(
-            cost_units=1, min_seats=0, max_seats=2, image="golden-omarchy-term"
-        ),
+        "terminal": SeatTypeConfig(cost_units=1, min_seats=0, max_seats=2, image="golden-omarchy"),
     }
 
 
@@ -1024,18 +1027,26 @@ def _default_resources() -> dict[str, ResourceConfig]:
 
 def _default_images() -> dict[str, ImageConfig]:
     directory = default_images_dir()
-    # ``golden-omarchy`` is the default desktop image; the stock
-    # ``golden-desktop``/``golden-term`` stay registered as fallbacks.
+    # ``golden-omarchy`` is the default image for BOTH seat types: registered
+    # with ``seat_type = None`` so it is shared and the provisioner applies the
+    # boot mode from the seat's type. The stock ``golden-desktop``/
+    # ``golden-term`` and the hand-built ``golden-omarchy-term`` stay
+    # registered as per-type fallbacks.
     by_name = {name: seat_type for seat_type, name in DEFAULT_GOLDEN_BY_TYPE.items()}
-    by_name["golden-omarchy"] = "desktop"
-    # The Omarchy terminal golden (same system, boots to a shell). Built by
-    # hand alongside ``golden-omarchy``; do NOT let ``ensure_golden_images``
-    # force-rebuild these two from the template snapshots.
-    by_name["golden-omarchy-term"] = "terminal"
-    return {
+    entries = {
         name: ImageConfig(golden=str(directory / f"{name}.qcow2"), seat_type=seat_type)
         for name, seat_type in by_name.items()
     }
+    entries["golden-omarchy"] = ImageConfig(
+        golden=str(directory / "golden-omarchy.qcow2"), seat_type=None
+    )
+    # The Omarchy terminal golden (same system, boots to a shell). Built by
+    # hand alongside ``golden-omarchy``; do NOT let ``ensure_golden_images``
+    # force-rebuild it from the template snapshots.
+    entries["golden-omarchy-term"] = ImageConfig(
+        golden=str(directory / "golden-omarchy-term.qcow2"), seat_type="terminal"
+    )
+    return entries
 
 
 @dataclass
@@ -1204,12 +1215,15 @@ class Config:
         """Resolve a seat's image name to the golden qcow2 path.
 
         A registered image (``[images.<name>]``) wins and, when it declares a
-        ``seat_type``, must match the requested seat type. An unregistered
-        image name (including the historical default ``omavroom-base``) falls
-        back to the seat type's own ``golden-<seat_type>`` entry. Desktop
-        seats default to the registered ``golden-omarchy``; ``golden-desktop``
-        remains the per-type fallback, so the stock config still resolves to a
-        golden for every seat type without any TOML.
+        ``seat_type``, must match the requested seat type; a ``seat_type`` of
+        ``None`` is **shared** and accepted for either type (the provisioner
+        then applies that seat type's boot mode). An unregistered image name
+        (including the historical default ``omavroom-base``) falls back to the
+        seat type's own ``golden-<seat_type>`` entry. Both seat types default
+        to the shared ``golden-omarchy``; ``golden-desktop`` /
+        ``golden-omarchy-term`` remain the per-type fallbacks, so the stock
+        config still resolves to a golden for every seat type without any
+        TOML.
         """
         if seat_type not in SEAT_TYPES:
             raise ValueError(f"unknown seat type: {seat_type!r}")
