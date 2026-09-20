@@ -839,11 +839,15 @@ def default_config_path() -> Path:
 
 
 def _default_seats() -> dict[str, SeatTypeConfig]:
-    # Desktop seats boot the Omarchy 4.0.4 golden. To revert, set
-    # ``image="golden-desktop"`` here (or in ``[seats.desktop]`` TOML).
+    # Both seat types boot Omarchy: a desktop golden (Hyprland + quickshell)
+    # and a terminal golden (the same system, no compositor, booting to a
+    # shell) with the shared dev tooling baked in. To revert, point these at
+    # ``golden-desktop`` / ``golden-term`` (or set ``[seats.<type>]`` TOML).
     return {
         "desktop": SeatTypeConfig(cost_units=4, min_seats=0, max_seats=1, image="golden-omarchy"),
-        "terminal": SeatTypeConfig(cost_units=1, min_seats=0, max_seats=2),
+        "terminal": SeatTypeConfig(
+            cost_units=1, min_seats=0, max_seats=2, image="golden-omarchy-term"
+        ),
     }
 
 
@@ -860,6 +864,10 @@ def _default_images() -> dict[str, ImageConfig]:
     # ``golden-desktop``/``golden-term`` stay registered as fallbacks.
     by_name = {name: seat_type for seat_type, name in DEFAULT_GOLDEN_BY_TYPE.items()}
     by_name["golden-omarchy"] = "desktop"
+    # The Omarchy terminal golden (same system, boots to a shell). Built by
+    # hand alongside ``golden-omarchy``; do NOT let ``ensure_golden_images``
+    # force-rebuild these two from the template snapshots.
+    by_name["golden-omarchy-term"] = "terminal"
     return {
         name: ImageConfig(golden=str(directory / f"{name}.qcow2"), seat_type=seat_type)
         for name, seat_type in by_name.items()

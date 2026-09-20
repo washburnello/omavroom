@@ -95,7 +95,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
-from omavroom.config import Config, is_safe_image_name
+from omavroom.config import DEFAULT_GOLDEN_BY_TYPE, Config, is_safe_image_name
 from omavroom.manager.provisioner import (
     CommandResult,
     ExportSpec,
@@ -669,7 +669,12 @@ class LibvirtProvisioner(Provisioner):
         """
         built: dict[str, Path] = {}
         for seat_type, (source_name, snapshot) in _GOLDEN_SOURCES.items():
-            destination = self.config.golden_for(seat_type)
+            # Always target the STOCK golden for the seat type (golden-desktop
+            # / golden-term), never whatever image the seat type currently
+            # points at: the hand-built Omarchy goldens (golden-omarchy /
+            # golden-omarchy-term) must not be overwritten from the template
+            # snapshots.
+            destination = self.config.golden_for(seat_type, DEFAULT_GOLDEN_BY_TYPE[seat_type])
             if destination.exists() and not force:
                 built[seat_type] = destination
                 continue

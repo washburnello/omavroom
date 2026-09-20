@@ -36,7 +36,7 @@ def test_exec_max_runtime_accepts_zero() -> None:
 def test_seat_default_image_is_set() -> None:
     cfg = Config.default()
     assert cfg.seats["desktop"].image == "golden-omarchy"
-    assert cfg.seats["terminal"].image == DEFAULT_IMAGE
+    assert cfg.seats["terminal"].image == "golden-omarchy-term"
     assert cfg.image_for("desktop") == "golden-omarchy"
 
 
@@ -72,7 +72,7 @@ def test_toml_overrides_image_resources_and_admission(tmp_path) -> None:
     cfg = Config.from_toml(cfg_file)
     assert cfg.seats["desktop"].image == "custom-desktop"
     assert cfg.seats["desktop"].max_seats == 3
-    assert cfg.seats["terminal"].image == DEFAULT_IMAGE
+    assert cfg.seats["terminal"].image == "golden-omarchy-term"
     assert cfg.resources["terminal"].memory_mb == 1024
     assert cfg.resources["terminal"].cpu_vcpus == 2
     assert cfg.admission.dynamic is False
