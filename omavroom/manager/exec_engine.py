@@ -34,7 +34,10 @@ command that daemonises itself inside the guest can outlive the channel --
 a documented limitation, not a guarantee. The wall-clock timeout is enforced
 twice: the provisioner receives ``timeout_s`` (hard transport timeout, exit
 ``124``), and the engine clamps the requested timeout to
-``exec.max_runtime_s``.
+``exec.max_runtime_s``. That engine ceiling is optional: ``max_runtime_s = 0``
+(default) means no engine-wide cap, so a long build/test is never killed by a
+fixed timer (the host stays protected by the libvirt CPU/RAM caps and the
+output ring). ``timeout_s = 0`` passed to the provisioner means "no timeout".
 
 Output is a per-stream ring buffer (``ExecTracker``): the most recent
 ``exec.max_output_bytes`` characters are retained and ``truncated`` is set
@@ -99,13 +102,13 @@ class ExecEngine:
         provisioner: Provisioner,
         *,
         read_seat: Callable[[int], st.Seat | None],
-        max_runtime_s: int = 3600,
+        max_runtime_s: int = 0,
         default_timeout_s: int = 60,
         on_busy: Callable[[int], None] | None = None,
         on_idle: Callable[[int], None] | None = None,
     ) -> None:
-        if max_runtime_s < 1:
-            raise ValueError("max_runtime_s must be >= 1")
+        if max_runtime_s < 0:
+            raise ValueError("max_runtime_s must be >= 0 (0 = no ceiling)")
         if default_timeout_s < 1:
             raise ValueError("default_timeout_s must be >= 1")
         self.tracker = tracker
@@ -153,8 +156,18 @@ class ExecEngine:
         effective = 0
         recorded = timeout_s
         if command:
-            requested = timeout_s if timeout_s is not None else self.default_timeout_s
-            effective = min(requested, self.max_runtime_s)
+            if timeout_s is not None:
+                requested = timeout_s
+            elif self.max_runtime_s > 0:
+                requested = self.default_timeout_s
+            else:
+                # No engine ceiling and no explicit per-call timeout: run
+                # without one (0 means "no timeout" to the transport).
+                requested = 0
+            if self.max_runtime_s > 0:
+                effective = min(requested, self.max_runtime_s)
+            else:
+                effective = requested
             recorded = effective
             if not self._vm_running(seat_id, seat.vm_name):
                 raise ExecNotAllowed(f"seat {seat_id} VM is not running")

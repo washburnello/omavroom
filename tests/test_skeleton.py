@@ -19,10 +19,12 @@ def test_config_defaults_match_plan_starting_point() -> None:
         seat = cfg.seats[seat_type]
         assert seat.min_seats <= seat.max_seats
     assert cfg.host.headroom_floor_mb > 0
-    assert cfg.leases.lease_timeout_s >= cfg.leases.heartbeat_timeout_s
+    # Lease liveness is the heartbeat; the wall clock is a disabled (0) ceiling.
+    assert cfg.leases.lease_timeout_s == 0
     assert cfg.leases.heartbeat_timeout_s >= cfg.leases.heartbeat_interval_s
     assert cfg.exec.max_output_bytes > 0
-    assert cfg.exec.max_runtime_s > 0
+    # The exec runtime ceiling is disabled (0) by default.
+    assert cfg.exec.max_runtime_s == 0
 
 
 def test_config_toml_override(tmp_path) -> None:

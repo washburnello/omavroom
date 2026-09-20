@@ -23,6 +23,16 @@ def test_resources_defaults_match_real_box() -> None:
     assert (terminal.cpu_vcpus, terminal.memory_mb, terminal.overlay_max_gb) == (2, 2048, 10)
 
 
+def test_exec_max_runtime_accepts_zero() -> None:
+    from omavroom.config import ExecConfig
+
+    assert ExecConfig().max_runtime_s == 0
+    assert ExecConfig(max_runtime_s=0).max_runtime_s == 0
+    assert Config.validate_value("exec", "max_runtime_s", 0) == 0
+    with pytest.raises(ValueError, match="max_runtime_s must be >= 0"):
+        ExecConfig(max_runtime_s=-1)
+
+
 def test_seat_default_image_is_set() -> None:
     cfg = Config.default()
     assert cfg.seats["desktop"].image == "golden-omarchy"

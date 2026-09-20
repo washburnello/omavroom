@@ -397,6 +397,11 @@ _REFSPEC_RE = re.compile(r"^refs/[^\s\x00-\x1f\x7f]+$")
 _SAFE_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 #: A short (unqualified) ref/branch token safe to pass to git as an argument.
 _SAFE_REF_TOKEN_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/-]*$")
+#: Omarchy theme names: letters/digits plus spaces and ``._+-/`` (e.g.
+#: ``"Tokyo Night"``). Deliberately excludes shell metacharacters and ``..``.
+_SAFE_THEME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+/-]{0,63}$")
+#: Default host-side root for ``copy_in``/``copy_out`` (under the data dir).
+TRANSFER_DIR_NAME = "transfer"
 
 
 def is_safe_sha(value: str) -> bool:
@@ -496,6 +501,7 @@ class LibvirtProvisioner(Provisioner):
         virsh_bin: str = "virsh",
         qemu_img_bin: str = "qemu-img",
         magick_bin: str | None = None,
+        host_transfer_root: str | Path | None = None,
         max_bundle_bytes: int = 2 * 1024**3,
         max_export_commits: int = 100,
         dhcp_timeout_s: int = 60,
@@ -523,6 +529,11 @@ class LibvirtProvisioner(Provisioner):
         self.nvram_dir = self.base_dir / "nvram"
         self.staging_dir = self.base_dir / "staging"
         self.images_dir = self.base_dir / "images"
+        self.host_transfer_root = (
+            Path(host_transfer_root).expanduser()
+            if host_transfer_root is not None
+            else self.base_dir / TRANSFER_DIR_NAME
+        )
         self.ssh_key = Path(ssh_key).expanduser()
         self.ssh_user = ssh_user
         self.ssh_port = ssh_port
@@ -541,7 +552,12 @@ class LibvirtProvisioner(Provisioner):
         self._stream_runner = stream_runner or _subprocess_stream_runner
         self._sleep = sleep
         self._monotonic = monotonic
-        for directory in (self.seats_dir, self.nvram_dir, self.staging_dir):
+        for directory in (
+            self.seats_dir,
+            self.nvram_dir,
+            self.staging_dir,
+            self.host_transfer_root,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -998,13 +1014,22 @@ class LibvirtProvisioner(Provisioner):
         argv += [f"{self.ssh_user}@{ip}", "--", f"{prefix}{command}"]
         return argv
 
-    def _scp_argv(self, vm_ref: str, remote_path: str, local_path: str) -> list[str]:
-        ip = self.ip_for(vm_ref)
+    def _scp_base(self, vm_ref: str) -> list[str]:
+        """``scp`` argv prefix with the same pinned-key options as SSH."""
         argv = ["scp", *self._ssh_opts(vm_ref)]
         if self.ssh_port != 22:
             argv += ["-P", str(self.ssh_port)]
-        argv += [f"{self.ssh_user}@{ip}:{remote_path}", local_path]
         return argv
+
+    def _scp_argv(self, vm_ref: str, remote_path: str, local_path: str) -> list[str]:
+        """Download argv: ``scp <opts> user@ip:remote local``."""
+        ip = self.ip_for(vm_ref)
+        return [*self._scp_base(vm_ref), f"{self.ssh_user}@{ip}:{remote_path}", local_path]
+
+    def _scp_upload_argv(self, vm_ref: str, local_path: str, remote_path: str) -> list[str]:
+        """Upload argv: ``scp <opts> local user@ip:remote`` (argv list only)."""
+        ip = self.ip_for(vm_ref)
+        return [*self._scp_base(vm_ref), local_path, f"{self.ssh_user}@{ip}:{remote_path}"]
 
     def run(
         self,
@@ -1709,10 +1734,18 @@ class LibvirtProvisioner(Provisioner):
     # desktop ops
     # ------------------------------------------------------------------
     def screenshot(
-        self, vm_ref: str, *, max_width: int | None = None, max_bytes: int | None = None
+        self,
+        vm_ref: str,
+        *,
+        max_width: int | None = None,
+        max_bytes: int | None = None,
+        region: tuple[int, int, int, int] | None = None,
     ) -> bytes:
         """Grab the guest framebuffer as PNG bytes, bounded by width and bytes.
 
+        ``max_width=None`` (or ``0``) leaves the frame at native resolution;
+        a positive width downscales only when the frame is wider. ``region``
+        ``(x, y, w, h)`` crops the native frame *before* any downscale.
         If the image needs conversion/downscaling and ImageMagick is
         unavailable, or the encoded PNG cannot be brought under ``max_bytes``,
         this raises :class:`ProvisionerError` rather than returning an
@@ -1720,6 +1753,7 @@ class LibvirtProvisioner(Provisioner):
         """
         if not self._exists(vm_ref):
             raise ProvisionerError(f"unknown seat VM: {vm_ref}")
+        crop = self._validate_region(region)
         seat_dir = self._seat_dir(vm_ref)
         seat_dir.mkdir(parents=True, exist_ok=True)
         raw = seat_dir / "screenshot.raw"
@@ -1733,14 +1767,14 @@ class LibvirtProvisioner(Provisioner):
         data = raw.read_bytes()
         needs_convert = not data.startswith(_PNG_MAGIC)
         needs_resize = False
-        if not needs_convert and max_width is not None:
+        if not needs_convert and max_width:
             try:
                 width, _ = png_dimensions(data)
                 needs_resize = width > max_width
             except ValueError:
                 needs_resize = False
         over_bytes = max_bytes is not None and len(data) > max_bytes
-        if not (needs_convert or needs_resize or over_bytes):
+        if not (needs_convert or needs_resize or crop is not None or over_bytes):
             raw.unlink(missing_ok=True)
             return data
         if not self.magick_bin:
@@ -1753,6 +1787,8 @@ class LibvirtProvisioner(Provisioner):
                 raise ProvisionerError(
                     "screenshot needs downscaling but ImageMagick is unavailable"
                 )
+            if crop is not None:
+                raise ProvisionerError("screenshot needs cropping but ImageMagick is unavailable")
             raise ProvisionerError(
                 f"screenshot is {len(data)} bytes > max_bytes {max_bytes} and "
                 "ImageMagick is unavailable"
@@ -1762,11 +1798,14 @@ class LibvirtProvisioner(Provisioner):
         src.write_bytes(data)
         raw.unlink(missing_ok=True)
         png = seat_dir / "screenshot.png"
-        width = max_width
+        width = max_width or None
         encoded: bytes | None = None
         for _ in range(6):
             png.unlink(missing_ok=True)
             argv = [self.magick_bin, str(src)]
+            if crop is not None:
+                x, y, w, h = crop
+                argv += ["-crop", f"{w}x{h}+{x}+{y}", "+repage"]
             if width is not None:
                 argv += ["-resize", f"{width}x"]
             argv.append(str(png))
@@ -1794,44 +1833,96 @@ class LibvirtProvisioner(Provisioner):
             )
         return encoded
 
+    @staticmethod
+    def _validate_region(
+        region: tuple[int, int, int, int] | None,
+    ) -> tuple[int, int, int, int] | None:
+        """Normalize/validate a screenshot crop rectangle."""
+        if region is None:
+            return None
+        if not isinstance(region, (tuple, list)) or len(region) != 4:
+            raise ProvisionerError("region must be an (x, y, w, h) tuple")
+        x, y, w, h = region
+        for value in (x, y, w, h):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ProvisionerError("region values must be integers")
+        if x < 0 or y < 0 or w < 1 or h < 1:
+            raise ProvisionerError("region requires x >= 0, y >= 0, w >= 1, h >= 1")
+        return (x, y, w, h)
+
     def _desktop_env(self) -> dict[str, str]:
         return {
             "XDG_RUNTIME_DIR": "/run/user/1000",
             "WAYLAND_DISPLAY": "wayland-1",
         }
 
+    def _desktop_env_prefix(self) -> str:
+        """The ``KEY=value`` prefix that puts a guest command on the desktop.
+
+        Exported once for the whole remote shell (``env A=1 cmd1 && cmd2``
+        would leave ``cmd2`` without it), so it is prepended with ``export``.
+        """
+        return " ".join(f"{key}={_quote(value)}" for key, value in self._desktop_env().items())
+
+    def _desktop_command(self, body: str) -> str:
+        """Wrap a desktop command body with the exported Wayland environment."""
+        return f"export {self._desktop_env_prefix()}; {body}"
+
+    def _require_desktop(self, vm_ref: str, method: str) -> _SeatMeta:
+        """Assert ``vm_ref`` is a desktop seat and return its metadata."""
+        meta = self._require_meta(vm_ref)
+        if meta.seat_type != "desktop":
+            raise ProvisionerError(f"{method} is only supported on desktop seats: {vm_ref}")
+        return meta
+
     def input(self, vm_ref: str, events: list[InputEvent]) -> None:
-        """Inject key/text/click events inside the guest (desktop seats).
+        """Inject key/text/type/click events inside the guest (desktop seats).
 
         Runs ``wtype``/``ydotool`` over SSH with the guest's Wayland session
         environment. Click values are ``x,y[,button]`` with button 1/2/3
         mapping to ydotool's BTN_LEFT/BTN_RIGHT/BTN_MIDDLE. Key values may be
         a single keysym (``"Return"``) or a ``Mod+...+Key`` combo
         (``"Super+Return"``, ``"Ctrl+Alt+t"``); see :meth:`_key_command`.
+        ``type`` events type per character with ``wtype -d`` (see
+        :meth:`_type_command`), unlike ``text`` which types in bulk.
         """
-        meta = self._require_meta(vm_ref)
-        if meta.seat_type != "desktop":
-            raise ProvisionerError(f"input is only supported on desktop seats: {vm_ref}")
+        self._require_desktop(vm_ref, "input")
         commands: list[str] = []
         for event in events:
             if event.kind == "key":
                 commands.append(self._key_command(event.value))
+            elif event.kind == "type":
+                commands.append(self._type_command(event.value, event.delay_ms))
             elif event.kind == "text":
                 commands.append(f"wtype -- {_quote(event.value)}")
             else:
                 commands.append(self._click_command(event.value))
         if not commands:
             return
-        # The Wayland env must apply to EVERY command, not just the first in an
-        # "&&" chain (``env A=1 cmd1 && cmd2`` leaves cmd2 without it), so
-        # export it once for the whole remote shell.
-        env_exports = " ".join(
-            f"{key}={_quote(value)}" for key, value in self._desktop_env().items()
-        )
-        joined = f"export {env_exports}; " + " && ".join(commands)
+        joined = self._desktop_command(" && ".join(commands))
         result = self.run(vm_ref, joined, timeout_s=60)
         if not result.ok:
             raise ProvisionerError(f"input injection failed on {vm_ref}: {result.stderr.strip()}")
+
+    @staticmethod
+    def _type_command(value: str, delay_ms: int | None) -> str:
+        """Build a per-character ``wtype`` typing command.
+
+        ``delay_ms`` maps to ``wtype -d`` (milliseconds between keystrokes,
+        ``wtype``'s own default 0 when unset), so incremental rendering is
+        exercised::
+
+            type "ab", delay_ms=40 -> wtype -d 40 -- ab
+        """
+        if not value:
+            raise ProvisionerError("type event value must not be empty")
+        parts = ["wtype"]
+        if delay_ms is not None:
+            if delay_ms < 0:
+                raise ProvisionerError("type event delay_ms must be >= 0")
+            parts += ["-d", str(delay_ms)]
+        parts += ["--", _quote(value)]
+        return " ".join(parts)
 
     #: Allowed click buttons -> ydotool BTN_* key codes.
     _CLICK_BUTTONS: dict[str, str] = {"1": "272", "2": "274", "3": "273"}
@@ -1911,6 +2002,292 @@ class LibvirtProvisioner(Provisioner):
         return (
             f"ydotool mousemove --absolute {x} {y} || ydotool mousemove {x} {y}; "
             f"ydotool click {code}"
+        )
+
+    # ------------------------------------------------------------------
+    # file transfer (copy_in / copy_out; host side constrained to a root)
+    # ------------------------------------------------------------------
+    def _safe_host_path(self, path: str, *, for_write: bool) -> Path:
+        """Resolve a host path and require it to stay under the transfer root.
+
+        An absolute path must already live under :attr:`host_transfer_root`; a
+        relative path is resolved *inside* it. Symlinks are resolved first, so
+        a link inside the root pointing outside is rejected. Only ever passed
+        as a single ``scp`` argv element -- never a host shell string.
+        """
+        raw = (path or "").strip()
+        if not raw:
+            raise ProvisionerError("host path must not be empty")
+        if "\x00" in raw:
+            raise ProvisionerError(f"host path contains a NUL byte: {raw!r}")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.host_transfer_root / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError as exc:
+            raise ProvisionerError(f"cannot resolve host path {raw!r}: {exc}") from exc
+        root = self.host_transfer_root.resolve()
+        if resolved != root and not resolved.is_relative_to(root):
+            raise ProvisionerError(f"host path {raw!r} is outside the allowed transfer root {root}")
+        if for_write:
+            if resolved == root:
+                raise ProvisionerError("host path must name a file, not the transfer root")
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        return resolved
+
+    @staticmethod
+    def _safe_guest_path(path: str, what: str) -> str:
+        """Validate a guest-side path (absolute, no whitespace/control chars)."""
+        raw = (path or "").strip()
+        if not raw.startswith("/"):
+            raise ProvisionerError(f"{what} must be an absolute guest path: {raw!r}")
+        if _CTRL_OR_SPACE_RE.search(raw):
+            raise ProvisionerError(f"unsafe {what} rejected: {raw!r}")
+        return raw
+
+    def copy_in(self, vm_ref: str, host_path: str, guest_path: str) -> int:
+        """Upload one host file to the guest over the pinned SSH key.
+
+        The host source must live under :attr:`host_transfer_root`. The
+        transfer is an ``scp`` **argv list** (never a host shell string).
+        """
+        self._require_meta(vm_ref)
+        source = self._safe_host_path(host_path, for_write=False)
+        if not source.is_file():
+            raise ProvisionerError(f"copy_in source is not a file: {source}")
+        destination = self._safe_guest_path(guest_path, "guest_path")
+        result = self.host(self._scp_upload_argv(vm_ref, str(source), destination), timeout=900)
+        if not result.ok:
+            raise ProvisionerError(f"copy_in failed for {vm_ref}: {result.stderr.strip()}")
+        return source.stat().st_size
+
+    def copy_out(self, vm_ref: str, guest_path: str, host_path: str) -> int:
+        """Download one guest file to the host over the pinned SSH key.
+
+        The host destination must live under :attr:`host_transfer_root`; its
+        parent is created if missing. The transfer is an ``scp`` **argv list**
+        (never a host shell string).
+        """
+        self._require_meta(vm_ref)
+        source = self._safe_guest_path(guest_path, "guest_path")
+        destination = self._safe_host_path(host_path, for_write=True)
+        result = self.host(self._scp_argv(vm_ref, source, str(destination)), timeout=900)
+        if not result.ok:
+            raise ProvisionerError(f"copy_out failed for {vm_ref}: {result.stderr.strip()}")
+        if not destination.is_file():
+            raise ProvisionerError(f"copy_out did not produce a file at {destination}")
+        return destination.stat().st_size
+
+    # ------------------------------------------------------------------
+    # desktop helpers (Omarchy / Hyprland; desktop seats only)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _lua_string(value: str) -> str:
+        """Render ``value`` as a Lua double-quoted string literal."""
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
+        return f'"{escaped}"'
+
+    @staticmethod
+    def _hyprctl_dispatch_command(expr: str) -> str:
+        """Invoke a Hyprland dispatcher through this version's **Lua** form.
+
+        On Omarchy's Hyprland 0.56 (Lua config) ``hyprctl dispatch`` is a
+        shorthand for ``hl.dispatch(...)``, so the argument must be a valid
+        Lua expression; passing a bare dispatcher name (``hyprctl dispatch
+        exec foot``) fails with "dispatch in lua is a shorthand for
+        hl.dispatch(...)". The expression is shell-quoted as one argv token.
+        """
+        return f"hyprctl dispatch {_quote(expr)}"
+
+    def _run_desktop(
+        self, vm_ref: str, body: str, *, timeout_s: int = 60, action: str = "desktop op"
+    ) -> CommandResult:
+        result = self.run(vm_ref, self._desktop_command(body), timeout_s=timeout_s)
+        if not result.ok:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise ProvisionerError(f"{action} failed on {vm_ref}: {detail}")
+        return result
+
+    @staticmethod
+    def _window_view(raw: dict) -> dict:
+        workspace = raw.get("workspace")
+        if isinstance(workspace, dict):
+            workspace = workspace.get("name")
+        return {
+            "address": raw.get("address"),
+            "class": raw.get("class"),
+            "title": raw.get("title"),
+            "initial_class": raw.get("initialClass"),
+            "initial_title": raw.get("initialTitle"),
+            "workspace": workspace,
+            "floating": bool(raw.get("floating")),
+            "mapped": bool(raw.get("mapped")),
+            "pid": raw.get("pid"),
+            "size": list(raw.get("size") or []),
+            "at": list(raw.get("at") or []),
+            "focus_history_id": raw.get("focusHistoryID"),
+        }
+
+    def list_windows(self, vm_ref: str) -> list[dict]:
+        """List the desktop's windows (``hyprctl clients -j``)."""
+        self._require_desktop(vm_ref, "list_windows")
+        result = self._run_desktop(vm_ref, "hyprctl clients -j", action="list_windows")
+        try:
+            raw = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise ProvisionerError(
+                f"list_windows could not parse hyprctl JSON on {vm_ref}: {exc}"
+            ) from exc
+        if not isinstance(raw, list):
+            raise ProvisionerError(
+                f"list_windows: hyprctl returned {type(raw).__name__}, expected a list"
+            )
+        return [self._window_view(window) for window in raw if isinstance(window, dict)]
+
+    def _resolve_window(self, vm_ref: str, match: str) -> dict:
+        """Resolve a class/title regex to one window (most recently focused)."""
+        if not (match or "").strip():
+            raise ProvisionerError("window match must be a non-empty regex")
+        try:
+            pattern = re.compile(match, re.IGNORECASE)
+        except re.error as exc:
+            raise ProvisionerError(f"invalid window match regex {match!r}: {exc}") from exc
+        windows = self.list_windows(vm_ref)
+        matched = [
+            window
+            for window in windows
+            if any(
+                pattern.search(window.get(key) or "")
+                for key in ("class", "title", "initial_class", "initial_title")
+            )
+        ]
+        if not matched:
+            raise ProvisionerError(f"no window matches {match!r} on {vm_ref}")
+
+        def focus_rank(window: dict) -> int:
+            value = window.get("focus_history_id")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            return 1 << 30
+
+        matched.sort(key=focus_rank)
+        return matched[0]
+
+    @staticmethod
+    def _window_reference(window: dict) -> str:
+        address = window.get("address") or ""
+        if not re.fullmatch(r"0x[0-9a-fA-F]+", address):
+            raise ProvisionerError(f"unsupported window address: {address!r}")
+        return f"address:{address}"
+
+    def launch_app(self, vm_ref: str, command: str, *, tui: bool = False) -> None:
+        """Launch an app: ``omarchy-launch-tui`` for TUIs, else direct dispatch.
+
+        TUI commands run in the default terminal via
+        ``omarchy-launch-tui bash -lc <command>``; GUI commands are dispatched
+        with ``hl.dsp.exec_cmd(<command>)``. The command is shell/Lua-quoted
+        so it cannot escape the dispatcher expression.
+        """
+        self._require_desktop(vm_ref, "launch_app")
+        command = (command or "").strip()
+        if not command:
+            raise ProvisionerError("launch_app requires a non-empty command")
+        if tui:
+            body = f"omarchy-launch-tui bash -lc {_quote(command)}"
+        else:
+            expr = f"hl.dsp.exec_cmd({self._lua_string(command)})"
+            body = self._hyprctl_dispatch_command(expr)
+        self._run_desktop(vm_ref, body, action="launch_app")
+
+    def focus_window(self, vm_ref: str, match: str) -> dict:
+        """Focus the matching window; returns the matched window view."""
+        self._require_desktop(vm_ref, "focus_window")
+        window = self._resolve_window(vm_ref, match)
+        reference = self._lua_string(self._window_reference(window))
+        expr = f"hl.dsp.focus({{ window = {reference} }})"
+        self._run_desktop(vm_ref, self._hyprctl_dispatch_command(expr), action="focus_window")
+        return window
+
+    def resize_window(self, vm_ref: str, match: str, width: int, height: int) -> None:
+        """Resize the matching window with ``hl.dsp.window.resize``."""
+        self._require_desktop(vm_ref, "resize_window")
+        if not self._is_positive_int(width) or not self._is_positive_int(height):
+            raise ProvisionerError("resize_window width/height must be positive integers")
+        window = self._resolve_window(vm_ref, match)
+        reference = self._lua_string(self._window_reference(window))
+        expr = f"hl.dsp.window.resize({{ window = {reference}, x = {width}, y = {height} }})"
+        self._run_desktop(vm_ref, self._hyprctl_dispatch_command(expr), action="resize_window")
+
+    def move_window(self, vm_ref: str, match: str, x: int, y: int) -> None:
+        """Move the matching window with ``hl.dsp.window.move``."""
+        self._require_desktop(vm_ref, "move_window")
+        if not self._is_int(x) or not self._is_int(y):
+            raise ProvisionerError("move_window x/y must be integers")
+        window = self._resolve_window(vm_ref, match)
+        reference = self._lua_string(self._window_reference(window))
+        expr = f"hl.dsp.window.move({{ window = {reference}, x = {x}, y = {y} }})"
+        self._run_desktop(vm_ref, self._hyprctl_dispatch_command(expr), action="move_window")
+
+    def float_window(self, vm_ref: str, match: str, on: bool) -> None:
+        """Toggle floating for the matching window with ``hl.dsp.window.float``."""
+        self._require_desktop(vm_ref, "float_window")
+        if not isinstance(on, bool):
+            raise ProvisionerError("float_window 'on' must be a boolean")
+        window = self._resolve_window(vm_ref, match)
+        reference = self._lua_string(self._window_reference(window))
+        action = "on" if on else "off"
+        expr = f'hl.dsp.window.float({{ window = {reference}, action = "{action}" }})'
+        self._run_desktop(vm_ref, self._hyprctl_dispatch_command(expr), action="float_window")
+
+    @staticmethod
+    def _is_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    @classmethod
+    def _is_positive_int(cls, value: object) -> bool:
+        return cls._is_int(value) and value > 0
+
+    def set_theme(self, vm_ref: str, name: str) -> None:
+        """Apply an Omarchy theme (``omarchy theme set <name>``)."""
+        self._require_desktop(vm_ref, "set_theme")
+        theme = (name or "").strip()
+        if not _SAFE_THEME_RE.fullmatch(theme) or ".." in theme:
+            raise ProvisionerError(f"unsafe theme name rejected: {name!r}")
+        self._run_desktop(
+            vm_ref, f"omarchy theme set {_quote(theme)}", timeout_s=180, action="set_theme"
+        )
+
+    def clipboard_get(self, vm_ref: str) -> str:
+        """Read the guest Wayland clipboard (``wl-paste``); empty is empty."""
+        self._require_desktop(vm_ref, "clipboard_get")
+        result = self.run(
+            vm_ref,
+            self._desktop_command("wl-paste --no-newline --type text/plain"),
+            timeout_s=30,
+        )
+        if not result.ok:
+            if "nothing" in (result.stderr or "").lower():
+                return ""
+            raise ProvisionerError(
+                f"clipboard_get failed on {vm_ref}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result.stdout
+
+    def clipboard_set(self, vm_ref: str, text: str) -> None:
+        """Set the guest Wayland clipboard (``wl-copy``) from quoted stdin."""
+        self._require_desktop(vm_ref, "clipboard_set")
+        if not isinstance(text, str):
+            raise ProvisionerError("clipboard_set text must be a string")
+        self._run_desktop(
+            vm_ref, f"printf '%s' {_quote(text)} | wl-copy", timeout_s=30, action="clipboard_set"
         )
 
     def peek_endpoint(self, vm_ref: str) -> str:

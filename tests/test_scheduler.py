@@ -155,7 +155,33 @@ def test_dead_lease_is_reclaimed_by_heartbeat_timeout(make_manager, clock):
     assert seat.id in mgr.pool_status().needs_attention
 
 
-def test_wall_clock_cap_reclaims_despite_heartbeats(make_manager, clock):
+def test_heartbeats_keep_lease_alive_past_old_wall_clock_cap(make_manager, clock):
+    """The wall clock is no longer a live cap: heartbeats alone sustain a seat."""
+    cfg = _base_config()
+    assert cfg.leases.lease_timeout_s == 0
+    fake = FakeProvisioner()
+    mgr = make_manager(cfg, provisioner=fake, free_ram_mb=lambda: 10**9)
+    handle = mgr.request_seat("A", "terminal")
+    mgr.run_until_idle()
+    seat = mgr.seat_status(handle.request_id).seat
+    seat_id = seat.id
+
+    # Heartbeat across far more than the old 30-minute (1800 s) cap.
+    for _ in range(60):
+        clock.advance(60)
+        mgr.heartbeat(seat_id=seat_id)
+
+    report = mgr.tick()
+    assert report.reclaimed == 0
+    view = mgr.seat_status(handle.request_id)
+    assert view.status == "claimed"
+    assert view.seat.state == "ready"
+    assert view.seat.vm_name == seat.vm_name
+    assert fake.destroyed == []
+
+
+def test_lease_reclaims_to_stasis_once_heartbeats_stop(make_manager, clock):
+    """With the ceiling off, liveness is purely the heartbeat timeout."""
     cfg = _base_config()
     fake = FakeProvisioner()
     mgr = make_manager(cfg, provisioner=fake, free_ram_mb=lambda: 10**9)
@@ -163,14 +189,54 @@ def test_wall_clock_cap_reclaims_despite_heartbeats(make_manager, clock):
     mgr.run_until_idle()
     seat_id = mgr.seat_status(handle.request_id).seat.id
 
-    # Keep heartbeating, but cross the absolute lease deadline.
-    for _ in range(cfg.leases.lease_timeout_s // 100):
+    # Live a long time first (past the old cap) while heartbeating...
+    for _ in range(40):
+        clock.advance(60)
+        mgr.heartbeat(seat_id=seat_id)
+    assert mgr.tick().reclaimed == 0
+
+    # ...then stop, and the heartbeat timeout still sends it to stasis.
+    clock.advance(cfg.leases.heartbeat_timeout_s + 1)
+    report = mgr.tick()
+    assert report.reclaimed == 1
+    view = mgr.seat_status(handle.request_id)
+    assert view.seat.state == "held"
+    assert view.seat.last_error == "stale: heartbeat_timeout"
+    assert fake.destroyed == []
+
+
+def test_positive_lease_ceiling_still_reclaims_despite_heartbeats(make_manager, clock):
+    """A positive safety ceiling remains an absolute cap on wall-clock age."""
+    cfg = _base_config()
+    cfg.leases.lease_timeout_s = 600
+    fake = FakeProvisioner()
+    mgr = make_manager(cfg, provisioner=fake, free_ram_mb=lambda: 10**9)
+    handle = mgr.request_seat("A", "terminal")
+    mgr.run_until_idle()
+    seat_id = mgr.seat_status(handle.request_id).seat.id
+
+    for _ in range(6):
         clock.advance(100)
         mgr.heartbeat(seat_id=seat_id)
     clock.advance(1)
     report = mgr.tick()
     assert report.reclaimed == 1
-    assert mgr.seat_status(handle.request_id).status == "expired"
+    view = mgr.seat_status(handle.request_id)
+    assert view.status == "expired"
+    assert view.seat.last_error == "stale: lease_expired"
+
+
+def test_lease_ceiling_config_accepts_zero_and_rejects_bad_values():
+    from omavroom.config import LeaseConfig
+
+    assert LeaseConfig().lease_timeout_s == 0
+    assert LeaseConfig(lease_timeout_s=0).lease_timeout_s == 0
+    assert Config.validate_value("leases", "lease_timeout_s", 0) == 0
+    assert Config.default().set_value("leases", "lease_timeout_s", 0) == 0
+    with pytest.raises(ValueError, match="lease_timeout_s must be >= 0"):
+        LeaseConfig(lease_timeout_s=-1)
+    with pytest.raises(ValueError, match="lease_timeout_s must be >= heartbeat_timeout_s"):
+        LeaseConfig(lease_timeout_s=10, heartbeat_timeout_s=300)
 
 
 def test_heartbeat_renews_liveness(make_manager, clock):

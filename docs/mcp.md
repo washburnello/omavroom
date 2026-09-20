@@ -103,8 +103,19 @@ of them with `"tools": { "omavroom*": false }`.
 | `exec_poll` | `exec_poll(seat_id, exec_id)` | `dict` — `state`, bounded `stdout`/`stderr`, `exit_code`, `truncated` |
 | `exec_kill` | `exec_kill(seat_id, exec_id, signal=9)` | `dict` (terminal view) |
 | `exec_run` | `exec_run(seat_id, command, timeout_s=30, label=None)` | `dict` — combined output + `exit_code` + `timed_out` (bounded sync) |
-| `screenshot` | `screenshot(seat_id, max_width=None, max_bytes=None)` | MCP **image content** + **base64 text** (downscaled + byte-capped PNG) |
-| `input` | `input(seat_id, events: list[dict])` | `dict` — `{"applied": n}`; events are `{"kind":"key"\|"text"\|"click","value":...}` |
+| `screenshot` | `screenshot(seat_id, max_width=None, max_bytes=None, region=None)` | MCP **image content** + **base64 text**. `max_width=None`/`0` = **native full-resolution**; a positive width downscales. `region=[x,y,w,h]` crops the native frame first. Byte-capped PNG |
+| `input` | `input(seat_id, events: list[dict])` | `dict` — `{"applied": n}`; events are `{"kind":"key"\|"text"\|"type"\|"click","value":...}` (`type` also takes `delay_ms`) |
+| `copy_in` | `copy_in(seat_id, host_path, guest_path)` | `dict` — `{"bytes": n}`; host path must be under the daemon transfer root |
+| `copy_out` | `copy_out(seat_id, guest_path, host_path)` | `dict` — `{"bytes": n}`; host path must be under the daemon transfer root |
+| `launch_app` | `launch_app(seat_id, command, tui=False)` | `dict` — `tui=True` runs in a terminal via `omarchy-launch-tui` |
+| `list_windows` | `list_windows(seat_id)` | `dict` — `{"windows": [...]}` (class, title, address, geometry) |
+| `focus_window` | `focus_window(seat_id, match)` | `dict` — `{"window": ...}`; `match` is a class/title regex |
+| `resize_window` | `resize_window(seat_id, match, width, height)` | `dict` |
+| `move_window` | `move_window(seat_id, match, x, y)` | `dict` |
+| `float_window` | `float_window(seat_id, match, on=True)` | `dict` |
+| `set_theme` | `set_theme(seat_id, name)` | `dict` — `omarchy theme set <name>` |
+| `clipboard_get` | `clipboard_get(seat_id)` | `dict` — `{"text": ...}` (`wl-paste`) |
+| `clipboard_set` | `clipboard_set(seat_id, text)` | `dict` (`wl-copy`) |
 | `peek_endpoint` | `peek_endpoint(seat_id)` | `dict` — `{"endpoint": "vnc://..."}` (never opens a window) |
 | `peek_url` / `peek_attach` | aliases of `peek_endpoint` | `dict` |
 | `prepare_repo` | `prepare_repo(seat_id, url, branch=None)` | `dict` — `job_id` (long op) |
@@ -155,19 +166,43 @@ export, then destroy) or tear it down with `force_discard`; `leases.held_ttl_s`
 (default `0` = keep indefinitely) can bound how long stasis holds a seat.
 
 **Screenshots.** `screenshot` returns the PNG as MCP image content (the agent
-reads it) *and* as base64 text. The daemon downscales to `max_width` (default
-1024, hard cap 2048) *and* caps the encoded size at `max_bytes` (default
-2 000 000, hard cap 8 000 000), so a response is never multi-MB. If the image
-needs resizing but the resizer (ImageMagick) is unavailable, the call fails
+reads it) *and* as base64 text. By default (`max_width=None` or `0`) it returns
+the **native, full-resolution** frame; pass a positive `max_width` to downscale
+(hard cap 2048) and `region=[x, y, w, h]` to crop the native frame before
+encoding. The encoded size is still capped at `max_bytes` (default 2 000 000,
+hard cap 8 000 000), so a response is never multi-MB. If the image needs
+resizing/cropping but the resizer (ImageMagick) is unavailable, the call fails
 with a clear error instead of returning an oversized image.
+
+**Typing.** `input` events are `{"kind": "key"|"text"|"type"|"click",
+"value": ...}`. `key` is one keysym (`"Return"`) or a `Mod+...+Key` combo
+(`"Super+Return"`); `text` types in bulk; `type` types **per character** via
+`wtype -d` and takes an optional `"delay_ms"` so incremental rendering can be
+exercised; `click` is `"x,y[,button]"`.
+
+**File transfer.** `copy_in`/`copy_out` move one file over the pinned SSH key.
+The **host** side is constrained to the daemon's transfer root (under the
+omavroom data dir, `~/.local/share/omavroom/transfer` by default); a path
+outside it is rejected. Guest paths must be absolute. Transfers are `scp` argv
+lists — never a host shell string.
+
+**Desktop helpers.** On desktop seats, `launch_app` starts an app (TUI via
+`omarchy-launch-tui`, otherwise a direct Hyprland dispatch), `list_windows`
+returns the windows, and `focus_window`/`resize_window`/`move_window`/
+`float_window` act on the window whose class/title matches a regex.
+`set_theme` applies an Omarchy theme, and `clipboard_get`/`clipboard_set` use
+`wl-paste`/`wl-copy`. These use this Omarchy/Hyprland version's **Lua**
+dispatcher form, e.g. `hyprctl dispatch 'hl.dsp.focus({ window =
+"address:0x..." })'` (the plain `hyprctl dispatch exec ...` form is rejected).
 
 **Concurrency.** The MCP server keeps one shared daemon connection for fast
 calls and uses a dedicated short-lived connection for desktop ops
-(`screenshot`/`input`/`peek_endpoint`). A desktop op waits for the seat's
-exclusive lock at most `desktop_lock_timeout_s` (default 5 s) and then fails
-with wire code `seat_busy` rather than blocking behind a long
-export/reset/release; because it uses its own connection, a blocked desktop op
-cannot starve `heartbeat` or any other tool.
+(`screenshot`/`input`/`copy_*`/`launch_app`/`*_window`/`set_theme`/
+`clipboard_*`/`peek_endpoint`). A desktop op waits for the seat's exclusive
+lock at most `desktop_lock_timeout_s` (default 5 s) and then fails with wire
+code `seat_busy` rather than blocking behind a long export/reset/release;
+because it uses its own connection, a blocked desktop op cannot starve
+`heartbeat` or any other tool.
 
 **Typical flow.**
 
@@ -198,8 +233,10 @@ release_seat(seat_id, repo=..., branch="task") + job_wait
   aggregate stdout+stderr it returns (default 8 KiB across the list) so an
   overview call is never a multi-MiB response; use `exec_poll` for one exec's
   full ring output.
-- **Timeout.** `timeout_s` is clamped to `exec.max_runtime_s` (default
-  3600 s) and applied as a hard transport timeout (exit code `124`).
+- **Timeout.** `timeout_s` is applied as a hard transport timeout (exit code
+  `124`). `exec.max_runtime_s` is an optional engine-wide ceiling: when it is
+  positive a requested timeout is clamped to it, and `0` (the default) means
+  no engine cap, so a long build/test is never killed by a fixed timer.
 - **Kill.** `exec_kill` marks the exec `killed` immediately and signals the
   worker; with the libvirt provisioner the worker terminates the local `ssh`
   process, closing the channel (a command that daemonises itself in the guest

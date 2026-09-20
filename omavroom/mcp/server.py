@@ -23,9 +23,10 @@ Nothing agent-facing blocks indefinitely
 Concurrency model
 -----------------
 Fast calls share one daemon connection. Desktop ops
-(``screenshot``/``input``/``peek_endpoint``) run on a dedicated short-lived
-connection and the daemon bounds their wait for the per-seat lock, returning a
-typed ``seat_busy`` error rather than blocking for the length of an
+(``screenshot``/``input``/``copy_*``/``launch_app``/``*_window``/``set_theme``/
+``clipboard_*``/``peek_endpoint``) run on a dedicated short-lived connection and
+the daemon bounds their wait for the per-seat lock, returning a typed
+``seat_busy`` error rather than blocking for the length of an
 export/reset/release; because they do not share the connection they cannot
 starve ``heartbeat`` or other tools.
 
@@ -122,9 +123,11 @@ _SETTLED_SEAT_STATES = ("ready", "busy", "held", "error")
 
 DEFAULT_INSTRUCTIONS = (
     "Manage disposable Omarchy VM seats. Request a seat, run commands with "
-    "exec_run (short) or exec_start/exec_poll (long), capture the desktop "
-    "with screenshot, and release the seat when done. Long operations return "
-    "a job_id to poll; exec_start returns an exec_id to poll."
+    "exec_run (short) or exec_start/exec_poll (long), capture the native or "
+    "cropped desktop with screenshot, and act like a user with input, "
+    "launch_app, list_windows and the window/clipboard helpers. copy_in/out "
+    "move files. Release the seat when done. Long operations return a job_id "
+    "to poll; exec_start returns an exec_id to poll."
 )
 
 #: Every tool registered on the FastMCP server, in a stable order.
@@ -144,6 +147,17 @@ MCP_TOOL_NAMES: tuple[str, ...] = (
     "exec_run",
     "screenshot",
     "input",
+    "copy_in",
+    "copy_out",
+    "launch_app",
+    "list_windows",
+    "focus_window",
+    "resize_window",
+    "move_window",
+    "float_window",
+    "set_theme",
+    "clipboard_get",
+    "clipboard_set",
     "peek_endpoint",
     "peek_url",
     "peek_attach",
@@ -622,34 +636,136 @@ class OmavroomTools:
 
     # -- desktop ops -----------------------------------------------------
     def screenshot(
-        self, seat_id: int, max_width: int | None = None, max_bytes: int | None = None
+        self,
+        seat_id: int,
+        max_width: int | None = None,
+        max_bytes: int | None = None,
+        region: list[int] | None = None,
     ) -> list:
-        """Grab the guest framebuffer as a downscaled, byte-capped PNG.
+        """Grab the guest framebuffer as an MCP image (and base64 text).
 
-        Returns MCP image content (so the agent can look at it) plus the same
-        PNG as base64 text for callers that want the bytes.
+        ``max_width=None`` (or ``0``) returns the **native, full-resolution**
+        frame; pass a positive width to downscale. ``region=[x, y, w, h]``
+        crops the native frame to that rectangle before encoding. The encoded
+        PNG is still byte-capped, so a raw frame is never a multi-MB reply.
         """
         self._use_seat(seat_id)
+        requested = 0 if max_width is None else max_width
+        crop = tuple(region) if region is not None else None
         with self._desktop_session() as client:
-            data = client.screenshot(seat_id, max_width=max_width, max_bytes=max_bytes)
+            data = client.screenshot(seat_id, max_width=requested, max_bytes=max_bytes, region=crop)
         return [Image(data=data, format="png"), base64.b64encode(data).decode("ascii")]
 
     def input(self, seat_id: int, events: list[dict]) -> dict:
         """Inject keystrokes/clicks inside a desktop seat.
 
-        Each event is ``{"kind": "key"|"text"|"click", "value": "..."}``.
+        Each event is ``{"kind": "key"|"text"|"type"|"click", "value": "..."}``.
+        ``key`` is a single keysym or ``Mod+...+Key`` combo, ``text`` types in
+        bulk, ``type`` types per character (add ``"delay_ms": N`` to set the
+        delay between characters and exercise incremental rendering), and
+        ``click`` takes ``"x,y[,button]"``.
         """
         wire: list[InputEvent] = []
         for event in events:
             if isinstance(event, InputEvent):
                 wire.append(event)
             elif isinstance(event, dict):
-                wire.append(InputEvent(kind=event.get("kind"), value=event.get("value")))
+                wire.append(
+                    InputEvent(
+                        kind=event.get("kind"),
+                        value=event.get("value"),
+                        delay_ms=event.get("delay_ms"),
+                    )
+                )
             else:
                 raise ValueError("each input event must be an object")
         self._use_seat(seat_id)
         with self._desktop_session() as client:
             return client.input(seat_id, wire)
+
+    def copy_in(self, seat_id: int, host_path: str, guest_path: str) -> dict:
+        """Copy a host file into the seat over the pinned SSH key.
+
+        The host path is constrained to the daemon's transfer root (under the
+        omavroom data dir); a path outside it is rejected. ``guest_path`` must
+        be absolute.
+        """
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.copy_in(seat_id, host_path, guest_path)
+
+    def copy_out(self, seat_id: int, guest_path: str, host_path: str) -> dict:
+        """Copy a seat file out to the host over the pinned SSH key.
+
+        The host destination is constrained to the daemon's transfer root
+        (under the omavroom data dir); a path outside it is rejected.
+        ``guest_path`` must be absolute.
+        """
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.copy_out(seat_id, guest_path, host_path)
+
+    def launch_app(self, seat_id: int, command: str, tui: bool = False) -> dict:
+        """Launch an app on the seat's desktop.
+
+        ``tui=True`` runs ``command`` in a terminal via ``omarchy-launch-tui``
+        (for TUIs); otherwise it is dispatched directly through Hyprland.
+        """
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.launch_app(seat_id, command, tui=tui)
+
+    def list_windows(self, seat_id: int) -> dict:
+        """List the seat desktop's windows (class, title, address, geometry).
+
+        Use the returned ``class``/``title`` with ``focus_window`` (or pass a
+        regex directly).
+        """
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return {"windows": client.list_windows(seat_id)}
+
+    def focus_window(self, seat_id: int, match: str) -> dict:
+        """Focus the window whose class/title matches ``match`` (regex)."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return {"window": client.focus_window(seat_id, match)}
+
+    def resize_window(self, seat_id: int, match: str, width: int, height: int) -> dict:
+        """Resize the matching window to ``width`` x ``height`` pixels."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.resize_window(seat_id, match, width, height)
+
+    def move_window(self, seat_id: int, match: str, x: int, y: int) -> dict:
+        """Move the matching window's top-left corner to ``(x, y)``."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.move_window(seat_id, match, x, y)
+
+    def float_window(self, seat_id: int, match: str, on: bool = True) -> dict:
+        """Turn floating on/off for the matching window."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.float_window(seat_id, match, on)
+
+    def set_theme(self, seat_id: int, name: str) -> dict:
+        """Apply the named Omarchy theme (``omarchy theme set``)."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.set_theme(seat_id, name)
+
+    def clipboard_get(self, seat_id: int) -> dict:
+        """Read the seat's Wayland clipboard text (``wl-paste``)."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return {"text": client.clipboard_get(seat_id)}
+
+    def clipboard_set(self, seat_id: int, text: str) -> dict:
+        """Set the seat's Wayland clipboard text (``wl-copy``)."""
+        self._use_seat(seat_id)
+        with self._desktop_session() as client:
+            return client.clipboard_set(seat_id, text)
 
     def peek_endpoint(self, seat_id: int) -> dict:
         """Resolve the on-demand viewer endpoint (never opens a window)."""

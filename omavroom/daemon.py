@@ -33,8 +33,11 @@ Phase 5 mapping / frozen contract
   worker thread** (not the daemon job queue), so a long command never delays
   lifecycle work. Without a ``command`` the exec stays bookkeeping-only and
   the client drives it with ``exec_output``/``exec_finish`` (v1 compatibility).
-- ``screenshot`` defaults to ``DEFAULT_SCREENSHOT_MAX_WIDTH`` and clamps to
-  ``MAX_SCREENSHOT_MAX_WIDTH`` so a response can never be a multi-MB line.
+- ``screenshot`` returns the native full-resolution frame when ``max_width``
+  is explicit ``null``/``0`` (optional ``region`` crops first); when the key is
+  omitted it keeps the legacy ``DEFAULT_SCREENSHOT_MAX_WIDTH`` default and
+  clamps a positive width to ``MAX_SCREENSHOT_MAX_WIDTH`` so a response can
+  never be a multi-MB line.
 - ``peek_url`` (MCP name) maps to ``peek_endpoint``; ``peek_attach`` is a
   **client-side viewer action** — the daemon returns the ``vnc://`` endpoint
   and never opens a viewer/window itself. The client offers ``peek_url`` /
@@ -441,6 +444,17 @@ class Protocol:
             "exec_kill": self._exec_kill,
             "screenshot": self._screenshot,
             "input": self._input,
+            "copy_in": self._copy_in,
+            "copy_out": self._copy_out,
+            "launch_app": self._launch_app,
+            "list_windows": self._list_windows,
+            "focus_window": self._focus_window,
+            "resize_window": self._resize_window,
+            "move_window": self._move_window,
+            "float_window": self._float_window,
+            "set_theme": self._set_theme,
+            "clipboard_get": self._clipboard_get,
+            "clipboard_set": self._clipboard_set,
             "peek_endpoint": self._peek_endpoint,
             "set_admission_override": self._set_admission_override,
             "set_config_value": self._set_config_value,
@@ -596,15 +610,54 @@ class Protocol:
         )
 
     # -- desktop ops -----------------------------------------------------
-    def _screenshot(self, params: dict):
+    def _provisioner_op(self, params: dict, method: str, **kwargs):
+        """Run one provisioner method under the seat's per-seat lock.
+
+        The Manager does not (yet) forward these agent-facing helpers, so the
+        daemon drives the provisioner directly through the same guard the
+        manager's desktop ops use. Bound to ``desktop_lock_timeout_s`` so a
+        seat held by a long export/reset/release fails fast with ``seat_busy``.
+        """
+        manager = self.manager
         seat_id = _required_int(params, "seat_id")
-        requested = _optional_int(params, "max_width", None)
-        if requested is None:
+        with manager._seat_guard(seat_id, timeout=manager.desktop_lock_timeout_s) as vm_ref:
+            return getattr(manager.provisioner, method)(vm_ref, **kwargs)
+
+    @staticmethod
+    def _parse_region(params: dict) -> tuple[int, int, int, int] | None:
+        raw = params.get("region")
+        if raw is None:
+            return None
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            raise ValueError("parameter 'region' must be [x, y, w, h]")
+        values: list[int] = []
+        for item in raw:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError("region values must be integers")
+            values.append(item)
+        x, y, w, h = values
+        if x < 0 or y < 0 or w < 1 or h < 1:
+            raise ValueError("region requires x >= 0, y >= 0, w >= 1, h >= 1")
+        return (x, y, w, h)
+
+    def _screenshot(self, params: dict):
+        _required_int(params, "seat_id")
+        if "max_width" not in params:
+            # Legacy callers that omit the key keep the server default.
             width = DEFAULT_SCREENSHOT_MAX_WIDTH
-        elif requested < 1:
-            raise ValueError("parameter 'max_width' must be >= 1")
         else:
-            width = min(requested, MAX_SCREENSHOT_MAX_WIDTH)
+            requested = params["max_width"]
+            if requested is None:
+                # Explicit null requests the native, full-resolution frame.
+                width = None
+            elif isinstance(requested, bool) or not isinstance(requested, int):
+                raise ValueError("parameter 'max_width' must be an integer or null")
+            elif requested == 0:
+                width = None
+            elif requested < 1:
+                raise ValueError("parameter 'max_width' must be >= 0")
+            else:
+                width = min(requested, MAX_SCREENSHOT_MAX_WIDTH)
         requested_bytes = _optional_int(params, "max_bytes", None)
         if requested_bytes is None:
             max_bytes = DEFAULT_SCREENSHOT_MAX_BYTES
@@ -612,10 +665,15 @@ class Protocol:
             raise ValueError("parameter 'max_bytes' must be >= 1")
         else:
             max_bytes = min(requested_bytes, MAX_SCREENSHOT_MAX_BYTES)
-        data = self.manager.screenshot(seat_id, max_width=width, max_bytes=max_bytes)
+        region = self._parse_region(params)
+        data = self._provisioner_op(
+            params, "screenshot", max_width=width, max_bytes=max_bytes, region=region
+        )
         return {
             "png_base64": base64.b64encode(data).decode("ascii"),
             "max_width": width,
+            "native": width is None,
+            "region": list(region) if region is not None else None,
             "hard_cap": MAX_SCREENSHOT_MAX_WIDTH,
             "max_bytes": max_bytes,
             "hard_cap_bytes": MAX_SCREENSHOT_MAX_BYTES,
@@ -630,9 +688,78 @@ class Protocol:
         for item in raw_events:
             if not isinstance(item, dict):
                 raise ValueError("each input event must be an object")
-            events.append(InputEvent(kind=item.get("kind"), value=item.get("value")))
+            events.append(
+                InputEvent(
+                    kind=item.get("kind"),
+                    value=item.get("value"),
+                    delay_ms=item.get("delay_ms"),
+                )
+            )
         self.manager.input(seat_id, events)
         return {"applied": len(events)}
+
+    def _copy_in(self, params: dict):
+        host_path = _required_str(params, "host_path")
+        guest_path = _required_str(params, "guest_path")
+        size = self._provisioner_op(params, "copy_in", host_path=host_path, guest_path=guest_path)
+        return {"host_path": host_path, "guest_path": guest_path, "bytes": size}
+
+    def _copy_out(self, params: dict):
+        guest_path = _required_str(params, "guest_path")
+        host_path = _required_str(params, "host_path")
+        size = self._provisioner_op(params, "copy_out", guest_path=guest_path, host_path=host_path)
+        return {"host_path": host_path, "guest_path": guest_path, "bytes": size}
+
+    def _launch_app(self, params: dict):
+        command = _required_str(params, "command")
+        tui = _optional_bool(params, "tui", False)
+        self._provisioner_op(params, "launch_app", command=command, tui=tui)
+        return {"launched": command, "tui": tui}
+
+    def _list_windows(self, params: dict):
+        return {"windows": self._provisioner_op(params, "list_windows")}
+
+    def _focus_window(self, params: dict):
+        match = _required_str(params, "match")
+        window = self._provisioner_op(params, "focus_window", match=match)
+        return {"window": window}
+
+    def _resize_window(self, params: dict):
+        match = _required_str(params, "match")
+        width = _required_int(params, "width")
+        height = _required_int(params, "height")
+        if width < 1 or height < 1:
+            raise ValueError("width/height must be >= 1")
+        self._provisioner_op(params, "resize_window", match=match, width=width, height=height)
+        return {"match": match, "width": width, "height": height}
+
+    def _move_window(self, params: dict):
+        match = _required_str(params, "match")
+        x = _required_int(params, "x")
+        y = _required_int(params, "y")
+        self._provisioner_op(params, "move_window", match=match, x=x, y=y)
+        return {"match": match, "x": x, "y": y}
+
+    def _float_window(self, params: dict):
+        match = _required_str(params, "match")
+        on = _optional_bool(params, "on", True)
+        self._provisioner_op(params, "float_window", match=match, on=on)
+        return {"match": match, "on": on}
+
+    def _set_theme(self, params: dict):
+        name = _required_str(params, "name")
+        self._provisioner_op(params, "set_theme", name=name)
+        return {"theme": name}
+
+    def _clipboard_get(self, params: dict):
+        return {"text": self._provisioner_op(params, "clipboard_get")}
+
+    def _clipboard_set(self, params: dict):
+        text = params.get("text")
+        if not isinstance(text, str):
+            raise ValueError("parameter 'text' must be a string")
+        self._provisioner_op(params, "clipboard_set", text=text)
+        return {"text": text}
 
     def _peek_endpoint(self, params: dict):
         return {"endpoint": self.manager.peek_endpoint(_required_int(params, "seat_id"))}

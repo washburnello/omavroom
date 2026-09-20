@@ -181,6 +181,44 @@ def test_timeout_is_clamped_to_max_runtime(make_manager, fake):
     assert view.timeout_s == 30
 
 
+def test_max_runtime_zero_means_no_engine_ceiling(make_manager, fake, monkeypatch):
+    """Default 0 disables the engine-wide timer; no timeout reaches the transport."""
+    cfg = Config.default()
+    assert cfg.exec.max_runtime_s == 0
+    fake.run_hang_s = 0.0
+    seen: dict[str, int] = {}
+    original = fake.run
+
+    def spy(vm_ref, command, *, timeout_s=60, **kwargs):
+        seen["timeout_s"] = timeout_s
+        return original(vm_ref, command, timeout_s=timeout_s, **kwargs)
+
+    monkeypatch.setattr(fake, "run", spy)
+    mgr = make_manager(cfg, provisioner=fake, free_ram_mb=lambda: 10**9)
+    seat_id, _ = _ready_seat(mgr)
+
+    view = mgr.exec_start(seat_id, "e1", command="make test", timeout_s=None)
+    assert view.timeout_s == 0
+    assert _wait_until(lambda: mgr.exec_poll(seat_id, "e1").state == "finished")
+    assert seen["timeout_s"] == 0
+
+
+def test_max_runtime_zero_still_honours_explicit_timeout(make_manager, fake):
+    """With no engine ceiling, an explicit per-call timeout is still enforced."""
+    cfg = Config.default()
+    assert cfg.exec.max_runtime_s == 0
+    fake.run_hang_s = 5.0
+    mgr = make_manager(cfg, provisioner=fake, free_ram_mb=lambda: 10**9)
+    seat_id, _ = _ready_seat(mgr)
+
+    started = time.monotonic()
+    view = mgr.exec_start(seat_id, "e1", command="sleep 5", timeout_s=1)
+    assert view.timeout_s == 1
+    assert _wait_until(lambda: mgr.exec_poll(seat_id, "e1").state != "running", timeout=3)
+    assert mgr.exec_poll(seat_id, "e1").exit_code == 124
+    assert time.monotonic() - started < 3
+
+
 # --------------------------------------------------------------------------
 # a long exec must never block lifecycle work
 # --------------------------------------------------------------------------

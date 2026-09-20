@@ -435,9 +435,20 @@ class DaemonClient:
         return self.call("exec_kill", seat_id=seat_id, exec_id=exec_id, signal=signal)
 
     def screenshot(
-        self, seat_id: int, *, max_width: int | None = None, max_bytes: int | None = None
+        self,
+        seat_id: int,
+        *,
+        max_width: int | None = None,
+        max_bytes: int | None = None,
+        region: tuple[int, int, int, int] | list[int] | None = None,
     ) -> bytes:
         """Fetch one framebuffer as raw PNG bytes.
+
+        ``max_width=0`` requests the native, full-resolution frame (no
+        downscale); omitting ``max_width`` keeps the daemon's downscale
+        default so existing callers are unchanged. A positive width is a
+        bounded downscale. ``region=(x, y, w, h)`` crops the native frame
+        before encoding.
 
         Any malformed daemon reply (missing/wrong-typed ``png_base64`` or
         invalid base64) is normalized into a :class:`DaemonRequestError` so a
@@ -447,7 +458,14 @@ class DaemonClient:
         import base64
         import binascii
 
-        result = self.call("screenshot", seat_id=seat_id, max_width=max_width, max_bytes=max_bytes)
+        params: dict = {"seat_id": seat_id}
+        if max_width is not None:
+            params["max_width"] = max_width
+        if max_bytes is not None:
+            params["max_bytes"] = max_bytes
+        if region is not None:
+            params["region"] = list(region)
+        result = self.call("screenshot", **params)
         if not isinstance(result, dict):
             raise DaemonRequestError("bad_response", "screenshot response is not a JSON object")
         encoded = result.get("png_base64")
@@ -464,7 +482,11 @@ class DaemonClient:
 
     def input(self, seat_id: int, events: list[InputEvent] | list[dict]) -> dict:
         wire = [
-            {"kind": event.kind, "value": event.value} if isinstance(event, InputEvent) else event
+            (
+                {"kind": event.kind, "value": event.value, "delay_ms": event.delay_ms}
+                if isinstance(event, InputEvent)
+                else event
+            )
             for event in events
         ]
         return self.call("input", seat_id=seat_id, events=wire)
@@ -484,6 +506,51 @@ class DaemonClient:
         client viewer should connect to.
         """
         return self.peek_endpoint(seat_id)
+
+    # -- agent-facing file transfer + desktop helpers --------------------
+    def copy_in(self, seat_id: int, host_path: str, guest_path: str) -> dict:
+        """Copy one host file into the seat (host path constrained to the root)."""
+        return self.call("copy_in", seat_id=seat_id, host_path=host_path, guest_path=guest_path)
+
+    def copy_out(self, seat_id: int, guest_path: str, host_path: str) -> dict:
+        """Copy one seat file out to the host (host path constrained to the root)."""
+        return self.call("copy_out", seat_id=seat_id, guest_path=guest_path, host_path=host_path)
+
+    def launch_app(self, seat_id: int, command: str, *, tui: bool = False) -> dict:
+        """Launch an app on the seat's desktop (``tui=True`` for a terminal)."""
+        return self.call("launch_app", seat_id=seat_id, command=command, tui=tui)
+
+    def list_windows(self, seat_id: int) -> list:
+        """List the seat desktop's windows."""
+        return self.call("list_windows", seat_id=seat_id)["windows"]
+
+    def focus_window(self, seat_id: int, match: str) -> dict:
+        """Focus the window whose class/title matches ``match`` (regex)."""
+        return self.call("focus_window", seat_id=seat_id, match=match)["window"]
+
+    def resize_window(self, seat_id: int, match: str, width: int, height: int) -> dict:
+        """Resize the matching window to ``width`` x ``height`` pixels."""
+        return self.call("resize_window", seat_id=seat_id, match=match, width=width, height=height)
+
+    def move_window(self, seat_id: int, match: str, x: int, y: int) -> dict:
+        """Move the matching window's top-left corner to ``(x, y)``."""
+        return self.call("move_window", seat_id=seat_id, match=match, x=x, y=y)
+
+    def float_window(self, seat_id: int, match: str, on: bool = True) -> dict:
+        """Turn floating on/off for the matching window."""
+        return self.call("float_window", seat_id=seat_id, match=match, on=on)
+
+    def set_theme(self, seat_id: int, name: str) -> dict:
+        """Apply the named Omarchy theme."""
+        return self.call("set_theme", seat_id=seat_id, name=name)
+
+    def clipboard_get(self, seat_id: int) -> str:
+        """Read the seat's Wayland clipboard text."""
+        return self.call("clipboard_get", seat_id=seat_id)["text"]
+
+    def clipboard_set(self, seat_id: int, text: str) -> dict:
+        """Set the seat's Wayland clipboard text."""
+        return self.call("clipboard_set", seat_id=seat_id, text=text)
 
     def set_admission_override(self, override: str) -> dict:
         return self.call("set_admission_override", override=override)

@@ -44,13 +44,13 @@ defaults for anything unset:
     dynamic = true
     override = "auto"
     [leases]
-    lease_timeout_s = 1800
+    lease_timeout_s = 0
     heartbeat_interval_s = 60
     heartbeat_timeout_s = 300
     held_ttl_s = 0
     [exec]
     max_output_bytes = 1048576
-    max_runtime_s = 3600
+    max_runtime_s = 0
     max_concurrent_per_seat = 4
     max_concurrent_total = 16
     [export]
@@ -491,19 +491,25 @@ class AdmissionConfig:
 class LeaseConfig:
     """Lease + heartbeat timeouts (reclaim logic lives in the scheduler).
 
+    Liveness is the heartbeat: ``heartbeat_timeout_s`` without a renewal is
+    what moves a seat to stasis. ``lease_timeout_s`` is only a *safety
+    ceiling* on the wall-clock age of a lease; ``0`` (the default) disables
+    it entirely, so an actively-heartbeating seat is never reclaimed no
+    matter how long it lives. A positive ceiling must still be at least
+    ``heartbeat_timeout_s``.
+
     ``held_ttl_s`` bounds how long a seat may sit in ``held`` (stasis) before
     the pump auto-discards it. ``0`` (the default) means "keep until an
     operator acts" — stasis never destroys on its own.
     """
 
-    lease_timeout_s: int = 1800
+    lease_timeout_s: int = 0
     heartbeat_interval_s: int = 60
     heartbeat_timeout_s: int = 300
     held_ttl_s: int = 0
 
     def __post_init__(self) -> None:
         for name in (
-            "lease_timeout_s",
             "heartbeat_interval_s",
             "heartbeat_timeout_s",
         ):
@@ -511,25 +517,34 @@ class LeaseConfig:
                 raise ValueError(f"{name} must be >= 1")
         if self.heartbeat_timeout_s < self.heartbeat_interval_s:
             raise ValueError("heartbeat_timeout_s must be >= heartbeat_interval_s")
-        if self.lease_timeout_s < self.heartbeat_timeout_s:
-            raise ValueError("lease_timeout_s must be >= heartbeat_timeout_s")
+        if self.lease_timeout_s < 0:
+            raise ValueError("lease_timeout_s must be >= 0 (0 = no ceiling)")
+        if 0 < self.lease_timeout_s < self.heartbeat_timeout_s:
+            raise ValueError("lease_timeout_s must be >= heartbeat_timeout_s (or 0 for no ceiling)")
         if self.held_ttl_s < 0:
             raise ValueError("held_ttl_s must be >= 0")
 
 
 @dataclass
 class ExecConfig:
-    """Caps for agent execs (ring buffer + runtime limits, enforced later)."""
+    """Caps for agent execs (ring buffer + runtime limits, enforced later).
+
+    ``max_runtime_s`` is an *engine-wide* ceiling on a command exec's
+    runtime; ``0`` (the default) disables it so a long build/test is never
+    killed by a fixed timer. A positive value stays an explicit ceiling. The
+    output ring buffer and the per-exec worker are unaffected either way.
+    """
 
     max_output_bytes: int = 1_048_576
-    max_runtime_s: int = 3600
+    max_runtime_s: int = 0
     max_concurrent_per_seat: int = 4
     max_concurrent_total: int = 16
 
     def __post_init__(self) -> None:
+        if self.max_runtime_s < 0:
+            raise ValueError("max_runtime_s must be >= 0 (0 = no ceiling)")
         for name in (
             "max_output_bytes",
-            "max_runtime_s",
             "max_concurrent_per_seat",
             "max_concurrent_total",
         ):

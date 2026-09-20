@@ -20,6 +20,7 @@ URL/branch to clone, and push authentication stays on the host.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -151,16 +152,29 @@ class ExportOutcome:
 
 @dataclass(frozen=True)
 class InputEvent:
-    """One guest input event for desktop seats (Phase 5 ``input`` tool)."""
+    """One guest input event for desktop seats (Phase 5 ``input`` tool).
+
+    ``kind`` is ``"key"`` (single keysym or a ``Mod+...+Key`` combo),
+    ``"text"`` (bulk text), ``"type"`` (per-character typing driven by
+    ``wtype -d`` so incremental rendering is exercised), or ``"click"``.
+    ``delay_ms`` is only meaningful for ``"type"`` and is the per-character
+    delay handed to ``wtype``; ``None`` leaves ``wtype``'s own default.
+    """
 
     kind: str
     value: str
+    delay_ms: int | None = None
 
     def __post_init__(self) -> None:
-        if self.kind not in ("key", "text", "click"):
+        if self.kind not in ("key", "text", "type", "click"):
             raise ValueError(f"unknown input event kind: {self.kind!r}")
         if not isinstance(self.value, str) or not self.value:
             raise ValueError("input event value must be a non-empty string")
+        if self.delay_ms is not None:
+            if isinstance(self.delay_ms, bool) or not isinstance(self.delay_ms, int):
+                raise ValueError("input event delay_ms must be an integer or None")
+            if self.delay_ms < 0:
+                raise ValueError("input event delay_ms must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -260,14 +274,22 @@ class Provisioner(ABC):
     # -- desktop ops seam (Phase 5 screenshot / input / peek) ------------
     @abstractmethod
     def screenshot(
-        self, vm_ref: str, *, max_width: int | None = None, max_bytes: int | None = None
+        self,
+        vm_ref: str,
+        *,
+        max_width: int | None = None,
+        max_bytes: int | None = None,
+        region: tuple[int, int, int, int] | None = None,
     ) -> bytes:
         """Grab the guest framebuffer as PNG bytes (desktop seats).
 
-        ``max_width`` bounds the image width; ``max_bytes`` bounds the encoded
-        PNG size. An implementation that cannot satisfy ``max_bytes`` (no
-        resizer available) must raise :class:`ProvisionerError` rather than
-        return an oversized image.
+        ``max_width=None`` (or ``0``) means **native resolution, no
+        downscale**; a positive width bounds the image width. ``region`` is
+        an ``(x, y, w, h)`` crop applied to the native frame *before* any
+        downscale. ``max_bytes`` bounds the encoded PNG size. An
+        implementation that cannot satisfy ``max_bytes`` (no resizer
+        available) must raise :class:`ProvisionerError` rather than return an
+        oversized image.
         """
 
     @abstractmethod
@@ -277,6 +299,72 @@ class Provisioner(ABC):
     @abstractmethod
     def peek_endpoint(self, vm_ref: str) -> str:
         """Return the on-demand viewer endpoint (never auto-opened)."""
+
+    # -- file transfer seam (agent-facing copy_in / copy_out) ------------
+    @abstractmethod
+    def copy_in(self, vm_ref: str, host_path: str, guest_path: str) -> int:
+        """Copy one host file into the guest over the pinned SSH key.
+
+        The **host** side is constrained to a safe root (implementation
+        defined); a path outside it must raise :class:`ProvisionerError`.
+        Implementations must use an argv list, never a host shell string.
+        Returns the number of bytes copied.
+        """
+
+    @abstractmethod
+    def copy_out(self, vm_ref: str, guest_path: str, host_path: str) -> int:
+        """Copy one guest file out to the host over the pinned SSH key.
+
+        The **host** destination is constrained to the same safe root as
+        :meth:`copy_in`; a path outside it must raise
+        :class:`ProvisionerError`. Returns the number of bytes copied.
+        """
+
+    # -- desktop helpers (Omarchy / Hyprland; desktop seats only) --------
+    @abstractmethod
+    def launch_app(self, vm_ref: str, command: str, *, tui: bool = False) -> None:
+        """Launch an application on the seat's desktop.
+
+        ``tui=True`` runs the command in a terminal via
+        ``omarchy-launch-tui``; otherwise the command is dispatched directly
+        through Hyprland's Lua dispatcher.
+        """
+
+    @abstractmethod
+    def list_windows(self, vm_ref: str) -> list[dict]:
+        """Return the desktop's windows as structured dictionaries."""
+
+    @abstractmethod
+    def focus_window(self, vm_ref: str, match: str) -> dict:
+        """Focus the window whose class/title matches ``match`` (regex).
+
+        Returns the matched window view; raises :class:`ProvisionerError`
+        when nothing matches.
+        """
+
+    @abstractmethod
+    def resize_window(self, vm_ref: str, match: str, width: int, height: int) -> None:
+        """Resize the matching window to ``width`` x ``height`` pixels."""
+
+    @abstractmethod
+    def move_window(self, vm_ref: str, match: str, x: int, y: int) -> None:
+        """Move the matching window's top-left corner to ``(x, y)``."""
+
+    @abstractmethod
+    def float_window(self, vm_ref: str, match: str, on: bool) -> None:
+        """Turn floating on/off for the matching window."""
+
+    @abstractmethod
+    def set_theme(self, vm_ref: str, name: str) -> None:
+        """Apply the named Omarchy theme (``omarchy theme set``)."""
+
+    @abstractmethod
+    def clipboard_get(self, vm_ref: str) -> str:
+        """Return the guest's Wayland clipboard text (``wl-paste``)."""
+
+    @abstractmethod
+    def clipboard_set(self, vm_ref: str, text: str) -> None:
+        """Set the guest's Wayland clipboard text (``wl-copy``)."""
 
     # -- exec seam (Phase 5 ``exec_start``/``exec_poll``/``exec_kill``) --
     @abstractmethod
@@ -375,7 +463,29 @@ class FakeProvisioner(Provisioner):
         self.exported: list[str] = []
         self.inputs: dict[str, list[InputEvent]] = {}
         self.screenshots: list[str] = []
+        self.screenshots_meta: list[dict] = []
         self.peeks: list[str] = []
+        # Agent-facing file transfer + desktop helper recordings.
+        self.copies_in: list[tuple[str, str, str]] = []
+        self.copies_out: list[tuple[str, str, str]] = []
+        self.launched: list[tuple[str, str, bool]] = []
+        self.window_ops: list[tuple[str, str, tuple]] = []
+        self.themes: list[tuple[str, str]] = []
+        self.clipboard_text = ""
+        self.windows: list[dict] = [
+            {
+                "address": "0x1",
+                "class": "foot",
+                "title": "foot",
+                "initial_class": "foot",
+                "initial_title": "foot",
+                "workspace": "1",
+                "floating": False,
+                "size": [800, 600],
+                "at": [0, 0],
+                "focus_history_id": 0,
+            }
+        ]
         # Diffstat a fake fetch reports (tests override these).
         self.export_files_changed: int | None = None
         self.export_insertions = 10
@@ -688,15 +798,25 @@ class FakeProvisioner(Provisioner):
         )
 
     def screenshot(
-        self, vm_ref: str, *, max_width: int | None = None, max_bytes: int | None = None
+        self,
+        vm_ref: str,
+        *,
+        max_width: int | None = None,
+        max_bytes: int | None = None,
+        region: tuple[int, int, int, int] | None = None,
     ) -> bytes:
-        self._record("screenshot", vm_ref, max_width)
+        self._record("screenshot", vm_ref, max_width, region)
         self._maybe_fail("screenshot")
         vm = self._vm(vm_ref)
         with self._lock:
             self.screenshots.append(vm_ref)
+            self.screenshots_meta.append(
+                {"vm_ref": vm_ref, "max_width": max_width, "max_bytes": max_bytes, "region": region}
+            )
         width = max_width or 1280
         data = f"PNG:{vm['name']}:{width}x720".encode()
+        if region is not None:
+            data = f"PNG:{vm['name']}:{width}x720:{region}".encode()
         if max_bytes is not None and len(data) > max_bytes:
             data = data[:max_bytes]
         return data
@@ -715,3 +835,102 @@ class FakeProvisioner(Provisioner):
         with self._lock:
             self.peeks.append(vm_ref)
         return f"vnc://127.0.0.1:5900/?seat={vm['name']}"
+
+    # -- file transfer ---------------------------------------------------
+    def copy_in(self, vm_ref: str, host_path: str, guest_path: str) -> int:
+        self._record("copy_in", vm_ref, host_path, guest_path)
+        self._maybe_fail("copy_in")
+        self._vm(vm_ref)
+        with self._lock:
+            self.copies_in.append((vm_ref, host_path, guest_path))
+        return 0
+
+    def copy_out(self, vm_ref: str, guest_path: str, host_path: str) -> int:
+        self._record("copy_out", vm_ref, guest_path, host_path)
+        self._maybe_fail("copy_out")
+        self._vm(vm_ref)
+        with self._lock:
+            self.copies_out.append((vm_ref, guest_path, host_path))
+        return 0
+
+    # -- desktop helpers -------------------------------------------------
+    def launch_app(self, vm_ref: str, command: str, *, tui: bool = False) -> None:
+        self._record("launch_app", vm_ref, command, tui)
+        self._maybe_fail("launch_app")
+        self._vm(vm_ref)
+        with self._lock:
+            self.launched.append((vm_ref, command, tui))
+
+    def list_windows(self, vm_ref: str) -> list[dict]:
+        self._record("list_windows", vm_ref)
+        self._maybe_fail("list_windows")
+        self._vm(vm_ref)
+        with self._lock:
+            return [dict(window) for window in self.windows]
+
+    def _fake_match(self, vm_ref: str, match: str) -> dict:
+        for window in self.list_windows(vm_ref):
+            haystack = " ".join(
+                str(window.get(key) or "")
+                for key in ("class", "title", "initial_class", "initial_title")
+            )
+            try:
+                if re.search(match, haystack, re.IGNORECASE):
+                    return window
+            except re.error:
+                continue
+        raise ProvisionerError(f"fake provisioner: no window matches {match!r}")
+
+    def focus_window(self, vm_ref: str, match: str) -> dict:
+        self._record("focus_window", vm_ref, match)
+        self._maybe_fail("focus_window")
+        self._vm(vm_ref)
+        window = self._fake_match(vm_ref, match)
+        with self._lock:
+            self.window_ops.append(("focus_window", match, ()))
+        return window
+
+    def resize_window(self, vm_ref: str, match: str, width: int, height: int) -> None:
+        self._record("resize_window", vm_ref, match, width, height)
+        self._maybe_fail("resize_window")
+        self._vm(vm_ref)
+        self._fake_match(vm_ref, match)
+        with self._lock:
+            self.window_ops.append(("resize_window", match, (width, height)))
+
+    def move_window(self, vm_ref: str, match: str, x: int, y: int) -> None:
+        self._record("move_window", vm_ref, match, x, y)
+        self._maybe_fail("move_window")
+        self._vm(vm_ref)
+        self._fake_match(vm_ref, match)
+        with self._lock:
+            self.window_ops.append(("move_window", match, (x, y)))
+
+    def float_window(self, vm_ref: str, match: str, on: bool) -> None:
+        self._record("float_window", vm_ref, match, on)
+        self._maybe_fail("float_window")
+        self._vm(vm_ref)
+        self._fake_match(vm_ref, match)
+        with self._lock:
+            self.window_ops.append(("float_window", match, (on,)))
+
+    def set_theme(self, vm_ref: str, name: str) -> None:
+        self._record("set_theme", vm_ref, name)
+        self._maybe_fail("set_theme")
+        self._vm(vm_ref)
+        with self._lock:
+            self.themes.append((vm_ref, name))
+
+    def clipboard_get(self, vm_ref: str) -> str:
+        self._record("clipboard_get", vm_ref)
+        self._maybe_fail("clipboard_get")
+        self._vm(vm_ref)
+        with self._lock:
+            return self.clipboard_text
+
+    def clipboard_set(self, vm_ref: str, text: str) -> None:
+        self._record("clipboard_set", vm_ref, text)
+        self._maybe_fail("clipboard_set")
+        self._vm(vm_ref)
+        with self._lock:
+            self.clipboard_text = text

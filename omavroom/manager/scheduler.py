@@ -48,14 +48,16 @@ default image would head-of-line-block a pinned-image request forever.
 Leases
 ------
 Acquired at admission, not at readiness, so a stuck provision also times
-out. ``expires_at`` is an absolute wall-clock cap (never renewed);
-``last_heartbeat`` is renewed by the independent heartbeat channel. A lease
-is dead when either passes. Reclaim moves the seat to **stasis** (``held``)
-with a recorded reason, preserving the VM; if the seat has a recorded export
-intent the normal gated export is attempted automatically. Reclaim re-checks
-liveness inside the stasis transaction, so a heartbeat that lands during the
-scan saves the seat. Stasis is bounded only by ``leases.held_ttl_s`` (0 =
-keep until an operator acts).
+out. Liveness is the heartbeat: ``last_heartbeat`` is renewed by the
+independent heartbeat channel and a lease is dead when it goes stale.
+``expires_at`` is only an optional **safety ceiling** on wall-clock age;
+``leases.lease_timeout_s = 0`` (the default) disables that term entirely, so
+an actively-heartbeating seat survives indefinitely. Reclaim moves the seat
+to **stasis** (``held``) with a recorded reason, preserving the VM; if the
+seat has a recorded export intent the normal gated export is attempted
+automatically. Reclaim re-checks liveness inside the stasis transaction, so a
+heartbeat that lands during the scan saves the seat. Stasis is bounded only
+by ``leases.held_ttl_s`` (0 = keep until an operator acts).
 """
 
 from __future__ import annotations
@@ -83,6 +85,12 @@ from omavroom.manager.provisioner import (
 )
 
 log = logging.getLogger("omavroom.scheduler")
+
+#: Fallback provisioning wait when ``leases.lease_timeout_s`` is disabled
+#: (``0`` = no wall-clock lease ceiling). The lease ceiling is a liveness
+#: policy; provisioning still needs a defensive bound so a stuck VM start
+#: cannot hang the pump forever.
+DEFAULT_PROVISION_WAIT_S = 1800
 
 
 class LeaseNotFound(LookupError):
@@ -514,11 +522,28 @@ class Scheduler:
             return False
 
     def _lease_is_dead(self, lease: st.Lease, now: datetime) -> bool:
+        """A lease is dead when its heartbeat lapsed (the sole signal).
+
+        The wall-clock ``expires_at`` term is a *safety ceiling only*: when
+        ``leases.lease_timeout_s`` is 0 it is ignored, so heartbeats alone
+        keep a lease alive however long the seat is in use. A positive
+        ceiling is still enforced alongside the heartbeat timeout.
+        """
         now_text = st.fmt_time(now)
         heartbeat_floor = st.fmt_time(
             now - timedelta(seconds=self.config.leases.heartbeat_timeout_s)
         )
-        return lease.expires_at <= now_text or lease.last_heartbeat <= heartbeat_floor
+        if lease.last_heartbeat <= heartbeat_floor:
+            return True
+        ceiling = self.config.leases.lease_timeout_s
+        return ceiling > 0 and lease.expires_at <= now_text
+
+    def _lease_expiry_reason(self, lease: st.Lease, now: datetime) -> str:
+        """Why :meth:`_lease_is_dead` is true (wall clock wins if both apply)."""
+        ceiling = self.config.leases.lease_timeout_s
+        if ceiling > 0 and lease.expires_at <= st.fmt_time(now):
+            return "lease_expired"
+        return "heartbeat_timeout"
 
     def _reservation_live(self, conn, seat: st.Seat) -> bool:
         """Is a provisioning seat still wanted (not cancelled/released)?"""
@@ -541,17 +566,19 @@ class Scheduler:
         that lands during the scan still saves the seat.
         """
         moment = now or self._now()
+        # ``expired_leases`` matches either term; when the wall-clock ceiling
+        # is disabled it returns the whole active set, so filter down to the
+        # genuinely-dead leases here (avoids locking live seats every pump).
         leases = self.store.read(
             lambda c: st.expired_leases(c, moment, self.config.leases.heartbeat_timeout_s)
         )
+        leases = [lease for lease in leases if self._lease_is_dead(lease, moment)]
         reclaimed = 0
         for lease in leases:
             seat = self.store.read(lambda c: st.seat_by_id(c, lease.seat_id))
             if seat is None:
                 continue
-            reason = (
-                "lease_expired" if lease.expires_at <= st.fmt_time(moment) else "heartbeat_timeout"
-            )
+            reason = self._lease_expiry_reason(lease, moment)
             repo = seat.export_repo
             repo_key = repo if repo is not None else None
             with self.locks.seat_then_repo(seat.name, repo_key):
@@ -1136,7 +1163,12 @@ class Scheduler:
             )
             self.provisioner.apply_resource_limits(vm_ref, self._resources(seat.seat_type))
             self.provisioner.start(vm_ref)
-            self.provisioner.wait_ready(vm_ref, self.config.leases.lease_timeout_s)
+            # The lease ceiling is a liveness policy, not a provisioning
+            # timeout: with no ceiling (0) fall back to a defensive wait bound.
+            self.provisioner.wait_ready(
+                vm_ref,
+                self.config.leases.lease_timeout_s or DEFAULT_PROVISION_WAIT_S,
+            )
             return True, vm_ref
         except Exception as exc:  # noqa: BLE001 - one bad seat must not kill the pump
             if vm_ref is not None:
