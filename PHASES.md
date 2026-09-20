@@ -185,6 +185,32 @@ grown toolchain):
   overlays, destroy-on-release — but a hypervisor boundary and a real
   systemd Omarchy session, which containers can't give.
 
+### Golden automation and packaging (same round)
+
+- **Agents declare intent, not packages.** `omavroom/images.py` resolves tool
+  names (`rust`, `node`, `python`, `go`, ...) to Arch packages. `image_plan`
+  previews the recipe and the missing packages; `image_ensure` is idempotent
+  (satisfied short-circuit, recipe hash, delta rebase), writes
+  `.omavroom/image.toml` into the project repo, and starts a build per policy.
+- **Build policy** - `[images] build_policy = "ask" | "allowlist" | "auto"`
+  (default `allowlist`) with a safe default allowlist. Allowlisted toolchains
+  build automatically; anything else returns `needs_approval`, preserving the
+  old "is it cool if I install this?" gate without manual toil.
+- **Build visibility** - `pool_status.builds`, `image_status`, `image_logs`,
+  build events; builds serialize (one VM at a time).
+- **One image, two boot modes.** A single golden serves both seat types; the
+  provisioner sets the boot target in-guest from `seat_type` (desktop ->
+  `graphical.target` + tty1 autologin into Hyprland; terminal ->
+  `multi-user.target`, no compositor) and records it in seat meta. Project
+  images are single-shared, so a project builds once. `golden-omarchy-term`
+  remains as an alternative.
+- **Two skills shipped in the repo** (`skills/`): `omavroom` (everyday seat
+  use) and `omavroom-project-images` (the golden-prep lifecycle). Installed by
+  pointing opencode's `skills.paths` at the repo (no copying, always current),
+  plus an MCP `guide` tool/resource as a fallback for agents without the skill.
+  Split because the triggers differ and the golden-prep procedure would
+  otherwise bloat everyday seat use.
+
 ## Phase 5 — MCP server + opencode wiring
 
 Spec: FastMCP server exposing the async toolset (`pool_status`,
