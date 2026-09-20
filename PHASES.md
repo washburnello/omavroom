@@ -275,11 +275,22 @@ this is the single backlog of record.
 - [ ] Clean-machine install test (fresh account, ends in a Phase 1 proof)
 
 ### Quick wins / loose ends (S)
-- [ ] Stale docs from the collision fix: the `omavroom` skill and the
+- [x] Stale docs from the collision fix: the `omavroom` skill and the
       omarchy-pomodoro `AGENTS.md` still say "one seat at a time until the
       collision is fixed" — it is fixed
+- [ ] `omavroom_input`: support modifier combos (`Super+Return`,
+      `Ctrl+Alt+t`) — `input` only sends single keys or literal text today, so
+      agents cannot trigger Omarchy shortcuts. Map Super/Win→`logo`,
+      Ctrl/Alt/Shift, and emit `wtype -M … -k … -m …`.
 - [ ] Expose `cancel_request` as an MCP/CLI tool (agents cannot withdraw a
       queued request today)
+- [ ] Type the stale-heartbeat error (`heartbeat` on a closed lease returns a
+      raw `KeyError: no active lease` instead of a clean `not_found`).
+- [ ] MCP client version handshake: report the client's version and have the
+      daemon warn when a client predates a capability (e.g. auto-heartbeat), so
+      an un-restarted opencode is obvious. Document "restart opencode after
+      upgrading omavroom" (MCP servers are loaded per opencode process, not per
+      session).
 - [ ] `omarchy-fcitx5` user-service restart loop in the golden (log spam)
 - [ ] Re-run the pomodoro agent test end-to-end as the regression (seats no
       longer die; a dead agent should now land in Needs attention)
