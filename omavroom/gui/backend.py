@@ -108,6 +108,9 @@ class WallBackend(QObject):
     requestCaptureConfig = Signal(object)
     #: Tell the worker which desktop seat is focused (-1 for none).
     requestFocus = Signal(int)
+    #: Tell the worker which seat is live-streaming (-1 for none) so its
+    #: adaptive stills capture is suppressed while VNC owns it.
+    requestLiveSeat = Signal(int)
     #: Resolve the VNC endpoint for a focused desktop seat (worker thread).
     requestLiveEndpoint = Signal(int)
     #: Ask the worker to persist a config value (section, key, value) via the daemon.
@@ -168,6 +171,12 @@ class WallBackend(QObject):
         self._live_seat_id = -1
         self._live_target: int | None = None
         self._live_revision = 0
+        #: True once a real live frame has arrived for ``_live_seat_id``. QML
+        #: must not point at the provider until then (it would show a blank).
+        self._live_frame_ready = False
+        #: Last live-seat suppression pushed to the worker (-1 = none), so the
+        #: signal is only emitted on change.
+        self._live_seat_sent = -1
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(LIVE_POLL_INTERVAL_MS)
         self._live_timer.timeout.connect(self._poll_live)
@@ -260,6 +269,15 @@ class WallBackend(QObject):
     def liveRevision(self) -> int:
         """Monotonic counter bumped per delivered live frame (cache buster)."""
         return self._live_revision
+
+    @Property(bool, notify=liveChanged)
+    def liveReady(self) -> bool:
+        """Whether the live seat has produced its first frame yet.
+
+        The focused tile keeps its still until this flips true, so the live
+        provider's placeholder can never replace a good frame with a blank.
+        """
+        return self._live_frame_ready
 
     @Property(str, notify=noticeChanged)
     def liveModeNotice(self) -> str:
@@ -559,6 +577,18 @@ class WallBackend(QObject):
                 return seat_id if slot.occupied and slot.seat_type == "desktop" else None
         return None
 
+    def _set_live_seat_request(self, seat_id: int) -> None:
+        """Tell the worker (on change) which seat must not be still-captured."""
+        if seat_id != self._live_seat_sent:
+            self._live_seat_sent = seat_id
+            self.requestLiveSeat.emit(seat_id)
+
+    def _clear_live(self) -> None:
+        """Drop the live presentation without touching the timer/source."""
+        self._live_seat_id = -1
+        self._live_frame_ready = False
+        self._set_live_seat_request(-1)
+
     def _sync_live(self) -> None:
         """Start/stop the focused seat's stream as focus or ``live_mode`` changes.
 
@@ -571,8 +601,9 @@ class WallBackend(QObject):
         if self._live_target is not None:
             self._frame_source.stop(self._live_target)
         self._live_target = desired
-        if self._live_seat_id != -1:
-            self._live_seat_id = -1
+        had_live = self._live_seat_id != -1 or self._live_frame_ready
+        self._clear_live()
+        if had_live:
             self.liveChanged.emit()
         if desired is None:
             self._live_timer.stop()
@@ -595,18 +626,24 @@ class WallBackend(QObject):
             self._live_timer.stop()
             self._live_fallback(seat_id, str(exc))
             return
+        # Deliberately do *not* reset ``_live_revision`` here: the URL only
+        # advances when a frame actually arrives. ``liveSeatId`` alone does not
+        # point QML at the provider because ``liveReady`` is still false.
         self._live_seat_id = int(seat_id)
-        self._live_revision = 0
+        self._live_frame_ready = False
         self._live_mode_notice = ""
+        self._set_live_seat_request(int(seat_id))
         self._live_timer.start()
         self.liveChanged.emit()
         self.noticeChanged.emit()
 
     def _live_fallback(self, seat_id: int, reason: str) -> None:
         """Abandon live VNC for ``seat_id`` and tell the operator why."""
-        if self._live_seat_id != -1:
-            self._live_seat_id = -1
+        if self._live_seat_id != -1 or self._live_frame_ready:
+            self._clear_live()
             self.liveChanged.emit()
+        else:
+            self._set_live_seat_request(-1)
         self._live_mode_notice = f"live VNC unavailable for seat {seat_id}: {reason}; using stills"
         self._set_notice(self._live_mode_notice)
 
@@ -623,10 +660,16 @@ class WallBackend(QObject):
             self._live_timer.stop()
             self._live_fallback(seat_id, error)
             return
+        # Only a frame that actually exists advances the revision/readiness; an
+        # idle poll never publishes a new URL and never blanks the tile.
         revision = self._frame_source.revision(seat_id)
-        if revision != self._live_revision:
-            self._live_revision = revision
-            self.liveChanged.emit()
+        if revision <= 0:
+            return
+        if revision == self._live_revision and self._live_frame_ready:
+            return
+        self._live_revision = revision
+        self._live_frame_ready = True
+        self.liveChanged.emit()
 
     @Slot()
     def shutdown_live(self) -> None:
@@ -635,7 +678,7 @@ class WallBackend(QObject):
         stop_all = getattr(self._frame_source, "stop_all", None)
         if callable(stop_all):
             stop_all()
-        self._live_seat_id = -1
+        self._clear_live()
         self._live_target = None
 
     def _slot_rects(self):
@@ -751,6 +794,8 @@ class PollWorker(QObject):
             wall_interval_s=poll_interval_s,
         )
         self._live_mode = str(live_mode)
+        #: Seat whose stills capture is suppressed because the GUI streams it.
+        self._live_seat_id: int | None = None
         self._client: DaemonClient | None = client
         self._timer: QTimer | None = None
         #: Re-entrancy guard: a slow capture must coalesce, not stack ticks.
@@ -839,6 +884,17 @@ class PollWorker(QObject):
             self.poll_once()
 
     @Slot(int)
+    def set_live_seat(self, seat_id: int) -> None:
+        """Suppress stills capture for the live-streaming seat (``-1`` clears).
+
+        Called from the GUI thread when a VNC stream starts/stops. The seat's
+        framebuffer already flows through the image provider, so capturing it
+        here would waste a daemon round trip and race the live image.
+        """
+        self._live_seat_id = None if int(seat_id) < 0 else int(seat_id)
+        self._planner.set_live_seat(self._live_seat_id)
+
+    @Slot(int)
     def resolve_live_endpoint(self, seat_id: int) -> None:
         """Resolve a focused seat's VNC endpoint for the live (VNC) path.
 
@@ -888,6 +944,8 @@ class PollWorker(QObject):
         if mode == self._live_mode:
             return
         self._live_mode = mode
+        if mode != "vnc":
+            self.set_live_seat(-1)
 
     @Slot()
     def poll_once(self) -> None:

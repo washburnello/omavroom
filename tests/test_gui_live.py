@@ -226,6 +226,73 @@ def test_shutdown_live_stops_everything():
 
 
 # --------------------------------------------------------------------------
+# first-frame gating: the tile keeps its still until a real frame exists
+# --------------------------------------------------------------------------
+def test_stream_starts_but_is_not_ready_until_the_first_frame():
+    backend, source, _ = _backend_with_focus(live_mode="vnc")
+    backend.toggleFocus("desktop-0")
+    # The stream target is known, but no frame has arrived: not ready.
+    assert backend.liveSeatId == 5
+    assert backend.liveReady is False
+
+    source.revisions[5] = 1
+    backend._poll_live()
+    assert backend.liveReady is True
+    assert backend.liveRevision == 1
+
+
+def test_live_seat_suppression_is_emitted_on_start_and_cleared_on_fallback():
+    backend, source, _ = _backend_with_focus(live_mode="vnc")
+    seen: list[int] = []
+    backend.requestLiveSeat.connect(seen.append)
+    backend.toggleFocus("desktop-0")
+    assert seen == [5]
+
+    source.errors[5] = "boom"
+    backend._poll_live()
+    assert seen[-1] == -1
+
+
+def test_start_does_not_reset_or_advance_revision_without_a_frame():
+    backend, source, _ = _backend_with_focus(live_mode="vnc")
+    backend.toggleFocus("desktop-0")
+    assert backend.liveRevision == 0
+    backend._poll_live()  # no frame yet (source revision still 0)
+    assert backend.liveRevision == 0
+    assert backend.liveReady is False
+
+    source.revisions[5] = 4
+    backend._poll_live()
+    assert backend.liveRevision == 4
+    assert backend.liveReady is True
+
+
+def test_focus_switch_does_not_reset_the_revision_until_a_new_frame():
+    source = FakeFrameSource()
+    backend = WallBackend(_config(desktop=2, terminal=0), frame_source=source)
+    backend.setGuiSetting("live_mode", "vnc")
+    backend.requestLiveEndpoint.connect(
+        lambda seat_id: backend.on_action_result("live-endpoint", True, "ok", seat_id, "vnc://x:1")
+    )
+    per_type = {"desktop": {"max_seats": 2}, "terminal": {"max_seats": 0}}
+    backend.apply_payload(_payload([_seat(5, "desktop-1"), _seat(6, "desktop-2")], per_type))
+
+    backend.toggleFocus("desktop-0")
+    source.revisions[5] = 3
+    backend._poll_live()
+    assert backend.liveRevision == 3
+
+    backend.toggleFocus("desktop-1")  # new seat, no frame yet
+    assert backend.liveSeatId == 6
+    assert backend.liveReady is False
+    assert backend.liveRevision == 3  # unchanged until the new frame arrives
+
+    source.revisions[6] = 4
+    backend._poll_live()
+    assert backend.liveRevision == 4
+
+
+# --------------------------------------------------------------------------
 # QML delivery: the focused tile renders the provider URL
 # --------------------------------------------------------------------------
 def _pump(app: QGuiApplication, ms: int = 40) -> None:
@@ -252,9 +319,7 @@ def _find(root, prefix: str) -> list[QObject]:
     return [i for i in _all_items(base) if (i.objectName() or "").startswith(prefix)]
 
 
-def test_focused_tile_uses_image_provider_url():
-    app = _qapp()
-    backend, source, _ = _backend_with_focus(live_mode="vnc")
+def _build_live_engine(app: QGuiApplication, backend: WallBackend) -> QQmlApplicationEngine:
     engine = QQmlApplicationEngine()
     provider = FrameImageProvider(backend.frame_source)
     engine.rootContext().setContextProperty("backend", backend)
@@ -262,6 +327,22 @@ def test_focused_tile_uses_image_provider_url():
     engine.load(QUrl.fromLocalFile(os.path.join(QML_DIR, "Main.qml")))
     for _ in range(5):
         app.processEvents()
+    return engine
+
+
+def _teardown_live_engine(app: QGuiApplication, backend: WallBackend, engine) -> None:
+    backend.shutdown_live()
+    engine.deleteLater()
+    # Force the deferred engine delete before ``backend`` is collected, so
+    # QML bindings never re-evaluate against a null context property.
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
+def test_focused_tile_uses_image_provider_url():
+    app = _qapp()
+    backend, source, _ = _backend_with_focus(live_mode="vnc")
+    engine = _build_live_engine(app, backend)
     try:
         root = engine.rootObjects()[0]
         backend.toggleFocus("desktop-0")
@@ -274,9 +355,56 @@ def test_focused_tile_uses_image_provider_url():
         assert focused.property("live") is True
         assert focused.property("liveSource") == "image://omavroom/5?v=2"
     finally:
-        backend.shutdown_live()
-        engine.deleteLater()
-        # Force the deferred engine delete before ``backend`` is collected, so
-        # QML bindings never re-evaluate against a null context property.
-        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        app.processEvents()
+        _teardown_live_engine(app, backend, engine)
+
+
+def test_focused_tile_stays_on_still_until_first_live_frame():
+    app = _qapp()
+    backend, source, _ = _backend_with_focus(live_mode="vnc")
+    engine = _build_live_engine(app, backend)
+    try:
+        root = engine.rootObjects()[0]
+        backend.toggleFocus("desktop-0")
+        QQuickWindow.grabWindow(root)
+        _pump(app)
+        focused = {t.objectName(): t for t in _find(root, "slotTile-")}["slotTile-desktop-0"]
+        # Stream started, but no frame yet: the tile must NOT point at the
+        # provider (which would render its blank placeholder over the still).
+        assert backend.liveSeatId == 5
+        assert focused.property("live") is False
+        assert focused.property("liveSource") == ""
+
+        source.revisions[5] = 1
+        backend._poll_live()
+        QQuickWindow.grabWindow(root)
+        _pump(app)
+        assert focused.property("live") is True
+        assert focused.property("liveSource") == "image://omavroom/5?v=1"
+    finally:
+        _teardown_live_engine(app, backend, engine)
+
+
+def test_live_fallback_drops_the_provider_url_without_blanking():
+    app = _qapp()
+    backend, source, _ = _backend_with_focus(live_mode="vnc")
+    engine = _build_live_engine(app, backend)
+    try:
+        root = engine.rootObjects()[0]
+        backend.toggleFocus("desktop-0")
+        source.revisions[5] = 1
+        backend._poll_live()
+        QQuickWindow.grabWindow(root)
+        _pump(app)
+        focused = {t.objectName(): t for t in _find(root, "slotTile-")}["slotTile-desktop-0"]
+        assert focused.property("live") is True
+
+        # A stream error falls back to stills: the live URL is dropped, so the
+        # still underneath (or the retained last frame) shows instead.
+        source.errors[5] = "glitch"
+        backend._poll_live()
+        QQuickWindow.grabWindow(root)
+        _pump(app)
+        assert backend.liveSeatId == -1
+        assert focused.property("liveSource") == ""
+    finally:
+        _teardown_live_engine(app, backend, engine)

@@ -384,6 +384,76 @@ def test_click_command_mapping() -> None:
         LibvirtProvisioner._click_command("nope")
 
 
+# --------------------------------------------------------------------------
+# input key combos (modifier mapping -> wtype -M/-m)
+# --------------------------------------------------------------------------
+def test_key_command_single_key_unchanged() -> None:
+    assert LibvirtProvisioner._key_command("Return") == "wtype -k Return"
+
+
+def test_key_command_modifier_combo() -> None:
+    assert LibvirtProvisioner._key_command("Super+Return") == "wtype -M logo -k Return -m logo"
+    assert (
+        LibvirtProvisioner._key_command("Ctrl+Alt+t") == "wtype -M ctrl -M alt -k t -m alt -m ctrl"
+    )
+
+
+def test_key_command_modifier_aliases_and_pass_through() -> None:
+    for alias in ("Super", "Win", "Meta", "super"):
+        assert LibvirtProvisioner._key_command(f"{alias}+F1") == "wtype -M logo -k F1 -m logo"
+    assert LibvirtProvisioner._key_command("Control+x") == "wtype -M ctrl -k x -m ctrl"
+    assert LibvirtProvisioner._key_command("Shift+a") == "wtype -M shift -k a -m shift"
+    assert LibvirtProvisioner._key_command("capslock") == "wtype -k capslock"
+    assert LibvirtProvisioner._key_command("AltGr+e") == "wtype -M altgr -k e -m altgr"
+
+
+def test_key_command_release_is_reverse_of_press() -> None:
+    command = LibvirtProvisioner._key_command("Ctrl+Shift+Alt+t")
+    assert command == "wtype -M ctrl -M shift -M alt -k t -m alt -m shift -m ctrl"
+
+
+def test_key_command_rejects_bad_modifier_and_empty_key() -> None:
+    from omavroom.manager.provisioner import ProvisionerError
+
+    with pytest.raises(ProvisionerError, match="unknown modifier"):
+        LibvirtProvisioner._key_command("Hyper+Return")
+    with pytest.raises(ProvisionerError, match="no key"):
+        LibvirtProvisioner._key_command("Ctrl+")
+    with pytest.raises(ProvisionerError, match="must not be empty"):
+        LibvirtProvisioner._key_command("")
+
+
+def test_input_key_combo_emitted_to_guest(tmp_path: Path) -> None:
+    from omavroom.manager.provisioner import InputEvent
+
+    commands: list[str] = []
+
+    def runner(argv, timeout, input_text):
+        commands.append(argv[-1])
+        return CommandResult(0, "", "")
+
+    prov = _prov(tmp_path, host_runner=runner)
+    overlay = tmp_path / "seats" / "desktop-1" / "overlay.qcow2"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_bytes(b"x")
+    meta = _meta(prov, "desktop-1", overlay, seat_type="desktop")
+    meta.static_ip = "10.0.0.5"
+    prov._save_meta(meta)
+    prov.input(
+        "omavroom-seat-desktop-1",
+        [
+            InputEvent("key", "Super+Return"),
+            InputEvent("key", "Ctrl+Alt+t"),
+            InputEvent("key", "Return"),
+        ],
+    )
+    assert len(commands) == 1
+    remote = commands[0]
+    assert "wtype -M logo -k Return -m logo" in remote
+    assert "wtype -M ctrl -M alt -k t -m alt -m ctrl" in remote
+    assert "wtype -k Return" in remote
+
+
 def test_screenshot_converts_ppm_and_downscales(tmp_path: Path) -> None:
     from omavroom.manager.libvirt_provisioner import _subprocess_runner
 

@@ -79,7 +79,7 @@ import threading
 from pathlib import Path
 
 from omavroom.config import Config, set_config_value, set_config_values
-from omavroom.manager import Manager
+from omavroom.manager import LeaseNotFound, Manager
 from omavroom.manager.execs import DEFAULT_LIST_OUTPUT_BUDGET_BYTES
 from omavroom.manager.provisioner import (
     FakeProvisioner,
@@ -88,6 +88,7 @@ from omavroom.manager.provisioner import (
     ProvisionerError,
     RepoSpec,
 )
+from omavroom.version import CAPABILITY_AUTO_HEARTBEAT, SERVER_NAME, SERVER_VERSION
 
 log = logging.getLogger("omavroom.daemon")
 
@@ -198,6 +199,10 @@ def _error_payload(exc: BaseException) -> dict[str, str]:
     if isinstance(exc, DaemonError):
         code = exc.code
     elif isinstance(exc, KeyError):
+        code = "not_found"
+    elif isinstance(exc, LeaseNotFound):
+        # Typed stale/heartbeat path: same clean code as other missing
+        # resources, without depending on the bare-KeyError fallback.
         code = "not_found"
     elif isinstance(getattr(exc, "code", None), str):
         # Domain errors (e.g. ExecNotAllowed -> ``exec_not_allowed``) carry
@@ -419,6 +424,7 @@ class Protocol:
         self.jobs = jobs
         self._methods = {
             "ping": self._ping,
+            "hello": self._hello,
             "pool_status": self._pool_status,
             "queue_view": self._queue_view,
             "seat_status": self._seat_status,
@@ -465,6 +471,40 @@ class Protocol:
     # -- fast reads ------------------------------------------------------
     def _ping(self, params: dict) -> dict:
         return {"pong": True, "protocol": PROTOCOL_VERSION}
+
+    def _hello(self, params: dict) -> dict:
+        """Record the calling client's version/capabilities (startup handshake).
+
+        Returns the server/protocol version so the client can confirm the
+        handshake. A client whose capabilities omit ``auto_heartbeat`` is
+        logged as a warning (an un-restarted opencode) and, because the record
+        is kept per client label, surfaced in ``pool_status.stale_clients``.
+        """
+        client = _required_str(params, "client")
+        version = _optional_str(params, "version") or "unknown"
+        raw_capabilities = params.get("capabilities")
+        if raw_capabilities is None:
+            capabilities: list[str] = []
+        elif not isinstance(raw_capabilities, list):
+            raise ValueError("parameter 'capabilities' must be a list")
+        else:
+            capabilities = [str(item) for item in raw_capabilities]
+        info = self.manager.record_hello(client=client, version=version, capabilities=capabilities)
+        if not info["auto_heartbeat"]:
+            log.warning(
+                "MCP client %s %s connected without the %s capability "
+                "(likely an un-restarted opencode); lease heartbeats will not "
+                "be auto-renewed -- restart opencode after upgrading omavroom",
+                client,
+                version,
+                CAPABILITY_AUTO_HEARTBEAT,
+            )
+        return {
+            "server": SERVER_NAME,
+            "server_version": SERVER_VERSION,
+            "protocol": PROTOCOL_VERSION,
+            "capabilities": [CAPABILITY_AUTO_HEARTBEAT],
+        }
 
     def _pool_status(self, params: dict):
         return self.manager.pool_status()
@@ -1076,6 +1116,7 @@ __all__ = [
     "JobRegistry",
     "Protocol",
     "UnknownMethod",
+    "LeaseNotFound",
     "build_provisioner",
     "configure_logging",
     "default_log_path",

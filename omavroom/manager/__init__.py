@@ -94,6 +94,7 @@ Phase 5 MCP tool mapping:
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
@@ -118,6 +119,7 @@ from omavroom.manager.provisioner import (
 )
 from omavroom.manager.scheduler import (
     ExportGate,
+    LeaseNotFound,
     LeaseView,
     PoolStatus,
     PumpReport,
@@ -127,6 +129,7 @@ from omavroom.manager.scheduler import (
     Scheduler,
     SeatView,
 )
+from omavroom.version import CAPABILITY_AUTO_HEARTBEAT
 
 log = logging.getLogger("omavroom.manager")
 
@@ -250,6 +253,9 @@ class Manager:
         self._stop = False
         self._thread: threading.Thread | None = None
         self._cv = threading.Condition()
+        #: Latest ``hello`` reported per MCP client label (client handshake).
+        self.clients: dict[str, dict] = {}
+        self._clients_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -369,7 +375,34 @@ class Manager:
         return self.scheduler.list_seats(include_history=include_history)
 
     def pool_status(self) -> PoolStatus:
-        return self.scheduler.pool_status()
+        # The scheduler owns the pool snapshot; the manager layers on the MCP
+        # client handshake so ``status`` can flag a stale (un-restarted) client.
+        return dataclasses.replace(self.scheduler.pool_status(), stale_clients=self.stale_clients())
+
+    # ------------------------------------------------------------------
+    # MCP client handshake (version + capabilities)
+    # ------------------------------------------------------------------
+    def record_hello(self, *, client: str, version: str, capabilities: list[str]) -> dict:
+        """Record the latest ``hello`` for one MCP client; return its record."""
+        info = {
+            "client": client,
+            "version": version,
+            "capabilities": list(capabilities),
+            "auto_heartbeat": CAPABILITY_AUTO_HEARTBEAT in capabilities,
+            "at": st.fmt_time(st.utcnow()),
+        }
+        with self._clients_lock:
+            self.clients[client] = info
+        return info
+
+    def client_info(self) -> list[dict]:
+        """Every recorded MCP client, newest handshake per label."""
+        with self._clients_lock:
+            return [dict(info) for info in self.clients.values()]
+
+    def stale_clients(self) -> list[dict]:
+        """Recorded clients missing a required capability (``auto_heartbeat``)."""
+        return [info for info in self.client_info() if not info["auto_heartbeat"]]
 
     def queue_view(self, *, include_history: bool = False) -> list[RequestView]:
         return self.scheduler.queue_view(include_history=include_history)
@@ -666,6 +699,7 @@ __all__ = [
     "ExportGate",
     "Handle",
     "InputEvent",
+    "LeaseNotFound",
     "LeaseView",
     "LockManager",
     "Manager",

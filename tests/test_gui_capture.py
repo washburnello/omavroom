@@ -163,6 +163,26 @@ def test_clearing_focus_returns_everything_to_thumbnail():
     assert {capture.seat_id: capture.width for capture in plan.wall} == {1: 480, 2: 480}
 
 
+def test_live_seat_is_not_captured_as_a_still_while_streaming():
+    clock = FakeClock()
+    planner = _planner(clock)
+    planner.set_focus(1)
+    planner.set_live_seat(1)  # VNC owns seat 1
+    clock.advance(2.0)
+    plan = planner.plan(clock(), [_desktop(1), _desktop(2)])
+    # No focused still and no thumbnail for the live seat; the other seat is
+    # still captured normally.
+    assert plan.focused is None
+    assert [capture.seat_id for capture in plan.wall] == [2]
+
+    # Clearing the live seat restores the focused high-res capture.
+    planner.set_live_seat(-1)
+    clock.advance(2.0)
+    plan = planner.plan(clock(), [_desktop(1), _desktop(2)])
+    assert plan.focused is not None and plan.focused.seat_id == 1
+    assert [capture.seat_id for capture in plan.wall] == [2]
+
+
 @pytest.mark.parametrize(
     "seat",
     [
@@ -205,6 +225,33 @@ def test_pollworker_focused_tick_then_wall_pass():
 
     client.screenshots.clear()
     clock.advance(1.5)  # wall due (t == 2.0)
+    worker.poll_once()
+    assert sorted(client.screenshots) == [(1, 1024), (2, 480)]
+
+
+def test_pollworker_suppresses_stills_for_the_live_seat():
+    clock = FakeClock()
+    client = FakeClient([_desktop(1), _desktop(2)])
+    worker = _worker(client, _planner(clock))
+    worker.poll_once()  # first tick: wall pass captures both seats
+    assert sorted(client.screenshots) == [(1, 480), (2, 480)]
+
+    # Seat 1 starts streaming: its immediate focus capture must be skipped.
+    client.screenshots.clear()
+    worker.set_live_seat(1)
+    worker.set_focus(1)
+    assert client.screenshots == []
+
+    # The wall pass still captures every other live desktop seat.
+    client.screenshots.clear()
+    clock.advance(2.0)
+    worker.poll_once()
+    assert client.screenshots == [(2, 480)]
+
+    # Stream ends: the seat returns to the stills cadence (still the focus).
+    client.screenshots.clear()
+    worker.set_live_seat(-1)
+    clock.advance(2.0)
     worker.poll_once()
     assert sorted(client.screenshots) == [(1, 1024), (2, 480)]
 

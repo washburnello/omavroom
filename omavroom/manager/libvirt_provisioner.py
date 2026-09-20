@@ -1805,7 +1805,9 @@ class LibvirtProvisioner(Provisioner):
 
         Runs ``wtype``/``ydotool`` over SSH with the guest's Wayland session
         environment. Click values are ``x,y[,button]`` with button 1/2/3
-        mapping to ydotool's BTN_LEFT/BTN_RIGHT/BTN_MIDDLE.
+        mapping to ydotool's BTN_LEFT/BTN_RIGHT/BTN_MIDDLE. Key values may be
+        a single keysym (``"Return"``) or a ``Mod+...+Key`` combo
+        (``"Super+Return"``, ``"Ctrl+Alt+t"``); see :meth:`_key_command`.
         """
         meta = self._require_meta(vm_ref)
         if meta.seat_type != "desktop":
@@ -1813,7 +1815,7 @@ class LibvirtProvisioner(Provisioner):
         commands: list[str] = []
         for event in events:
             if event.kind == "key":
-                commands.append(f"wtype -k {_quote(event.value)}")
+                commands.append(self._key_command(event.value))
             elif event.kind == "text":
                 commands.append(f"wtype -- {_quote(event.value)}")
             else:
@@ -1833,6 +1835,62 @@ class LibvirtProvisioner(Provisioner):
 
     #: Allowed click buttons -> ydotool BTN_* key codes.
     _CLICK_BUTTONS: dict[str, str] = {"1": "272", "2": "274", "3": "273"}
+
+    #: Friendly modifier names (case-insensitive) -> the name ``wtype -M``/
+    #: ``-m`` accepts. ``Win``/``Meta`` are aliases for the Super key, which
+    #: wtype calls ``logo``.
+    _WTYPE_MODIFIERS: dict[str, str] = {
+        "super": "logo",
+        "win": "logo",
+        "meta": "logo",
+        "logo": "logo",
+        "ctrl": "ctrl",
+        "control": "ctrl",
+        "alt": "alt",
+        "shift": "shift",
+        "capslock": "capslock",
+        "altgr": "altgr",
+    }
+
+    @staticmethod
+    def _key_command(value: str) -> str:
+        """Build a ``wtype`` key command, expanding ``Mod+...+Key`` combos.
+
+        A plain keysym (``"Return"``) emits ``wtype -k Return`` exactly as
+        before. A combo emits the modifiers with ``-M``, the key with ``-k``,
+        then the modifiers in reverse with ``-m``::
+
+            Super+Return   -> wtype -M logo -k Return -m logo
+            Ctrl+Alt+t     -> wtype -M ctrl -M alt -k t -m alt -m ctrl
+
+        An unknown modifier, an empty modifier, or a missing/empty key raises
+        :class:`ProvisionerError`; nothing unvalidated is ever interpolated
+        into the guest shell.
+        """
+        combo = value.split("+")
+        if len(combo) == 1:
+            if not combo[0]:
+                raise ProvisionerError("key event value must not be empty")
+            return f"wtype -k {_quote(combo[0])}"
+        modifiers: list[str] = []
+        for token in combo[:-1]:
+            mapped = LibvirtProvisioner._WTYPE_MODIFIERS.get(token.strip().lower())
+            if mapped is None:
+                known = ", ".join(sorted(LibvirtProvisioner._WTYPE_MODIFIERS))
+                raise ProvisionerError(
+                    f"unknown modifier {token!r} in key combo {value!r} (known: {known})"
+                )
+            modifiers.append(mapped)
+        key = combo[-1]
+        if not key.strip():
+            raise ProvisionerError(f"key combo {value!r} has no key after its modifiers")
+        parts = ["wtype"]
+        for modifier in modifiers:
+            parts += ["-M", modifier]
+        parts += ["-k", _quote(key)]
+        for modifier in reversed(modifiers):
+            parts += ["-m", modifier]
+        return " ".join(parts)
 
     @staticmethod
     def _click_command(value: str) -> str:

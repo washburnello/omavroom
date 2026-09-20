@@ -91,6 +91,13 @@ from omavroom.daemon import (
 )
 from omavroom.manager.execs import DEFAULT_LIST_OUTPUT_BUDGET_BYTES
 from omavroom.manager.provisioner import InputEvent, RepoSpec
+from omavroom.version import (
+    MCP_CLIENT_CAPABILITIES,
+    MCP_CLIENT_NAME,
+    MCP_CLIENT_VERSION,
+    SERVER_NAME,
+    SERVER_VERSION,
+)
 
 log = logging.getLogger("omavroom.mcp")
 
@@ -366,6 +373,27 @@ class OmavroomTools:
         )
         if autostart_heartbeat:
             self.heartbeats.start()
+        # Announce this client's version/capabilities once at startup, so the
+        # daemon can flag an un-restarted opencode (missing ``auto_heartbeat``).
+        # Best-effort: an older daemon that predates ``hello`` must not stop us.
+        try:
+            self.hello = client.hello()
+        except DaemonClientError:
+            log.debug("daemon does not support the hello handshake", exc_info=True)
+            self.hello = {"client": MCP_CLIENT_NAME, "version": MCP_CLIENT_VERSION}
+
+    # -- client identity / handshake -------------------------------------
+    @property
+    def client_name(self) -> str:
+        return MCP_CLIENT_NAME
+
+    @property
+    def client_version(self) -> str:
+        return MCP_CLIENT_VERSION
+
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        return MCP_CLIENT_CAPABILITIES
 
     # -- auto-heartbeat --------------------------------------------------
     def _beat_seat(self, seat_id: int) -> bool:
@@ -413,6 +441,16 @@ class OmavroomTools:
     def pool_status(self) -> dict:
         """What seats exist, what is busy, who is queued, and admission state."""
         return self.client.pool_status()
+
+    def ping(self) -> dict:
+        """Liveness + this client's version/capabilities and the server's."""
+        reply = self.client.ping_info()
+        reply["client"] = MCP_CLIENT_NAME
+        reply["client_version"] = MCP_CLIENT_VERSION
+        reply["capabilities"] = list(MCP_CLIENT_CAPABILITIES)
+        reply.setdefault("server", SERVER_NAME)
+        reply.setdefault("server_version", SERVER_VERSION)
+        return reply
 
     def queue_view(self, include_history: bool = False) -> list:
         """The request queue (waiting + claimed; optionally history)."""
@@ -814,6 +852,9 @@ __all__ = [
     "DEFAULT_HEARTBEAT_INTERVAL_S",
     "DEFAULT_HEARTBEAT_TIMEOUT_S",
     "DEFAULT_INSTRUCTIONS",
+    "MCP_CLIENT_CAPABILITIES",
+    "MCP_CLIENT_NAME",
+    "MCP_CLIENT_VERSION",
     "MCP_TOOL_NAMES",
     "MCPDaemonError",
     "HeartbeatMonitor",

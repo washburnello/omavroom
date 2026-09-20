@@ -118,12 +118,21 @@ class CapturePlanner:
         self.wall_interval_s = max(self.focused_interval_s, float(wall_interval_s))
         self._clock = clock or time.monotonic
         self._focused_seat_id: int | None = None
+        #: The seat currently live-streaming (VNC). Its framebuffer is already
+        #: flowing through the image provider, so the stills path must not
+        #: capture it (that would waste a daemon call and let a slower still
+        #: alternate with the live image).
+        self._live_seat_id: int | None = None
         #: First tick is always a full wall pass.
         self._next_wall_at: float | None = None
 
     @property
     def focused_seat_id(self) -> int | None:
         return self._focused_seat_id
+
+    @property
+    def live_seat_id(self) -> int | None:
+        return self._live_seat_id
 
     def now(self) -> float:
         """Current time from the injected clock."""
@@ -132,6 +141,13 @@ class CapturePlanner:
     def set_focus(self, seat_id: int | None) -> None:
         """Focus a seat (or ``None`` to clear); no immediate capture here."""
         self._focused_seat_id = None if seat_id is None else int(seat_id)
+
+    def set_live_seat(self, seat_id: int | None) -> None:
+        """Mark the seat whose stills captures are suppressed (``None``/``-1`` clears)."""
+        if seat_id is None or int(seat_id) < 0:
+            self._live_seat_id = None
+        else:
+            self._live_seat_id = int(seat_id)
 
     def wall_due(self, now: float) -> bool:
         """Whether the slow wall pass is due at monotonic time ``now``.
@@ -146,12 +162,18 @@ class CapturePlanner:
         """Return the captures due at monotonic time ``now`` for ``seats``."""
         live = live_desktop_ids(seats)
         focused: Capture | None = None
-        if self._focused_seat_id is not None and self._focused_seat_id in live:
+        if (
+            self._focused_seat_id is not None
+            and self._focused_seat_id in live
+            and self._focused_seat_id != self._live_seat_id
+        ):
             focused = Capture(self._focused_seat_id, self.focused_width, True)
 
         wall: list[Capture] = []
         if self.wall_due(now):
             for seat_id in live:
+                if seat_id == self._live_seat_id:
+                    continue
                 if focused is not None and seat_id == focused.seat_id:
                     continue
                 wall.append(Capture(seat_id, self.thumbnail_width, False))

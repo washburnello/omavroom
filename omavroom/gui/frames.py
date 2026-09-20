@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import socket
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Protocol
 
@@ -239,6 +240,9 @@ class VncFrameSource:
         self._stop_join_timeout = stop_join_timeout
         self._lock = threading.Lock()
         self._sessions: dict[int, _VncSession] = {}
+        #: Last good frame per seat, kept after ``stop`` so the image provider
+        #: still has something to show on fallback instead of a blank tile.
+        self._last_frames: dict[int, QImage] = {}
 
     def start(self, seat_id: int, width: int, endpoint: str | None = None) -> None:
         seat = int(seat_id)
@@ -263,6 +267,11 @@ class VncFrameSource:
         if session is not None:
             session.stop()
             session.join(timeout=self._stop_join_timeout)
+            # Retain the last decoded frame: stopping must not blank the tile.
+            frame = session.frame()
+            if frame is not None and not frame.isNull():
+                with self._lock:
+                    self._last_frames[seat] = frame
 
     def stop_all(self) -> None:
         with self._lock:
@@ -271,9 +280,15 @@ class VncFrameSource:
             self.stop(seat)
 
     def frame(self, seat_id: int) -> QImage | None:
+        seat = int(seat_id)
         with self._lock:
-            session = self._sessions.get(int(seat_id))
-        return session.frame() if session is not None else None
+            session = self._sessions.get(seat)
+            last = self._last_frames.get(seat)
+        if session is not None:
+            frame = session.frame()
+            if frame is not None:
+                return frame
+        return last
 
     def revision(self, seat_id: int) -> int:
         with self._lock:
@@ -302,22 +317,43 @@ def _seat_id_from_image_id(image_id: str) -> int | None:
         return None
 
 
+#: How many per-seat frames the provider remembers once a source goes away.
+#: Small: only the focused seat (and a little history) is ever requested.
+_MAX_CACHED_FRAMES = 8
+
+
 class FrameImageProvider(QQuickImageProvider):
     """Serves the live frame for ``image://omavroom/<seat_id>?v=<rev>``.
 
     Called on the render thread while the source's own thread publishes new
     frames, so every access goes through the source's lock (``frame`` /
     ``revision`` are safe to call concurrently).
+
+    The last frame successfully served per seat is cached here as well: if the
+    source forgets it (a stream was stopped/replaced), the provider still
+    returns the most recent frame instead of a blank placeholder. Only a seat
+    that has *never* produced a frame gets the 1x1 transparent placeholder.
     """
 
     def __init__(self, source: FrameSource) -> None:
         super().__init__(QQuickImageProvider.ImageType.Image)
         self._source = source
+        self._lock = threading.Lock()
+        self._last: OrderedDict[int, QImage] = OrderedDict()
 
     def requestImage(self, image_id: str, size: QSize, requested_size: QSize) -> QImage:
         """Qt virtual: return the latest frame for the requested seat id."""
         seat_id = _seat_id_from_image_id(image_id)
         image = self._source.frame(seat_id) if seat_id is not None else None
+        if image is not None and not image.isNull() and seat_id is not None:
+            with self._lock:
+                self._last[seat_id] = image
+                self._last.move_to_end(seat_id)
+                while len(self._last) > _MAX_CACHED_FRAMES:
+                    self._last.popitem(last=False)
+        elif seat_id is not None:
+            with self._lock:
+                image = self._last.get(seat_id)
         if image is None or image.isNull():
             image = _placeholder_image()
         size.setWidth(image.width())

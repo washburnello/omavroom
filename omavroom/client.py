@@ -309,6 +309,33 @@ class DaemonClient:
         """The daemon's wire protocol version (see ``daemon.PROTOCOL_VERSION``)."""
         return int(self.call("ping").get("protocol", 0))
 
+    def hello(
+        self,
+        client: str | None = None,
+        *,
+        version: str | None = None,
+        capabilities: list[str] | None = None,
+    ) -> dict:
+        """Announce this client's version/capabilities (startup handshake).
+
+        Defaults to the shared MCP client identity in :mod:`omavroom.version`.
+        Returns the server's ``{server, server_version, protocol, capabilities}``.
+        """
+        from omavroom.version import (
+            MCP_CLIENT_CAPABILITIES,
+            MCP_CLIENT_NAME,
+            MCP_CLIENT_VERSION,
+        )
+
+        return self.call(
+            "hello",
+            client=client or MCP_CLIENT_NAME,
+            version=version or MCP_CLIENT_VERSION,
+            capabilities=list(capabilities)
+            if capabilities is not None
+            else list(MCP_CLIENT_CAPABILITIES),
+        )
+
     def pool_status(self) -> dict:
         return self.call("pool_status")
 

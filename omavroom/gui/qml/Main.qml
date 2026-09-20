@@ -149,9 +149,13 @@ ApplicationWindow {
                     focused: r.focused === true
                     slotData: d
                     // Live VNC applies only to the focused desktop seat; every
-                    // other tile keeps its adaptive still. The revision in the
-                    // URL busts QML's image cache each delivered frame.
+                    // other tile keeps its adaptive still. The tile keeps its
+                    // still until the first live frame actually arrives
+                    // (`liveReady`), so the provider's blank placeholder can
+                    // never replace a good frame. The revision in the URL busts
+                    // QML's image cache and only advances with a real frame.
                     liveSource: (backend.liveMode === "vnc" && backend.liveSeatId >= 0
+                                 && backend.liveReady
                                  && d.seat_id === backend.liveSeatId)
                         ? ("image://omavroom/" + d.seat_id + "?v=" + backend.liveRevision)
                         : ""

@@ -63,7 +63,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -83,6 +83,17 @@ from omavroom.manager.provisioner import (
 )
 
 log = logging.getLogger("omavroom.scheduler")
+
+
+class LeaseNotFound(LookupError):
+    """Heartbeat/renewal for a lease that is absent or already closed.
+
+    Typed (rather than a bare ``KeyError``) and carries the structured wire
+    code ``not_found``, so the daemon answers with the same clean code as
+    every other missing-resource path.
+    """
+
+    code = "not_found"
 
 
 def read_free_ram_mb() -> int:
@@ -176,6 +187,10 @@ class PoolStatus:
     #: ``resetting`` whose intent could not be recovered). ``retry_release``
     #: or ``force_discard`` always unblocks them.
     needs_attention: list[int]
+    #: MCP clients whose reported capabilities are missing a required one
+    #: (currently ``auto_heartbeat``): a client that has not been restarted
+    #: since upgrading omavroom. Populated by the manager, not the scheduler.
+    stale_clients: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1428,7 +1443,7 @@ class Scheduler:
             elif request_id is not None:
                 lease = st.lease_for_request(conn, request_id)
             if lease is None:
-                raise KeyError("no active lease for heartbeat")
+                raise LeaseNotFound("no active lease for heartbeat")
             st.touch_heartbeat(conn, lease.id, now)
             st.log_event(
                 conn,

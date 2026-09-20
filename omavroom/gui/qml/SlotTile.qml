@@ -20,6 +20,9 @@ Rectangle {
     readonly property bool desktop: slotData.seat_type === "desktop"
     readonly property bool live: liveSource !== ""
     readonly property string thumb: slotData.thumbnail_source || ""
+    //: The still frame is always laid down first; the live image paints over
+    //: it only once a real live frame exists. Neither ever blanks the other.
+    readonly property bool showStill: desktop && occupied && thumb !== ""
     readonly property string terminal: slotData.terminal_text || ""
     readonly property string offText: slotData.off_text || "off / no signal"
     // Terminals are headless: they have no viewer endpoint, so they must not
@@ -47,16 +50,34 @@ Rectangle {
             border.color: "#1c222b"
             clip: true
 
+            // Bottom buffer: the last still. It stays visible underneath the
+            // live frame, so the tile is never blank while the live source is
+            // empty, loading, or has just fallen back.
             Image {
                 id: thumbImage
                 anchors.fill: parent
                 anchors.margins: 1
-                visible: tile.live || (tile.desktop && tile.occupied && tile.thumb !== "")
-                // Live VNC frames come from the image provider (cache-busted by
-                // the live revision); stills keep the base64 thumbnail path.
-                source: tile.live ? tile.liveSource : tile.thumb
+                visible: tile.showStill
+                source: tile.showStill ? tile.thumb : ""
                 fillMode: Image.PreserveAspectFit
                 asynchronous: true
+                cache: false
+                smooth: true
+                mipmap: true
+            }
+
+            // Top buffer: live VNC frames from the image provider (cache-busted
+            // by the live revision). Loaded synchronously so a frame swap is
+            // atomic; the still below covers any decode gap. Only shown once a
+            // real frame is ready (`liveSource` is "" until then).
+            Image {
+                id: liveImage
+                anchors.fill: parent
+                anchors.margins: 1
+                visible: tile.live
+                source: tile.live ? tile.liveSource : ""
+                fillMode: Image.PreserveAspectFit
+                asynchronous: false
                 cache: false
                 smooth: true
                 mipmap: true
@@ -65,7 +86,7 @@ Rectangle {
             Text {
                 anchors.fill: parent
                 anchors.margins: 8
-                visible: !thumbImage.visible
+                visible: !tile.showStill && !tile.live
                 text: {
                     if (!tile.occupied)
                         return tile.offText;

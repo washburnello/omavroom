@@ -80,12 +80,28 @@ def attention_lines(rows: list[SeatRow]) -> list[str]:
     return [render_seat_label(row) for row in rows if row.needs_attention]
 
 
+def stale_client_lines(clients: list[dict]) -> list[str]:
+    """Human lines for MCP clients missing a required capability.
+
+    These are usually an opencode process that started before an omavroom
+    upgrade and must be restarted so it picks up the current MCP server.
+    """
+    return [
+        (
+            f"{client.get('client', '?')} {client.get('version', '?')}"
+            f" (missing: auto_heartbeat) -- restart opencode"
+        )
+        for client in clients
+    ]
+
+
 def status_report(status: dict, *, now: datetime | None = None) -> str:
     """Full ``omavroom status`` text for one pool snapshot."""
     per_type = status.get("per_type") or {}
     seats = build_seat_rows(status, now=now)
     waiters = build_waiter_rows(status, now=now)
     attention = attention_lines(seats)
+    stale = stale_client_lines(status.get("stale_clients") or [])
 
     lines = [
         (
@@ -114,6 +130,12 @@ def status_report(status: dict, *, now: datetime | None = None) -> str:
         "NEEDS ATTENTION",
         "\n".join(f"  {line}" for line in attention) if attention else "(none)",
     ]
+    if stale:
+        lines += [
+            "",
+            "STALE MCP CLIENTS",
+            "\n".join(f"  {line}" for line in stale),
+        ]
     return "\n".join(lines)
 
 

@@ -157,6 +157,7 @@ def run_gui(
     backend.requestConfigValues.connect(worker.set_config_values)
     backend.requestCaptureConfig.connect(worker.set_capture_config)
     backend.requestFocus.connect(worker.set_focus)
+    backend.requestLiveSeat.connect(worker.set_live_seat)
     backend.requestLiveEndpoint.connect(worker.resolve_live_endpoint)
 
     engine = QQmlApplicationEngine()

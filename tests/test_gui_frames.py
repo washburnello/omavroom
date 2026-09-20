@@ -194,6 +194,27 @@ def test_vnc_source_reports_connection_failure():
     source.stop(3)
 
 
+def test_vnc_source_keeps_the_last_frame_after_stop():
+    server = _FakeVncServer(5, 3)
+    server.start()
+    source = VncFrameSource(connect_timeout=2.0, read_timeout=0.2)
+    try:
+        source.start(4, 320, f"vnc://127.0.0.1:{server.port}")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and source.revision(4) < 1:
+            time.sleep(0.02)
+        assert source.frame(4) is not None
+
+        source.stop(4)
+        # Stopping must retain the last good frame, never blank the tile.
+        retained = source.frame(4)
+        assert retained is not None
+        assert (retained.width(), retained.height()) == (5, 3)
+    finally:
+        source.stop(4)
+        server.stop()
+
+
 # --------------------------------------------------------------------------
 # FrameImageProvider
 # --------------------------------------------------------------------------
@@ -217,6 +238,12 @@ def test_image_provider_returns_latest_frame_and_placeholder():
         # Unknown/missing seats get a 1x1 transparent placeholder, never None.
         placeholder = provider.requestImage("999", QSize(), QSize())
         assert (placeholder.width(), placeholder.height()) == (1, 1)
+
+        # Once a seat has produced a frame, the provider keeps serving it even
+        # after the source is stopped (fallback must not go black).
+        source.stop(11)
+        retained = provider.requestImage("11?v=9", QSize(), QSize())
+        assert (retained.width(), retained.height()) == (6, 3)
     finally:
         source.stop(11)
         server.stop()
