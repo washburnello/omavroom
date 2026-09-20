@@ -135,6 +135,10 @@ DEFAULT_INSTRUCTIONS = (
 #: did not load the omavroom skill.
 IMAGE_GUIDE = """\
 Project golden images (agent flow)
+0. New project: scaffold once with `omavroom init .` (writes
+   .omavroom/image.toml from detected tools). Commit the recipe. Then call
+   image_plan/image_ensure with project_root="." and no tools/packages: the
+   request is read from that recipe. Explicit tools/packages still win.
 1. Declare needs, do not guess packages: image_plan(project, tools=[...])
    maps high-level tools (rust, node, python, go, java, docker, tex, git,
    build, jq, ripgrep, fd) to Arch packages and shows the target image, the
@@ -884,6 +888,7 @@ class OmavroomTools:
         tools: list[str] | None = None,
         packages: list[str] | None = None,
         base: str | None = None,
+        project_root: str | None = None,
     ) -> dict:
         """Read-only plan for a project image: recipe, missing packages, satisfied.
 
@@ -892,9 +897,17 @@ class OmavroomTools:
         ``fd``) to Arch packages, merges them with the project image's recorded
         package set, and reports the target image name, the newly missing
         packages, and whether the current image already satisfies the request.
-        Never builds or writes anything.
+        Never builds or writes anything. With neither ``tools`` nor
+        ``packages`` and a ``project_root``, the request is read from
+        ``<project_root>/.omavroom/image.toml``.
         """
-        return self.client.image_plan(project, tools=tools, packages=packages, base=base)
+        return self.client.image_plan(
+            project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+        )
 
     def image_ensure(
         self,

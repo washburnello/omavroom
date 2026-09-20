@@ -126,7 +126,7 @@ of them with `"tools": { "omavroom*": false }`.
 | `force_discard` | `force_discard(seat_id, reason="force_discard")` | `dict` — `job_id` (long op) |
 | `reconcile` | `reconcile()` | `dict` — `job_id` (long op) |
 | `image_list` | `image_list()` | `list[dict]` — registered images, golden paths, project bindings |
-| `image_plan` | `image_plan(project, tools=None, packages=None, base=None)` | `dict` — would-be recipe, target image, `missing_packages`, `satisfied` (read-only) |
+| `image_plan` | `image_plan(project, tools=None, packages=None, base=None, project_root=None)` | `dict` — would-be recipe, target image, `missing_packages`, `satisfied` (read-only); with no tools/packages, reads `project_root`'s recipe |
 | `image_ensure` | `image_ensure(project, tools=None, packages=None, base=None, project_root=None, approved=False)` | `dict` — `satisfied` / `needs_approval` (with `recipe`) / `building` (with `job_id`) |
 | `image_status` | `image_status(name)` | `dict` — build `state` (`pending`/`running`/`done`/`error`) + registry metadata |
 | `image_logs` | `image_logs(name, tail=50)` | `dict` — last `tail` build-log lines |
@@ -135,6 +135,34 @@ of them with `"tools": { "omavroom*": false }`.
 | `guide` | `guide()` | `str` — short built-in "prepare and use a project golden image" flow (also the `omavroom://guide` resource) |
 | `job_poll` | `job_poll(job_id)` | `dict` — `state` (`pending`/`done`/`error`) |
 | `job_wait` | `job_wait(job_id, timeout_s=600)` | `dict` — last view (bounded) |
+
+## Starting a project
+
+Scaffold the recipe once, commit it, then let `image_ensure` read it:
+
+```bash
+omavroom init .                    # detect tools, write .omavroom/image.toml
+omavroom init . --tools rust,node  # add tools detection missed (repeatable; --base, --force)
+```
+
+`init` detects tools from the project files (`Cargo.toml`→`rust`,
+`package.json`→`node`, `pyproject.toml`/`requirements.txt`/`setup.py`→`python`,
+`go.mod`→`go`, `Dockerfile`→`docker`, any `*.tex`→`tex`, always `git`+`build`),
+resolves them to packages, and writes `base` + `packages`. It also appends a
+short *Isolated work (omavroom)* section to `AGENTS.md` (creating it if absent)
+without clobbering existing content. An existing recipe is left alone unless
+`--force` is passed.
+
+Commit `.omavroom/image.toml`, then build with **no `tools`/`packages`**:
+
+```
+image_ensure(project="my-project", project_root=".")
+```
+
+When both are omitted and a `project_root` is given, `image_ensure` (and
+`image_plan`) load `<project_root>/.omavroom/image.toml` and use its
+`base`/`packages`/`post` as the request. Explicit `tools`/`packages` still take
+precedence; a missing recipe with no explicit request is an error.
 
 ## Project images
 

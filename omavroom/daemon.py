@@ -805,6 +805,7 @@ class Protocol:
             tools=_optional_str_list(params, "tools"),
             packages=_optional_str_list(params, "packages"),
             base=_optional_str(params, "base"),
+            project_root=_optional_str(params, "project_root"),
         )
 
     def _image_ensure(self, params: dict) -> dict:

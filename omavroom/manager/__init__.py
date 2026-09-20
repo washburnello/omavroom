@@ -687,6 +687,7 @@ class Manager:
         tools: list[str] | tuple[str, ...] | None = None,
         packages: list[str] | tuple[str, ...] | None = None,
         base: str | None = None,
+        project_root: str | Path | None = None,
     ) -> dict:
         """Read-only plan: what image the project needs for ``tools``/``packages``.
 
@@ -695,11 +696,28 @@ class Manager:
         and reports the would-be recipe, the target image name, the newly
         missing packages, and whether the current image already satisfies the
         request. No build, no writes.
+
+        When ``tools`` and ``packages`` are both omitted and a ``project_root``
+        is given, the request is read from ``<project_root>/.omavroom/image.toml``
+        (the recipe ``omavroom init`` writes): its ``base``/``packages``/``post``
+        become the request. Explicit ``tools``/``packages`` always win. A
+        missing recipe with no explicit request is a clear error.
         """
         if not isinstance(project, str) or not project.strip():
             raise ValueError("project must be a non-empty string")
-        resolved = resolve_tools(tools or [])
-        for package in packages or []:
+        requested_tools = list(tools) if tools else []
+        requested_packages = list(packages) if packages else []
+        recipe: ImageRecipe | None = None
+        if not requested_tools and not requested_packages and project_root is not None:
+            recipe_path = default_recipe_path(project_root)
+            if not recipe_path.exists():
+                raise ValueError(
+                    f"no recipe at {recipe_path}: pass tools/packages or run 'omavroom init'"
+                )
+            recipe = load_recipe(recipe_path)
+            requested_packages = list(recipe.packages)
+        resolved = resolve_tools(requested_tools)
+        for package in requested_packages:
             if not is_safe_package(package):
                 raise ValueError(f"invalid package: {package!r}")
             if package not in resolved:
@@ -713,10 +731,14 @@ class Manager:
                 merged.append(package)
         effective_base = (
             base
+            or (recipe.base if recipe is not None else None)
             or (existing.base if existing is not None else None)
             or self.config.image_for("desktop")
         )
-        post = list(existing.post) if existing is not None else []
+        if recipe is not None:
+            post = list(recipe.post)
+        else:
+            post = list(existing.post) if existing is not None else []
         digest = recipe_hash(effective_base, merged, post)
         missing = [package for package in resolved if package not in current_packages]
         if existing is None or missing:
@@ -765,7 +787,13 @@ class Manager:
         project_root: str | Path | None,
     ) -> dict:
         """Plan an ensure and, when not satisfied, version the recipe on disk."""
-        plan = self.plan_image(project, tools=tools, packages=packages, base=base)
+        plan = self.plan_image(
+            project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+        )
         recipe_path = None
         if project_root is not None and not plan["satisfied"]:
             recipe = ImageRecipe(

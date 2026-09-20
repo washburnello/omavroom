@@ -570,14 +570,24 @@ class DaemonClient:
         tools: list[str] | None = None,
         packages: list[str] | None = None,
         base: str | None = None,
+        project_root: str | None = None,
     ) -> dict:
         """Read-only plan: recipe, target image, missing packages, satisfied.
 
         Resolves high-level ``tools`` (``rust``, ``node``, ...) to packages,
         merges them with the project image's recorded set, and reports what a
-        build would add. No side effects.
+        build would add. No side effects. With neither ``tools`` nor
+        ``packages`` and a ``project_root``, the request is read from
+        ``<project_root>/.omavroom/image.toml``.
         """
-        return self.call("image_plan", project=project, tools=tools, packages=packages, base=base)
+        return self.call(
+            "image_plan",
+            project=project,
+            tools=tools,
+            packages=packages,
+            base=base,
+            project_root=project_root,
+        )
 
     def image_ensure(
         self,

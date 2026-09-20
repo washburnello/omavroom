@@ -64,6 +64,7 @@ def default_screenshot_path(name: str) -> Path:
 
 
 _COMMAND_HELP: dict[str, str] = {
+    "init": "scaffold a project for isolated work (write .omavroom/image.toml)",
     "daemon": "run the seat manager daemon in the foreground",
     "status": "show a live pool/seat/queue table from the running daemon",
     "seats": "list live seats",
@@ -109,6 +110,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the daemon Unix socket path (env: XDG_RUNTIME_DIR layout)",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
+
+    init = subparsers.add_parser("init", help=_COMMAND_HELP["init"])
+    init.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="project directory (default: the current directory)",
+    )
+    init.add_argument(
+        "--tools",
+        action="append",
+        default=None,
+        metavar="TOOLS",
+        help="extra tools to add to the detected set (comma-separated; repeatable)",
+    )
+    init.add_argument("--base", default=None, help="base image name (default: golden-omarchy)")
+    init.add_argument("--force", action="store_true", help="overwrite an existing recipe")
+    _add_json(init)
 
     daemon = subparsers.add_parser("daemon", help=_COMMAND_HELP["daemon"])
     daemon.add_argument(
@@ -795,6 +814,56 @@ def _image_rm(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _parse_tool_flags(values: list[str] | None) -> list[str]:
+    """Flatten repeated/comma-separated ``--tools`` values into a tool list."""
+    tools: list[str] = []
+    for value in values or []:
+        for token in str(value).split(","):
+            token = token.strip()
+            if token and token not in tools:
+                tools.append(token)
+    return tools
+
+
+def _print_init_summary(result: dict) -> None:
+    detected = ", ".join(result["detected_tools"]) or "(none)"
+    print(f"init {result['path']}: detected {detected}")
+    print(f"  tools: {', '.join(result['tools']) or '(none)'}")
+    print(f"  packages: {', '.join(result['packages']) or '(none)'}")
+    if result["recipe_written"]:
+        print(f"  recipe: {result['recipe_path']} (written, base={result['base']})")
+    else:
+        print(f"  recipe: {result['recipe_path']} (exists; use --force to overwrite)")
+    if result["agents_created"]:
+        print("  AGENTS.md: created with the isolated-work section")
+    elif result["agents_changed"]:
+        print("  AGENTS.md: appended the isolated-work section")
+    else:
+        print("  AGENTS.md: already documents isolated work")
+    print(f"  image: {result['image']}")
+    print(f"  next: image_ensure(project={result['project']!r}, project_root={result['path']!r})")
+
+
+def _init(args: argparse.Namespace) -> int:
+    """Scaffold a project for isolated work; never talks to the daemon."""
+    from omavroom.scaffold import init_project
+
+    try:
+        result = init_project(
+            args.path or ".",
+            tools=_parse_tool_flags(args.tools),
+            base=args.base,
+            force=args.force,
+        )
+    except (OSError, ValueError) as exc:
+        return _fail("init", exc)
+    if args.json:
+        _dump(result)
+    else:
+        _print_init_summary(result)
+    return EXIT_OK
+
+
 def _settings(args: argparse.Namespace) -> int:
     """Print the effective (merged) local config; never talks to the daemon."""
     from omavroom.cli.format import settings_dict, settings_report
@@ -908,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return EXIT_USAGE
     handlers = {
+        "init": _init,
         "status": _status,
         "seats": _seats,
         "queue": _queue,
