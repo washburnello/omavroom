@@ -302,6 +302,41 @@ def test_ensure_delta_uses_existing_image_as_base(make_manager, user_config, tmp
     assert recipe.packages == ("jq", "git")
 
 
+def test_image_status_reports_recorded_packages(make_manager, user_config) -> None:
+    cfg = Config.default()
+    cfg.image_build.policy = "auto"
+    fake = FakeProvisioner()
+    mgr = make_manager(cfg, provisioner=fake)
+    mgr.ensure_image("p", tools=["rust"])
+    status = mgr.image_status("p-image")
+    assert status["packages"] == ["rustup", "base-devel"]
+    assert status["state"] == "done"
+    # The recorded package list survives a config reload (persisted).
+    assert Config.load().images["p-image"].packages == ("rustup", "base-devel")
+
+
+def test_delta_build_records_cumulative_packages(make_manager, user_config) -> None:
+    """A delta build must record existing + new packages, not just the delta.
+
+    Otherwise ``image_status``/``image_plan`` would report only the latest
+    packages and think the prior tools are missing again.
+    """
+    cfg = Config.default()
+    fake = FakeProvisioner()
+    mgr = make_manager(cfg, provisioner=fake)
+    first = mgr.build_image("p-image", packages=["jq"], approved=True)
+    assert first["packages"] == ["jq"]
+    second = mgr.build_image("p-image", packages=["git"], approved=True)
+    assert second["delta"] is True
+    assert second["packages"] == ["jq", "git"]
+    assert mgr.image_status("p-image")["packages"] == ["jq", "git"]
+    assert Config.load().images["p-image"].packages == ("jq", "git")
+    # A subsequent ensure for a package already recorded sees it as present.
+    plan = mgr.plan_image("p", packages=["jq"])
+    assert plan["missing_packages"] == []
+    assert plan["current_packages"] == ["jq", "git"]
+
+
 def test_ensure_hash_change_triggers_rebuild(make_manager, user_config) -> None:
     cfg = Config.default()
     cfg.image_build.policy = "auto"

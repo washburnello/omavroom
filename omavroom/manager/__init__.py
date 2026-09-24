@@ -564,7 +564,10 @@ class Manager:
         (``recipe_path``, defaulting to ``.omavroom/image.toml``) or explicit
         ``packages``/``post`` describe the delta; ``base`` overrides the
         recipe's base. The resolved image is registered in ``[images.<name>]``
-        (with its recipe metadata) so seats can be provisioned from it.
+        (with its recipe metadata) so seats can be provisioned from it; the
+        recorded ``packages`` are **cumulative** (a delta build merges the
+        existing image's recorded packages with the new ones), so
+        ``image_status``/``image_plan`` stay accurate across successive builds.
 
         A build is tracked in :attr:`builds` (``pool_status.builds`` /
         ``image_status`` / ``image_logs``) and recorded as
@@ -586,9 +589,18 @@ class Manager:
                 post=tuple(post or ()),
             )
         effective_base = base or recipe.base or self.config.image_for("desktop")
-        digest = recipe_hash(effective_base, recipe.packages, recipe.post)
         # A registered target means a previous build exists: the provisioner
-        # reuses it and applies only the delta.
+        # reuses it and applies only the delta. The *recorded* package set must
+        # be cumulative, though -- otherwise `image_status`/`image_plan` would
+        # report only the latest delta's packages and think prior tools are
+        # missing again. Merge the existing image's recorded packages in
+        # (deduped, preserving order) before hashing/recording.
+        existing_entry = self.config.images.get(name)
+        recorded_packages = list(existing_entry.packages) if existing_entry is not None else []
+        for package in recipe.packages:
+            if package not in recorded_packages:
+                recorded_packages.append(package)
+        digest = recipe_hash(effective_base, recorded_packages, recipe.post)
         delta = name in self.config.images
         self.builds.start(name, started_at=st.fmt_time(st.utcnow()))
         self._log_event(
@@ -626,7 +638,7 @@ class Manager:
                 path,
                 seat_type,
                 base=effective_base,
-                packages=recipe.packages,
+                packages=recorded_packages,
                 post=recipe.post,
                 recipe_hash=digest,
             )
@@ -636,7 +648,7 @@ class Manager:
             golden=path,
             seat_type=seat_type,
             base=effective_base,
-            packages=recipe.packages,
+            packages=tuple(recorded_packages),
             post=recipe.post,
             recipe_hash=digest,
         )
@@ -646,7 +658,7 @@ class Manager:
             "base": effective_base,
             "path": path,
             "seat_type": seat_type,
-            "packages": list(recipe.packages),
+            "packages": list(recorded_packages),
             "post": list(recipe.post),
             "delta": delta,
             "recipe_hash": digest,

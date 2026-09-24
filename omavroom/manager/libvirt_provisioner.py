@@ -69,6 +69,24 @@ never destroys — the goldens' template domains. The scheduler's reconcile
 contract matches VMs to seats by seat *name*, so :class:`VmInfo.name`
 strips the prefix and equals the seat name.
 
+Build VM networking
+-------------------
+A project-image build boots a scratch overlay of a golden and installs
+packages over the qemu-guest-agent. The goldens ship no working DHCP unit,
+so :meth:`_build_image_locked` gives the build VM the **same** MAC-matched
+static ``systemd-networkd`` unit a seat gets (a unique address from
+``[network]``, allocated by :meth:`_allocate_static_ip`) before any
+``pacman`` runs, then waits (bounded by ``build_network_timeout_s``) until
+the guest actually resolves the mirror host. On timeout it raises a clear
+:class:`ProvisionerError` naming the address/gateway/DNS and probe host
+rather than letting ``pacman`` fail with ``Could not resolve host``. The
+build-only unit matches the throwaway MAC, so it is removed (and networkd
+restarted) before the overlay is flattened — the derived image never bakes
+a stale unit, and seats write their own on boot. A ``pacman -S --needed``
+delta whose packages are all already present exits ``1`` ("nothing to do");
+:meth:`_run_pacman_install` treats that as success while still failing on any
+genuine ``error:`` line.
+
 Exec transport
 --------------
 :meth:`LibvirtProvisioner.run` is a real SSH command runner (pinned
@@ -138,6 +156,12 @@ _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 BUILD_DOMAIN_PREFIX = "omavroom-build-"
 #: The pacman cache-cleaner run at the end of every build (keeps images lean).
 PACMAN_CLEAN_COMMAND = "pacman -Sc --noconfirm"
+#: Hostname the build VM must be able to resolve before ``pacman`` may run.
+#: The golden ships no working DHCP unit, so the build VM gets the same
+#: MAC-matched static networkd unit a seat gets; this probe proves DNS is
+#: live (the mirror the golden's pacman.conf points at must resolve) before
+#: the install, rather than failing later with a confusing pacman error.
+BUILD_DNS_PROBE = "stable-mirror.omarchy.org"
 #: Only one build VM may run at a time (bounded host RAM). A process-wide
 #: lock serializes builds across managers/threads in this process.
 _BUILD_LOCK = threading.Lock()
@@ -169,6 +193,35 @@ def build_pacman_install_command(packages: tuple[str, ...] | list[str]) -> str:
     """Render the exact ``pacman -S`` install command for a package list."""
     args = " ".join(shlex.quote(package) for package in packages)
     return f"pacman -S --needed --noconfirm {args}".strip()
+
+
+#: ``pacman -S --needed`` messages that mean "there was nothing to install"
+#: (all requested packages are already present); exit status is then ``1``.
+_PACMAN_NOOP_RE = re.compile(
+    r"(there is nothing to do|is up to date -- skipping)",
+    re.IGNORECASE,
+)
+#: A genuine pacman failure line, regardless of the exit status.
+_PACMAN_ERROR_RE = re.compile(
+    r"error:|could not resolve|failed to retrieve|failed to commit",
+    re.IGNORECASE,
+)
+
+
+def _pacman_nothing_to_do(returncode: int, output: str) -> bool:
+    """True when ``pacman -S --needed`` did nothing and may be treated as success.
+
+    pacman exits ``1`` when every requested package is already installed,
+    printing ``warning: X is up to date -- skipping`` and/or ``there is nothing
+    to do``. That is a successful no-op for a delta build. Any genuine
+    ``error:`` line (``could not resolve`` / ``failed to retrieve`` / ``failed
+    to commit``) means the build really failed, so it is **not** a no-op.
+    """
+    if returncode == 0:
+        return True
+    if _PACMAN_ERROR_RE.search(output):
+        return False
+    return bool(_PACMAN_NOOP_RE.search(output))
 
 
 def _subprocess_runner(argv: list[str], timeout: int, input_text: str | None) -> CommandResult:
@@ -625,6 +678,7 @@ class LibvirtProvisioner(Provisioner):
         golden_convert_timeout_s: int = 900,
         build_ready_timeout_s: int = 300,
         build_command_timeout_s: int = 1800,
+        build_network_timeout_s: int = 90,
         fsck_timeout_s: int = 300,
         host_runner: Callable[[list[str], int, str | None], CommandResult] | None = None,
         stream_runner: (
@@ -666,6 +720,7 @@ class LibvirtProvisioner(Provisioner):
         self.golden_convert_timeout_s = golden_convert_timeout_s
         self.build_ready_timeout_s = build_ready_timeout_s
         self.build_command_timeout_s = build_command_timeout_s
+        self.build_network_timeout_s = build_network_timeout_s
         self.fsck_timeout_s = fsck_timeout_s
         self._runner = host_runner or _subprocess_runner
         self._stream_runner = stream_runner or _subprocess_stream_runner
@@ -868,6 +923,8 @@ class LibvirtProvisioner(Provisioner):
             )
             shutil.copyfile(self._nvram_template(seat_type), nvram)
             resources = self.config.resources_for(seat_type)
+            mac = self._random_mac()
+            static_ip = self._allocate_static_ip(scratch_ref)
             xml = build_domain_xml(
                 seat_type=seat_type,
                 name=scratch_ref,
@@ -876,7 +933,7 @@ class LibvirtProvisioner(Provisioner):
                 vcpus=resources.cpu_vcpus,
                 nvram_path=str(nvram),
                 disk_path=str(overlay),
-                mac=self._random_mac(),
+                mac=mac,
                 cpu_quota=resources.cpu_vcpus * CPU_PERIOD_US,
                 mem_hard_limit_kb=(resources.memory_mb + MEM_OVERHEAD_MB) * 1024,
                 mem_soft_limit_kb=resources.memory_mb * 1024,
@@ -896,16 +953,21 @@ class LibvirtProvisioner(Provisioner):
                     f"virsh start failed for {scratch_ref}: {start.stderr.strip()}"
                 )
             self._wait_build_agent(scratch_ref)
+            # The golden ships no working DHCP unit: give the build VM the same
+            # MAC-matched static network a seat gets and prove DNS is live
+            # before pacman touches the network.
+            self._configure_build_network(scratch_ref, mac, static_ip, on_log)
             if packages:
                 self._build_log(on_log, f"installing: {' '.join(packages)}")
-                self._run_build_command(
-                    scratch_ref, build_pacman_install_command(packages), "package install"
-                )
+                self._run_pacman_install(scratch_ref, build_pacman_install_command(packages))
             for command in post:
                 self._build_log(on_log, f"post: {command}")
                 self._run_build_command(scratch_ref, command, "post command")
             self._build_log(on_log, "cleaning package cache")
             self._run_build_command(scratch_ref, PACMAN_CLEAN_COMMAND, "package cache clean")
+            # Drop the build-only unit (it matches the throwaway MAC) so the
+            # flattened image does not bake a stale, MAC-specific unit.
+            self._remove_build_network(scratch_ref, on_log)
             self.stop(scratch_ref)
             target.parent.mkdir(parents=True, exist_ok=True)
             self._qemu_img(
@@ -940,6 +1002,149 @@ class LibvirtProvisioner(Provisioner):
         if not result.ok:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ProvisionerError(f"{what} failed on build VM {ref}: {detail}")
+
+    # ------------------------------------------------------------------
+    # build VM networking (golden has no working DHCP unit)
+    # ------------------------------------------------------------------
+    def _configure_build_network(
+        self, ref: str, mac: str, static_ip: str, on_log: Callable[[str], None] | None
+    ) -> None:
+        """Pin the build VM's static network before any ``pacman`` runs.
+
+        The golden ships no working DHCP unit, so a boot-time race otherwise
+        leaves the build VM with no resolver and ``pacman`` fails with
+        ``Could not resolve host``. This writes the same MAC-matched
+        systemd-networkd unit a seat gets, removes any leftover ``.network``
+        unit, restarts networkd, and then waits until the guest actually
+        resolves :data:`BUILD_DNS_PROBE`. Idempotent: an already-correct unit
+        is rewritten only when its content differs (the restart is cheap).
+        """
+        network = self.config.network
+        content = build_static_network_config(
+            mac=mac,
+            ip=static_ip,
+            prefix_len=network.prefix_len,
+            gateway=network.gateway,
+            dns=tuple(network.dns),
+        )
+        unit = f"{STATIC_NETWORK_DIR}/{STATIC_NETWORK_FILE}"
+        address = f"{static_ip}/{network.prefix_len}"
+        self._build_log(on_log, f"configuring build network {static_ip} on {mac}")
+        command = (
+            "set -e; umask 022; "
+            f"mkdir -p {STATIC_NETWORK_DIR}; "
+            f"if [ ! -f {unit} ] || ! cmp -s {unit} - <<'OMAVROOM_NET_EOF'\n"
+            f"{content}"
+            "OMAVROOM_NET_EOF\n"
+            "then\n"
+            f"cat > {unit} <<'OMAVROOM_NET_EOF'\n"
+            f"{content}"
+            "OMAVROOM_NET_EOF\n"
+            "fi; "
+            f"find {STATIC_NETWORK_DIR} -maxdepth 1 -type f -name '*.network' "
+            f"! -name '{STATIC_NETWORK_FILE}' -delete; "
+            "systemctl enable systemd-networkd >/dev/null 2>&1 || true; "
+            "systemctl restart systemd-networkd; "
+            'IFACE=""; for d in /sys/class/net/*; do '
+            f'if [ "$(cat "$d/address" 2>/dev/null)" = {shlex.quote(mac)} ]; '
+            'then IFACE=$(basename "$d"); fi; done; '
+            '[ -n "$IFACE" ] || { echo NET_NO_IFACE; exit 1; }; '
+            "i=0; while [ $i -lt 40 ]; do "
+            f'if ip -o -4 addr show dev "$IFACE" | grep -qF {shlex.quote(address)}; '
+            "then break; fi; i=$((i+1)); sleep 0.5; done; "
+            f'ip -o -4 addr show dev "$IFACE" | grep -qF {shlex.quote(address)} '
+            "|| { echo NET_STATIC_MISSING; exit 1; }; "
+            "echo NET_STATIC_OK"
+        )
+        result = self.agent_exec(ref, command, timeout_s=90)
+        if result.returncode != 0 or "NET_STATIC_OK" not in result.stdout:
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
+            raise ProvisionerError(f"build network configuration failed on {ref}: {detail}")
+        self._wait_build_dns(ref, static_ip, on_log)
+
+    def _wait_build_dns(
+        self, ref: str, static_ip: str, on_log: Callable[[str], None] | None
+    ) -> None:
+        """Poll until the build VM resolves :data:`BUILD_DNS_PROBE`, or raise.
+
+        Bounded by ``build_network_timeout_s``. On timeout the error names the
+        real problem (no DNS/network in the build VM), the address, gateway,
+        DNS servers and probe host -- not the downstream pacman error.
+        """
+        network = self.config.network
+        self._build_log(on_log, f"waiting for DNS ({BUILD_DNS_PROBE})")
+        probe = shlex.quote(BUILD_DNS_PROBE)
+        # ``getent`` uses nss (also covers hosts/mDNS); ``resolvectl query``
+        # talks to resolved directly. Either proving the name resolves is
+        # enough -- pacman only needs the mirror hostname to resolve.
+        command = (
+            f"getent hosts {probe} >/dev/null 2>&1 || resolvectl query {probe} >/dev/null 2>&1"
+        )
+        deadline = self._monotonic() + self.build_network_timeout_s
+        while True:
+            result = self.agent_exec(ref, command, timeout_s=30)
+            if result.ok:
+                self._build_log(on_log, f"build VM DNS ready ({static_ip})")
+                return
+            if self._monotonic() >= deadline:
+                break
+            self._sleep(2)
+        raise ProvisionerError(
+            f"build VM {ref} has no working network/DNS: could not resolve "
+            f"{BUILD_DNS_PROBE!r} within {self.build_network_timeout_s}s "
+            f"(address {static_ip}/{network.prefix_len}, gateway {network.gateway}, "
+            f"dns {', '.join(network.dns)}); the golden ships no working DHCP unit, "
+            "so the build VM needs a working static network before pacman can run"
+        )
+
+    def _remove_build_network(self, ref: str, on_log: Callable[[str], None] | None) -> None:
+        """Remove the build-only static unit before the overlay is flattened.
+
+        The unit matches the build VM's throwaway MAC, so it is meaningless (and
+        stale) in the derived image; seats write their own MAC-matched unit on
+        boot anyway. Restarting networkd returns the guest to its default
+        behaviour. Best-effort: cleanup failure never fails a finished build.
+        """
+        unit = f"{STATIC_NETWORK_DIR}/{STATIC_NETWORK_FILE}"
+        try:
+            result = self.agent_exec(
+                ref,
+                f"set -e; rm -f {unit}; systemctl restart systemd-networkd; echo NET_CLEANED",
+                timeout_s=60,
+            )
+            if result.returncode == 0 and "NET_CLEANED" in result.stdout:
+                self._build_log(on_log, "removed build-only static network unit")
+            else:
+                log.warning(
+                    "could not remove build network unit on %s: %s",
+                    ref,
+                    result.stderr.strip() or result.stdout.strip(),
+                )
+        except ProvisionerError as exc:  # pragma: no cover - transport flake
+            log.warning("could not remove build network unit on %s: %s", ref, exc)
+
+    # ------------------------------------------------------------------
+    # pacman install (delta builds: "nothing to do" is success)
+    # ------------------------------------------------------------------
+    def _run_pacman_install(self, ref: str, command: str) -> None:
+        """Run a ``pacman -S --needed`` install, tolerating a no-op.
+
+        ``pacman -S --needed`` exits ``1`` when every requested package is
+        already present (``warning: X is up to date -- skipping`` / ``there is
+        nothing to do``). A valid delta build must not fail for that reason, so
+        exit ``1`` with no genuine ``error:`` lines is treated as success; any
+        real pacman error (``could not resolve`` / ``failed to retrieve`` /
+        ``failed to commit`` / any other ``error:``) still fails.
+        """
+        result = self.agent_exec(ref, command, timeout_s=self.build_command_timeout_s)
+        if result.ok:
+            return
+        combined = f"{result.stdout}\n{result.stderr}"
+        if _pacman_nothing_to_do(result.returncode, combined):
+            log.info("pacman install on %s was a no-op (all packages up to date)", ref)
+            return
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ProvisionerError(f"package install failed on build VM {ref}: {detail}")
 
     def _remove_build(self, ref: str, build_dir: Path) -> None:
         """Destroy/undefine the scratch VM and delete its build directory."""

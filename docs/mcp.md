@@ -287,9 +287,14 @@ A build is ephemeral and delta-aware:
 
 1. a scratch overlay is created on the base golden and booted (one build VM
    at a time, to bound host RAM);
-2. `pacman -S --needed --noconfirm <packages>` plus any `post` commands run;
-3. `pacman -Sc --noconfirm` trims the package cache;
-4. the VM shuts down, the overlay is flattened to a standalone
+2. the scratch VM gets the same MAC-matched static network unit a seat gets
+   (the golden ships no working DHCP unit), and the build waits until the
+   guest actually resolves the configured mirror host before continuing;
+3. `pacman -S --needed --noconfirm <packages>` plus any `post` commands run
+   (an all-up-to-date "nothing to do" delta is a success, not a failure);
+4. `pacman -Sc --noconfirm` trims the package cache and the build-only
+   static unit is removed;
+5. the VM shuts down, the overlay is flattened to a standalone
    `<name>.qcow2` with mode `444`, and the scratch VM/overlay are removed.
 
 **Delta reuse.** If `<name>.qcow2` already exists, the build starts *from
